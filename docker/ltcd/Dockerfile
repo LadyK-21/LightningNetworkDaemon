@@ -11,7 +11,7 @@ RUN go install -v . ./cmd/...
 RUN go install . ./cmd/ltcctl ./cmd/gencerts
 
 # Start a new image
-FROM alpine as final
+FROM alpine:3.18.3 as final
 
 # Expose mainnet ports (server, rpc)
 EXPOSE 9333 9334
