@@ -27,7 +27,7 @@ RUN apk add --no-cache --update alpine-sdk \
 &&  make release-install
 
 # Start a new, final image.
-FROM alpine as final
+FROM alpine:3.18.5 as final
 
 # Define a root volume for data persistence.
 VOLUME /root/.lnd
