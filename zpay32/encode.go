@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -39,11 +40,11 @@ func (invoice *Invoice) Encode(signer MessageSigner) (string, error) {
 	zeroes := make([]byte, timestampBase32Len-len(timestampBase32))
 	_, err := bufferBase32.Write(zeroes)
 	if err != nil {
-		return "", fmt.Errorf("unable to write to buffer: %v", err)
+		return "", fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(timestampBase32)
 	if err != nil {
-		return "", fmt.Errorf("unable to write to buffer: %v", err)
+		return "", fmt.Errorf("unable to write to buffer: %w", err)
 	}
 
 	// We now write the tagged fields to the buffer, which will fill the
@@ -91,8 +92,10 @@ func (invoice *Invoice) Encode(signer MessageSigner) (string, error) {
 	// From the header byte we can extract the recovery ID, and the last 64
 	// bytes encode the signature.
 	recoveryID := sign[0] - 27 - 4
-	var sig lnwire.Sig
-	copy(sig[:], sign[1:])
+	sig, err := lnwire.NewSigFromWireECDSA(sign[1:])
+	if err != nil {
+		return "", err
+	}
 
 	// If the pubkey field was explicitly set, it must be set to the pubkey
 	// used to create the signature.
@@ -112,7 +115,10 @@ func (invoice *Invoice) Encode(signer MessageSigner) (string, error) {
 	}
 
 	// Convert the signature to base32 before writing it to the buffer.
-	signBase32, err := bech32.ConvertBits(append(sig[:], recoveryID), 8, 5, true)
+	signBase32, err := bech32.ConvertBits(
+		append(sig.RawBytes(), recoveryID),
+		8, 5, true,
+	)
 	if err != nil {
 		return "", err
 	}
@@ -255,6 +261,29 @@ func writeTaggedFields(bufferBase32 *bytes.Buffer, invoice *Invoice) error {
 		}
 	}
 
+	for _, path := range invoice.BlindedPaymentPaths {
+		var buf bytes.Buffer
+
+		err := path.Encode(&buf)
+		if err != nil {
+			return err
+		}
+
+		blindedPathBase32, err := bech32.ConvertBits(
+			buf.Bytes(), 8, 5, true,
+		)
+		if err != nil {
+			return err
+		}
+
+		err = writeTaggedField(
+			bufferBase32, fieldTypeB, blindedPathBase32,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	if invoice.Destination != nil {
 		// Convert 33 byte pubkey to 53 5-bit groups.
 		pubKeyBase32, err := bech32.ConvertBits(
@@ -273,14 +302,14 @@ func writeTaggedFields(bufferBase32 *bytes.Buffer, invoice *Invoice) error {
 			return err
 		}
 	}
-	if invoice.PaymentAddr != nil {
-		err := writeBytes32(
-			bufferBase32, fieldTypeS, *invoice.PaymentAddr,
-		)
-		if err != nil {
-			return err
-		}
+
+	err := fn.MapOptionZ(invoice.PaymentAddr, func(addr [32]byte) error {
+		return writeBytes32(bufferBase32, fieldTypeS, addr)
+	})
+	if err != nil {
+		return err
 	}
+
 	if invoice.Features.SerializeSize32() > 0 {
 		var b bytes.Buffer
 		err := invoice.Features.RawFeatureVector.EncodeBase32(&b)
@@ -327,15 +356,15 @@ func writeTaggedField(bufferBase32 *bytes.Buffer, dataType byte, data []byte) er
 
 	err := bufferBase32.WriteByte(dataType)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(lenBase32)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 	_, err = bufferBase32.Write(data)
 	if err != nil {
-		return fmt.Errorf("unable to write to buffer: %v", err)
+		return fmt.Errorf("unable to write to buffer: %w", err)
 	}
 
 	return nil

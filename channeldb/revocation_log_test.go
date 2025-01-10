@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntest/channels"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -33,17 +34,38 @@ var (
 		0xff, // value = 255
 	}
 
+	customRecords = lnwire.CustomRecords{
+		lnwire.MinCustomRecordsTlvType + 1: []byte("custom data"),
+	}
+
+	blobBytes = []byte{
+		// Corresponds to the encoded version of the above custom
+		// records.
+		0xfe, 0x00, 0x01, 0x00, 0x01, 0x0b, 0x63, 0x75, 0x73, 0x74,
+		0x6f, 0x6d, 0x20, 0x64, 0x61, 0x74, 0x61,
+	}
+
 	testHTLCEntry = HTLCEntry{
-		RefundTimeout: 740_000,
-		OutputIndex:   10,
-		Incoming:      true,
-		Amt:           1000_000,
-		amtTlv:        1000_000,
-		incomingTlv:   1,
+		RefundTimeout: tlv.NewPrimitiveRecord[tlv.TlvType1, uint32](
+			740_000,
+		),
+		OutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType2, uint16](
+			10,
+		),
+		Incoming: tlv.NewPrimitiveRecord[tlv.TlvType3](true),
+		Amt: tlv.NewRecordT[tlv.TlvType4](
+			tlv.NewBigSizeT(btcutil.Amount(1_000_000)),
+		),
+		CustomBlob: tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[tlv.TlvType5](blobBytes),
+		),
+		HtlcIndex: tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[tlv.TlvType6, uint16](0x33),
+		),
 	}
 	testHTLCEntryBytes = []byte{
-		// Body length 23.
-		0x16,
+		// Body length 45.
+		0x2d,
 		// Rhash tlv.
 		0x0, 0x0,
 		// RefundTimeout tlv.
@@ -54,35 +76,82 @@ var (
 		0x3, 0x1, 0x1,
 		// Amt tlv.
 		0x4, 0x5, 0xfe, 0x0, 0xf, 0x42, 0x40,
+		// Custom blob tlv.
+		0x5, 0x11, 0xfe, 0x00, 0x01, 0x00, 0x01, 0x0b, 0x63, 0x75, 0x73,
+		0x74, 0x6f, 0x6d, 0x20, 0x64, 0x61, 0x74, 0x61,
+		// HLTC index tlv.
+		0x6, 0x2, 0x0, 0x33,
 	}
+
+	testHTLCEntryHash = HTLCEntry{
+		RHash: tlv.NewPrimitiveRecord[tlv.TlvType0](NewSparsePayHash(
+			[32]byte{0x33, 0x44, 0x55},
+		)),
+		RefundTimeout: tlv.NewPrimitiveRecord[tlv.TlvType1, uint32](
+			740_000,
+		),
+		OutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType2, uint16](
+			10,
+		),
+		Incoming: tlv.NewPrimitiveRecord[tlv.TlvType3](true),
+		Amt: tlv.NewRecordT[tlv.TlvType4](
+			tlv.NewBigSizeT(btcutil.Amount(1_000_000)),
+		),
+	}
+	testHTLCEntryHashBytes = []byte{
+		// Body length 54.
+		0x36,
+		// Rhash tlv.
+		0x0, 0x20,
+		0x33, 0x44, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		// RefundTimeout tlv.
+		0x1, 0x4, 0x0, 0xb, 0x4a, 0xa0,
+		// OutputIndex tlv.
+		0x2, 0x2, 0x0, 0xa,
+		// Incoming tlv.
+		0x3, 0x1, 0x1,
+		// Amt tlv.
+		0x4, 0x5, 0xfe, 0x0, 0xf, 0x42, 0x40,
+	}
+
+	localBalance  = lnwire.MilliSatoshi(9000)
+	remoteBalance = lnwire.MilliSatoshi(3000)
 
 	testChannelCommit = ChannelCommitment{
 		CommitHeight:  999,
-		LocalBalance:  lnwire.MilliSatoshi(9000),
-		RemoteBalance: lnwire.MilliSatoshi(3000),
+		LocalBalance:  localBalance,
+		RemoteBalance: remoteBalance,
 		CommitFee:     btcutil.Amount(rand.Int63()),
 		FeePerKw:      btcutil.Amount(5000),
 		CommitTx:      channels.TestFundingTx,
 		CommitSig:     bytes.Repeat([]byte{1}, 71),
 		Htlcs: []HTLC{{
-			RefundTimeout: testHTLCEntry.RefundTimeout,
-			OutputIndex:   int32(testHTLCEntry.OutputIndex),
-			Incoming:      testHTLCEntry.Incoming,
-			Amt: lnwire.NewMSatFromSatoshis(
-				testHTLCEntry.Amt,
+			RefundTimeout: testHTLCEntry.RefundTimeout.Val,
+			OutputIndex:   int32(testHTLCEntry.OutputIndex.Val),
+			HtlcIndex: uint64(
+				testHTLCEntry.HtlcIndex.ValOpt().
+					UnsafeFromSome(),
 			),
+			Incoming: testHTLCEntry.Incoming.Val,
+			Amt: lnwire.NewMSatFromSatoshis(
+				testHTLCEntry.Amt.Val.Int(),
+			),
+			CustomRecords: customRecords,
 		}},
+		CustomBlob: fn.Some(blobBytes),
 	}
 
-	testRevocationLog = RevocationLog{
-		OurOutputIndex:   0,
-		TheirOutputIndex: 1,
-		CommitTxHash:     testChannelCommit.CommitTx.TxHash(),
-		HTLCEntries:      []*HTLCEntry{&testHTLCEntry},
-	}
-	testRevocationLogBytes = []byte{
-		// Body length 42.
-		0x2a,
+	testRevocationLogNoAmts = NewRevocationLog(
+		0, 1, testChannelCommit.CommitTx.TxHash(),
+		fn.None[lnwire.MilliSatoshi](), fn.None[lnwire.MilliSatoshi](),
+		[]*HTLCEntry{&testHTLCEntry}, fn.Some(blobBytes),
+	)
+	testRevocationLogNoAmtsBytes = []byte{
+		// Body length 61.
+		0x3d,
 		// OurOutputIndex tlv.
 		0x0, 0x2, 0x0, 0x0,
 		// TheirOutputIndex tlv.
@@ -93,6 +162,36 @@ var (
 		0x6e, 0x60, 0x29, 0x23, 0x1d, 0x5e, 0xc5, 0xe6,
 		0xbd, 0xf7, 0xd3, 0x9b, 0x16, 0x7d, 0x0, 0xff,
 		0xc8, 0x22, 0x51, 0xb1, 0x5b, 0xa0, 0xbf, 0xd,
+		// Custom blob tlv.
+		0x5, 0x11, 0xfe, 0x00, 0x01, 0x00, 0x01, 0x0b, 0x63, 0x75, 0x73,
+		0x74, 0x6f, 0x6d, 0x20, 0x64, 0x61, 0x74, 0x61,
+	}
+
+	testRevocationLogWithAmts = NewRevocationLog(
+		0, 1, testChannelCommit.CommitTx.TxHash(),
+		fn.Some(localBalance), fn.Some(remoteBalance),
+		[]*HTLCEntry{&testHTLCEntry}, fn.Some(blobBytes),
+	)
+	testRevocationLogWithAmtsBytes = []byte{
+		// Body length 71.
+		0x47,
+		// OurOutputIndex tlv.
+		0x0, 0x2, 0x0, 0x0,
+		// TheirOutputIndex tlv.
+		0x1, 0x2, 0x0, 0x1,
+		// CommitTxHash tlv.
+		0x2, 0x20,
+		0x28, 0x76, 0x2, 0x59, 0x1d, 0x9d, 0x64, 0x86,
+		0x6e, 0x60, 0x29, 0x23, 0x1d, 0x5e, 0xc5, 0xe6,
+		0xbd, 0xf7, 0xd3, 0x9b, 0x16, 0x7d, 0x0, 0xff,
+		0xc8, 0x22, 0x51, 0xb1, 0x5b, 0xa0, 0xbf, 0xd,
+		// OurBalance.
+		0x3, 0x3, 0xfd, 0x23, 0x28,
+		// Remote Balance.
+		0x4, 0x3, 0xfd, 0x0b, 0xb8,
+		// Custom blob tlv.
+		0x5, 0x11, 0xfe, 0x00, 0x01, 0x00, 0x01, 0x0b, 0x63, 0x75, 0x73,
+		0x74, 0x6f, 0x6d, 0x20, 0x64, 0x61, 0x74, 0x61,
 	}
 )
 
@@ -127,7 +226,7 @@ func TestReadTLVStream(t *testing.T) {
 
 	// Read the tlv stream.
 	buf := bytes.NewBuffer(testValueBytes)
-	err = readTlvStream(buf, ts)
+	_, err = readTlvStream(buf, ts)
 	require.NoError(t, err)
 
 	// Check the bytes are read as expected.
@@ -150,7 +249,7 @@ func TestReadTLVStreamErr(t *testing.T) {
 
 	// Read the tlv stream.
 	buf := bytes.NewBuffer(b)
-	err = readTlvStream(buf, ts)
+	_, err = readTlvStream(buf, ts)
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 
 	// Check the bytes are not read.
@@ -163,11 +262,6 @@ func TestSerializeHTLCEntriesEmptyRHash(t *testing.T) {
 	// Copy the testHTLCEntry.
 	entry := testHTLCEntry
 
-	// Set the internal fields to empty values so we can test the bytes are
-	// padded.
-	entry.incomingTlv = 0
-	entry.amtTlv = 0
-
 	// Write the tlv stream.
 	buf := bytes.NewBuffer([]byte{})
 	err := serializeHTLCEntries(buf, []*HTLCEntry{&entry})
@@ -175,6 +269,21 @@ func TestSerializeHTLCEntriesEmptyRHash(t *testing.T) {
 
 	// Check the bytes are read as expected.
 	require.Equal(t, testHTLCEntryBytes, buf.Bytes())
+}
+
+func TestSerializeHTLCEntriesWithRHash(t *testing.T) {
+	t.Parallel()
+
+	// Copy the testHTLCEntry.
+	entry := testHTLCEntryHash
+
+	// Write the tlv stream.
+	buf := bytes.NewBuffer([]byte{})
+	err := serializeHTLCEntries(buf, []*HTLCEntry{&entry})
+	require.NoError(t, err)
+
+	// Check the bytes are read as expected.
+	require.Equal(t, testHTLCEntryHashBytes, buf.Bytes())
 }
 
 func TestSerializeHTLCEntries(t *testing.T) {
@@ -185,7 +294,7 @@ func TestSerializeHTLCEntries(t *testing.T) {
 
 	// Create a fake rHash.
 	rHashBytes := bytes.Repeat([]byte{10}, 32)
-	copy(entry.RHash[:], rHashBytes)
+	copy(entry.RHash.Val[:], rHashBytes)
 
 	// Construct the serialized bytes.
 	//
@@ -194,7 +303,7 @@ func TestSerializeHTLCEntries(t *testing.T) {
 	partialBytes := testHTLCEntryBytes[3:]
 
 	// Write the total length and RHash tlv.
-	expectedBytes := []byte{0x36, 0x0, 0x20}
+	expectedBytes := []byte{0x4d, 0x0, 0x20}
 	expectedBytes = append(expectedBytes, rHashBytes...)
 
 	// Append the rest.
@@ -208,25 +317,78 @@ func TestSerializeHTLCEntries(t *testing.T) {
 	require.Equal(t, expectedBytes, buf.Bytes())
 }
 
-func TestSerializeRevocationLog(t *testing.T) {
+// TestSerializeAndDeserializeRevLog tests the serialization and deserialization
+// of various forms of the revocation log.
+func TestSerializeAndDeserializeRevLog(t *testing.T) {
 	t.Parallel()
 
-	// Copy the testRevocationLog and testHTLCEntry.
-	rl := testRevocationLog
+	tests := []struct {
+		name        string
+		revLog      RevocationLog
+		revLogBytes []byte
+	}{
+		{
+			name:        "with no amount fields",
+			revLog:      testRevocationLogNoAmts,
+			revLogBytes: testRevocationLogNoAmtsBytes,
+		},
+		{
+			name:        "with amount fields",
+			revLog:      testRevocationLogWithAmts,
+			revLogBytes: testRevocationLogWithAmtsBytes,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			testSerializeRevocationLog(
+				t, &test.revLog, test.revLogBytes,
+			)
+
+			testDeserializeRevocationLog(
+				t, &test.revLog, test.revLogBytes,
+			)
+		})
+	}
+}
+
+func testSerializeRevocationLog(t *testing.T, rl *RevocationLog,
+	revLogBytes []byte) {
+
+	// Copy the testRevocationLogWithAmts and testHTLCEntry.
 	htlc := testHTLCEntry
 	rl.HTLCEntries = []*HTLCEntry{&htlc}
 
 	// Write the tlv stream.
 	buf := bytes.NewBuffer([]byte{})
-	err := serializeRevocationLog(buf, &rl)
+	err := serializeRevocationLog(buf, rl)
 	require.NoError(t, err)
 
 	// Check the expected bytes on the body of the revocation log.
 	bodyIndex := buf.Len() - len(testHTLCEntryBytes)
-	require.Equal(t, testRevocationLogBytes, buf.Bytes()[:bodyIndex])
+	require.Equal(t, revLogBytes, buf.Bytes()[:bodyIndex])
 }
 
-func TestDerializeHTLCEntriesEmptyRHash(t *testing.T) {
+func testDeserializeRevocationLog(t *testing.T, revLog *RevocationLog,
+	revLogBytes []byte) {
+
+	// Construct the full bytes.
+	revLogBytes = append(revLogBytes, testHTLCEntryBytes...)
+
+	// Read the tlv stream.
+	buf := bytes.NewBuffer(revLogBytes)
+	rl, err := deserializeRevocationLog(buf)
+	require.NoError(t, err)
+
+	// Check the bytes are read as expected.
+	require.Len(t, rl.HTLCEntries, 1)
+	require.Equal(t, *revLog, rl)
+}
+
+func TestDeserializeHTLCEntriesEmptyRHash(t *testing.T) {
 	t.Parallel()
 
 	// Read the tlv stream.
@@ -239,7 +401,7 @@ func TestDerializeHTLCEntriesEmptyRHash(t *testing.T) {
 	require.Equal(t, &testHTLCEntry, htlcs[0])
 }
 
-func TestDerializeHTLCEntries(t *testing.T) {
+func TestDeserializeHTLCEntries(t *testing.T) {
 	t.Parallel()
 
 	// Copy the testHTLCEntry.
@@ -247,7 +409,7 @@ func TestDerializeHTLCEntries(t *testing.T) {
 
 	// Create a fake rHash.
 	rHashBytes := bytes.Repeat([]byte{10}, 32)
-	copy(entry.RHash[:], rHashBytes)
+	copy(entry.RHash.Val[:], rHashBytes)
 
 	// Construct the serialized bytes.
 	//
@@ -256,7 +418,7 @@ func TestDerializeHTLCEntries(t *testing.T) {
 	partialBytes := testHTLCEntryBytes[3:]
 
 	// Write the total length and RHash tlv.
-	testBytes := append([]byte{0x36, 0x0, 0x20}, rHashBytes...)
+	testBytes := append([]byte{0x4d, 0x0, 0x20}, rHashBytes...)
 
 	// Append the rest.
 	testBytes = append(testBytes, partialBytes...)
@@ -269,23 +431,6 @@ func TestDerializeHTLCEntries(t *testing.T) {
 	// Check the bytes are read as expected.
 	require.Len(t, htlcs, 1)
 	require.Equal(t, &entry, htlcs[0])
-}
-
-func TestDerializeRevocationLog(t *testing.T) {
-	t.Parallel()
-
-	// Construct the full bytes.
-	b := testRevocationLogBytes
-	b = append(b, testHTLCEntryBytes...)
-
-	// Read the tlv stream.
-	buf := bytes.NewBuffer(b)
-	rl, err := deserializeRevocationLog(buf)
-	require.NoError(t, err)
-
-	// Check the bytes are read as expected.
-	require.Len(t, rl.HTLCEntries, 1)
-	require.Equal(t, testRevocationLog, rl)
 }
 
 func TestFetchLogBucket(t *testing.T) {
@@ -332,11 +477,11 @@ func TestDeleteLogBucket(t *testing.T) {
 
 	err = kvdb.Update(backend, func(tx kvdb.RwTx) error {
 		// Create the buckets.
-		chanBucket, _, err := createTestRevocatoinLogBuckets(tx)
+		chanBucket, _, err := createTestRevocationLogBuckets(tx)
 		require.NoError(t, err)
 
 		// Create the buckets again should give us an error.
-		_, _, err = createTestRevocatoinLogBuckets(tx)
+		_, _, err = createTestRevocationLogBuckets(tx)
 		require.ErrorIs(t, err, kvdb.ErrBucketExists)
 
 		// Delete both buckets.
@@ -344,7 +489,7 @@ func TestDeleteLogBucket(t *testing.T) {
 		require.NoError(t, err)
 
 		// Create the buckets again should give us NO error.
-		_, _, err = createTestRevocatoinLogBuckets(tx)
+		_, _, err = createTestRevocationLogBuckets(tx)
 		return err
 	}, func() {})
 	require.NoError(t, err)
@@ -368,17 +513,28 @@ func TestPutRevocationLog(t *testing.T) {
 		commit      ChannelCommitment
 		ourIndex    uint32
 		theirIndex  uint32
+		noAmtData   bool
 		expectedErr error
 		expectedLog RevocationLog
 	}{
 		{
 			// Test a normal put operation.
-			name:        "successful put",
+			name:        "successful put with amount data",
 			commit:      testChannelCommit,
 			ourIndex:    0,
 			theirIndex:  1,
 			expectedErr: nil,
-			expectedLog: testRevocationLog,
+			expectedLog: testRevocationLogWithAmts,
+		},
+		{
+			// Test a normal put operation.
+			name:        "successful put with no amount data",
+			commit:      testChannelCommit,
+			ourIndex:    0,
+			theirIndex:  1,
+			noAmtData:   true,
+			expectedErr: nil,
+			expectedLog: testRevocationLogNoAmts,
 		},
 		{
 			// Test our index too big.
@@ -409,12 +565,22 @@ func TestPutRevocationLog(t *testing.T) {
 		},
 		{
 			// Test dust htlc is not saved.
-			name:        "dust htlc not saved",
+			name:        "dust htlc not saved with amount data",
 			commit:      testCommitDust,
 			ourIndex:    0,
 			theirIndex:  1,
 			expectedErr: nil,
-			expectedLog: testRevocationLog,
+			expectedLog: testRevocationLogWithAmts,
+		},
+		{
+			// Test dust htlc is not saved.
+			name:        "dust htlc not saved with no amount data",
+			commit:      testCommitDust,
+			ourIndex:    0,
+			theirIndex:  1,
+			noAmtData:   true,
+			expectedErr: nil,
+			expectedLog: testRevocationLogNoAmts,
 		},
 	}
 
@@ -429,12 +595,13 @@ func TestPutRevocationLog(t *testing.T) {
 		// Construct the testing db transaction.
 		dbTx := func(tx kvdb.RwTx) (RevocationLog, error) {
 			// Create the buckets.
-			_, bucket, err := createTestRevocatoinLogBuckets(tx)
+			_, bucket, err := createTestRevocationLogBuckets(tx)
 			require.NoError(t, err)
 
 			// Save the log.
 			err = putRevocationLog(
 				bucket, &tc.commit, tc.ourIndex, tc.theirIndex,
+				tc.noAmtData,
 			)
 			if err != nil {
 				return RevocationLog{}, err
@@ -542,7 +709,7 @@ func TestFetchRevocationLogCompatible(t *testing.T) {
 				require.NoError(t, err)
 
 				err = putRevocationLog(
-					lb, &testChannelCommit, 0, 1,
+					lb, &testChannelCommit, 0, 1, false,
 				)
 				require.NoError(t, err)
 			}
@@ -598,7 +765,7 @@ func TestFetchRevocationLogCompatible(t *testing.T) {
 	}
 }
 
-func createTestRevocatoinLogBuckets(tx kvdb.RwTx) (kvdb.RwBucket,
+func createTestRevocationLogBuckets(tx kvdb.RwTx) (kvdb.RwBucket,
 	kvdb.RwBucket, error) {
 
 	chanBucket, err := tx.CreateTopLevelBucket(openChannelBucket)

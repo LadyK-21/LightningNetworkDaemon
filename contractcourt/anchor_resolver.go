@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/sweep"
 )
@@ -22,9 +24,6 @@ type anchorResolver struct {
 	// anchor is the outpoint on the commitment transaction.
 	anchor wire.OutPoint
 
-	// resolved reflects if the contract has been fully resolved or not.
-	resolved bool
-
 	// broadcastHeight is the height that the original contract was
 	// broadcast to the main-chain at. We'll use this value to bound any
 	// historical queries to the chain for spends/confirmations.
@@ -32,6 +31,9 @@ type anchorResolver struct {
 
 	// chanPoint is the channel point of the original contract.
 	chanPoint wire.OutPoint
+
+	// chanType denotes the type of channel the contract belongs to.
+	chanType channeldb.ChannelType
 
 	// currentReport stores the current state of the resolver for reporting
 	// over the rpc interface.
@@ -67,7 +69,7 @@ func newAnchorResolver(anchorSignDescriptor input.SignDescriptor,
 		currentReport:        report,
 	}
 
-	r.initLogger(r)
+	r.initLogger(fmt.Sprintf("%T(%v)", r, r.anchor))
 
 	return r
 }
@@ -79,42 +81,14 @@ func (c *anchorResolver) ResolverKey() []byte {
 	return nil
 }
 
-// Resolve offers the anchor output to the sweeper and waits for it to be swept.
+// Resolve waits for the output to be swept.
+//
+// NOTE: Part of the ContractResolver interface.
 func (c *anchorResolver) Resolve() (ContractResolver, error) {
-	// Attempt to update the sweep parameters to the post-confirmation
-	// situation. We don't want to force sweep anymore, because the anchor
-	// lost its special purpose to get the commitment confirmed. It is just
-	// an output that we want to sweep only if it is economical to do so.
-	//
-	// An exclusive group is not necessary anymore, because we know that
-	// this is the only anchor that can be swept.
-	//
-	// We also clear the parent tx information for cpfp, because the
-	// commitment tx is confirmed.
-	//
-	// After a restart or when the remote force closes, the sweeper is not
-	// yet aware of the anchor. In that case, it will be added as new input
-	// to the sweeper.
-	relayFeeRate := c.Sweeper.RelayFeePerKW()
-
-	anchorInput := input.MakeBaseInput(
-		&c.anchor,
-		input.CommitmentAnchor,
-		&c.anchorSignDescriptor,
-		c.broadcastHeight,
-		nil,
-	)
-
-	resultChan, err := c.Sweeper.SweepInput(
-		&anchorInput,
-		sweep.Params{
-			Fee: sweep.FeePreference{
-				FeeRate: relayFeeRate,
-			},
-		},
-	)
-	if err != nil {
-		return nil, err
+	// If we're already resolved, then we can exit early.
+	if c.IsResolved() {
+		c.log.Errorf("already resolved")
+		return nil, nil
 	}
 
 	var (
@@ -123,7 +97,7 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	)
 
 	select {
-	case sweepRes := <-resultChan:
+	case sweepRes := <-c.sweepResultChan:
 		switch sweepRes.Err {
 		// Anchor was swept successfully.
 		case nil:
@@ -138,17 +112,6 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 			c.log.Warnf("our anchor spent by someone else")
 			outcome = channeldb.ResolverOutcomeUnclaimed
 
-		// The sweeper gave up on sweeping the anchor. This happens
-		// after the maximum number of sweep attempts has been reached.
-		// See sweep.DefaultMaxSweepAttempts. Sweep attempts are
-		// interspaced with random delays picked from a range that
-		// increases exponentially.
-		//
-		// We consider the anchor as being lost.
-		case sweep.ErrTooManyAttempts:
-			c.log.Warnf("anchor sweep abandoned")
-			outcome = channeldb.ResolverOutcomeUnclaimed
-
 		// An unexpected error occurred.
 		default:
 			c.log.Errorf("unable to sweep anchor: %v", sweepRes.Err)
@@ -159,6 +122,8 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	case <-c.quit:
 		return nil, errResolverShuttingDown
 	}
+
+	c.log.Infof("resolved in tx %v", spendTx)
 
 	// Update report to reflect that funds are no longer in limbo.
 	c.reportLock.Lock()
@@ -171,7 +136,7 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	)
 	c.reportLock.Unlock()
 
-	c.resolved = true
+	c.markResolved()
 	return nil, c.PutResolverReport(nil, report)
 }
 
@@ -180,22 +145,18 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 //
 // NOTE: Part of the ContractResolver interface.
 func (c *anchorResolver) Stop() {
-	close(c.quit)
-}
+	c.log.Debugf("stopping...")
+	defer c.log.Debugf("stopped")
 
-// IsResolved returns true if the stored state in the resolve is fully
-// resolved. In this case the target output can be forgotten.
-//
-// NOTE: Part of the ContractResolver interface.
-func (c *anchorResolver) IsResolved() bool {
-	return c.resolved
+	close(c.quit)
 }
 
 // SupplementState allows the user of a ContractResolver to supplement it with
 // state required for the proper resolution of a contract.
 //
 // NOTE: Part of the ContractResolver interface.
-func (c *anchorResolver) SupplementState(_ *channeldb.OpenChannel) {
+func (c *anchorResolver) SupplementState(state *channeldb.OpenChannel) {
+	c.chanType = state.ChanType
 }
 
 // report returns a report on the resolution state of the contract.
@@ -214,3 +175,68 @@ func (c *anchorResolver) Encode(w io.Writer) error {
 // A compile time assertion to ensure anchorResolver meets the
 // ContractResolver interface.
 var _ ContractResolver = (*anchorResolver)(nil)
+
+// Launch offers the anchor output to the sweeper.
+func (c *anchorResolver) Launch() error {
+	if c.isLaunched() {
+		c.log.Tracef("already launched")
+		return nil
+	}
+
+	c.log.Debugf("launching resolver...")
+	c.markLaunched()
+
+	// If we're already resolved, then we can exit early.
+	if c.IsResolved() {
+		c.log.Errorf("already resolved")
+		return nil
+	}
+
+	// Attempt to update the sweep parameters to the post-confirmation
+	// situation. We don't want to force sweep anymore, because the anchor
+	// lost its special purpose to get the commitment confirmed. It is just
+	// an output that we want to sweep only if it is economical to do so.
+	//
+	// An exclusive group is not necessary anymore, because we know that
+	// this is the only anchor that can be swept.
+	//
+	// We also clear the parent tx information for cpfp, because the
+	// commitment tx is confirmed.
+	//
+	// After a restart or when the remote force closes, the sweeper is not
+	// yet aware of the anchor. In that case, it will be added as new input
+	// to the sweeper.
+	witnessType := input.CommitmentAnchor
+
+	// For taproot channels, we need to use the proper witness type.
+	if c.chanType.IsTaproot() {
+		witnessType = input.TaprootAnchorSweepSpend
+	}
+
+	anchorInput := input.MakeBaseInput(
+		&c.anchor, witnessType, &c.anchorSignDescriptor,
+		c.broadcastHeight, nil,
+	)
+
+	resultChan, err := c.Sweeper.SweepInput(
+		&anchorInput,
+		sweep.Params{
+			// For normal anchor sweeping, the budget is 330 sats.
+			Budget: btcutil.Amount(
+				anchorInput.SignDesc().Output.Value,
+			),
+
+			// There's no rush to sweep the anchor, so we use a nil
+			// deadline here.
+			DeadlineHeight: fn.None[int32](),
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	c.sweepResultChan = resultChan
+
+	return nil
+}

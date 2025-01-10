@@ -2,11 +2,14 @@ package lnd
 
 import (
 	"github.com/btcsuite/btcd/connmgr"
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcd/rpcclient"
+	btclogv1 "github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/neutrino"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/chanacceptor"
@@ -18,9 +21,13 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/funding"
+	"github.com/lightningnetwork/lnd/graph"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/healthcheck"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/invoices"
+	"github.com/lightningnetwork/lnd/kvdb/sqlbase"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc/autopilotrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/devrpc"
@@ -41,6 +48,8 @@ import (
 	"github.com/lightningnetwork/lnd/peer"
 	"github.com/lightningnetwork/lnd/peernotifier"
 	"github.com/lightningnetwork/lnd/routing"
+	"github.com/lightningnetwork/lnd/routing/blindedpath"
+	"github.com/lightningnetwork/lnd/routing/localchans"
 	"github.com/lightningnetwork/lnd/rpcperms"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -91,7 +100,7 @@ var (
 
 // genSubLogger creates a logger for a subsystem. We provide an instance of
 // a signal.Interceptor to be able to shutdown in the case of a critical error.
-func genSubLogger(root *build.RotatingLogWriter,
+func genSubLogger(root *build.SubLoggerManager,
 	interceptor signal.Interceptor) func(string) btclog.Logger {
 
 	// Create a shutdown function which will request shutdown from our
@@ -112,7 +121,9 @@ func genSubLogger(root *build.RotatingLogWriter,
 }
 
 // SetupLoggers initializes all package-global logger variables.
-func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor) {
+//
+//nolint:ll
+func SetupLoggers(root *build.SubLoggerManager, interceptor signal.Interceptor) {
 	genLogger := genSubLogger(root, interceptor)
 
 	// Now that we have the proper root logger, we can replace the
@@ -121,6 +132,16 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 		l.Logger = build.NewSubLogger(l.subsystem, genLogger)
 		SetSubLogger(root, l.subsystem, l.Logger)
 	}
+
+	// Initialize loggers from packages outside of `lnd` first. The
+	// packages below will overwrite the names of the loggers they import.
+	// For instance, the logger in `neutrino.query` is overwritten by
+	// `btcwallet.chain`, which is overwritten by `lnwallet`. To ensure the
+	// overwriting works, we need to initialize the loggers here so they
+	// can be overwritten later.
+	AddV1SubLogger(root, "BTCN", interceptor, neutrino.UseLogger)
+	AddV1SubLogger(root, "CMGR", interceptor, connmgr.UseLogger)
+	AddV1SubLogger(root, "RPCC", interceptor, rpcclient.UseLogger)
 
 	// Some of the loggers declared in the main lnd package are also used
 	// in sub packages.
@@ -131,13 +152,12 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	AddSubLogger(root, "DISC", interceptor, discovery.UseLogger)
 	AddSubLogger(root, "NTFN", interceptor, chainntnfs.UseLogger)
 	AddSubLogger(root, "CHDB", interceptor, channeldb.UseLogger)
+	AddSubLogger(root, "SQLB", interceptor, sqlbase.UseLogger)
 	AddSubLogger(root, "HSWC", interceptor, htlcswitch.UseLogger)
-	AddSubLogger(root, "CMGR", interceptor, connmgr.UseLogger)
-	AddSubLogger(root, "BTCN", interceptor, neutrino.UseLogger)
 	AddSubLogger(root, "CNCT", interceptor, contractcourt.UseLogger)
 	AddSubLogger(root, "UTXN", interceptor, contractcourt.UseNurseryLogger)
 	AddSubLogger(root, "BRAR", interceptor, contractcourt.UseBreachLogger)
-	AddSubLogger(root, "SPHX", interceptor, sphinx.UseLogger)
+	AddV1SubLogger(root, "SPHX", interceptor, sphinx.UseLogger)
 	AddSubLogger(root, "SWPR", interceptor, sweep.UseLogger)
 	AddSubLogger(root, "SGNR", interceptor, signrpc.UseLogger)
 	AddSubLogger(root, "WLKT", interceptor, walletrpc.UseLogger)
@@ -157,6 +177,7 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	AddSubLogger(root, "CHFD", interceptor, chanfunding.UseLogger)
 	AddSubLogger(root, "PEER", interceptor, peer.UseLogger)
 	AddSubLogger(root, "CHCL", interceptor, chancloser.UseLogger)
+	AddSubLogger(root, "LCHN", interceptor, localchans.UseLogger)
 
 	AddSubLogger(root, routing.Subsystem, interceptor, routing.UseLogger)
 	AddSubLogger(root, routerrpc.Subsystem, interceptor, routerrpc.UseLogger)
@@ -172,11 +193,18 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	AddSubLogger(root, btcwallet.Subsystem, interceptor, btcwallet.UseLogger)
 	AddSubLogger(root, rpcwallet.Subsystem, interceptor, rpcwallet.UseLogger)
 	AddSubLogger(root, peersrpc.Subsystem, interceptor, peersrpc.UseLogger)
+	AddSubLogger(root, graph.Subsystem, interceptor, graph.UseLogger)
+	AddSubLogger(root, lncfg.Subsystem, interceptor, lncfg.UseLogger)
+	AddSubLogger(
+		root, blindedpath.Subsystem, interceptor, blindedpath.UseLogger,
+	)
+	AddV1SubLogger(root, graphdb.Subsystem, interceptor, graphdb.UseLogger)
+	AddSubLogger(root, chainio.Subsystem, interceptor, chainio.UseLogger)
 }
 
 // AddSubLogger is a helper method to conveniently create and register the
 // logger of one or more sub systems.
-func AddSubLogger(root *build.RotatingLogWriter, subsystem string,
+func AddSubLogger(root *build.SubLoggerManager, subsystem string,
 	interceptor signal.Interceptor, useLoggers ...func(btclog.Logger)) {
 
 	// genSubLogger will return a callback for creating a logger instance,
@@ -189,9 +217,9 @@ func AddSubLogger(root *build.RotatingLogWriter, subsystem string,
 	SetSubLogger(root, subsystem, logger, useLoggers...)
 }
 
-// SetSubLogger is a helper method to conveniently register the logger of a sub
-// system.
-func SetSubLogger(root *build.RotatingLogWriter, subsystem string,
+// SetSubLogger is a helper method to conveniently register the logger of a
+// sub system.
+func SetSubLogger(root *build.SubLoggerManager, subsystem string,
 	logger btclog.Logger, useLoggers ...func(btclog.Logger)) {
 
 	root.RegisterSubLogger(subsystem, logger)
@@ -200,18 +228,30 @@ func SetSubLogger(root *build.RotatingLogWriter, subsystem string,
 	}
 }
 
-// logClosure is used to provide a closure over expensive logging operations so
-// don't have to be performed when the logging level doesn't warrant it.
-type logClosure func() string
+// AddV1SubLogger is a helper method to conveniently create and register the
+// logger of one or more sub systems.
+func AddV1SubLogger(root *build.SubLoggerManager, subsystem string,
+	interceptor signal.Interceptor, useLoggers ...func(btclogv1.Logger)) {
 
-// String invokes the underlying function and returns the result.
-func (c logClosure) String() string {
-	return c()
+	// genSubLogger will return a callback for creating a logger instance,
+	// which we will give to the root logger.
+	genLogger := genSubLogger(root, interceptor)
+
+	// Create and register just a single logger to prevent them from
+	// overwriting each other internally.
+	logger := build.NewSubLogger(subsystem, genLogger)
+	SetV1SubLogger(root, subsystem, logger, useLoggers...)
 }
 
-// newLogClosure returns a new closure over a function that returns a string
-// which itself provides a Stringer interface so that it can be used with the
-// logging system.
-func newLogClosure(c func() string) logClosure {
-	return logClosure(c)
+// SetV1SubLogger is a helper method to conveniently register the logger of a
+// sub system. Note that the btclog v2 logger implements the btclog v1 logger
+// which is why we can pass the v2 logger to the UseLogger call-backs that
+// expect the v1 logger.
+func SetV1SubLogger(root *build.SubLoggerManager, subsystem string,
+	logger btclog.Logger, useLoggers ...func(btclogv1.Logger)) {
+
+	root.RegisterSubLogger(subsystem, logger)
+	for _, useLogger := range useLoggers {
+		useLogger(logger)
+	}
 }

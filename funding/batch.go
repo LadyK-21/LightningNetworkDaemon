@@ -72,7 +72,7 @@ func (c *batchChannel) processPendingUpdate(u *lnrpc.OpenStatusUpdate) error {
 
 	hash, err := chainhash.NewHash(pendingUpd.Txid)
 	if err != nil {
-		return fmt.Errorf("could not parse outpoint TX hash: %v", err)
+		return fmt.Errorf("could not parse outpoint TX hash: %w", err)
 	}
 
 	c.chanPoint = &wire.OutPoint{
@@ -134,7 +134,8 @@ type Wallet interface {
 	PsbtFundingFinalize([32]byte, *psbt.Packet, *wire.MsgTx) error
 
 	// PublishTransaction performs cursory validation (dust checks, etc),
-	// then finally broadcasts the passed transaction to the Bitcoin network.
+	// then finally broadcasts the passed transaction to the Bitcoin
+	// network.
 	PublishTransaction(*wire.MsgTx, string) error
 
 	// CancelFundingIntent allows a caller to cancel a previously registered
@@ -225,23 +226,35 @@ func (b *Batcher) BatchFund(ctx context.Context,
 					"chan ID")
 			}
 		} else if _, err := rand.Read(pendingChanID[:]); err != nil {
-			return nil, fmt.Errorf("error making temp chan ID: %v",
+			return nil, fmt.Errorf("error making temp chan ID: %w",
 				err)
 		}
 
+		//nolint:ll
 		fundingReq, err := b.cfg.RequestParser(&lnrpc.OpenChannelRequest{
-			SatPerVbyte:        uint64(req.SatPerVbyte),
-			NodePubkey:         rpcChannel.NodePubkey,
-			LocalFundingAmount: rpcChannel.LocalFundingAmount,
-			PushSat:            rpcChannel.PushSat,
-			TargetConf:         req.TargetConf,
-			Private:            rpcChannel.Private,
-			MinHtlcMsat:        rpcChannel.MinHtlcMsat,
-			RemoteCsvDelay:     rpcChannel.RemoteCsvDelay,
-			MinConfs:           req.MinConfs,
-			SpendUnconfirmed:   req.SpendUnconfirmed,
-			CloseAddress:       rpcChannel.CloseAddress,
-			CommitmentType:     rpcChannel.CommitmentType,
+			SatPerVbyte:                uint64(req.SatPerVbyte),
+			TargetConf:                 req.TargetConf,
+			MinConfs:                   req.MinConfs,
+			SpendUnconfirmed:           req.SpendUnconfirmed,
+			NodePubkey:                 rpcChannel.NodePubkey,
+			LocalFundingAmount:         rpcChannel.LocalFundingAmount,
+			PushSat:                    rpcChannel.PushSat,
+			Private:                    rpcChannel.Private,
+			MinHtlcMsat:                rpcChannel.MinHtlcMsat,
+			RemoteCsvDelay:             rpcChannel.RemoteCsvDelay,
+			CloseAddress:               rpcChannel.CloseAddress,
+			RemoteMaxValueInFlightMsat: rpcChannel.RemoteMaxValueInFlightMsat,
+			RemoteMaxHtlcs:             rpcChannel.RemoteMaxHtlcs,
+			MaxLocalCsv:                rpcChannel.MaxLocalCsv,
+			CommitmentType:             rpcChannel.CommitmentType,
+			ZeroConf:                   rpcChannel.ZeroConf,
+			ScidAlias:                  rpcChannel.ScidAlias,
+			BaseFee:                    rpcChannel.BaseFee,
+			FeeRate:                    rpcChannel.FeeRate,
+			UseBaseFee:                 rpcChannel.UseBaseFee,
+			UseFeeRate:                 rpcChannel.UseFeeRate,
+			RemoteChanReserveSat:       rpcChannel.RemoteChanReserveSat,
+			Memo:                       rpcChannel.Memo,
 			FundingShim: &lnrpc.FundingShim{
 				Shim: &lnrpc.FundingShim_PsbtShim{
 					PsbtShim: &lnrpc.PsbtShim{
@@ -252,7 +265,7 @@ func (b *Batcher) BatchFund(ctx context.Context,
 			},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("error parsing channel %d: %v",
+			return nil, fmt.Errorf("error parsing channel %d: %w",
 				idx, err)
 		}
 
@@ -318,16 +331,19 @@ func (b *Batcher) BatchFund(ctx context.Context,
 	// settings from the first request as all of them should be equal
 	// anyway.
 	firstReq := b.channels[0].fundingReq
-	feeRateSatPerKVByte := firstReq.FundingFeePerKw.FeePerKVByte()
+	feeRateSatPerVByte := firstReq.FundingFeePerKw.FeePerVByte()
+	changeType := walletrpc.ChangeAddressType_CHANGE_ADDRESS_TYPE_P2TR
 	fundPsbtReq := &walletrpc.FundPsbtRequest{
 		Template: &walletrpc.FundPsbtRequest_Raw{
 			Raw: txTemplate,
 		},
 		Fees: &walletrpc.FundPsbtRequest_SatPerVbyte{
-			SatPerVbyte: uint64(feeRateSatPerKVByte) / 1000,
+			SatPerVbyte: uint64(feeRateSatPerVByte),
 		},
-		MinConfs:         firstReq.MinConfs,
-		SpendUnconfirmed: firstReq.MinConfs == 0,
+		MinConfs:              firstReq.MinConfs,
+		SpendUnconfirmed:      firstReq.MinConfs == 0,
+		ChangeType:            changeType,
+		CoinSelectionStrategy: req.CoinSelectionStrategy,
 	}
 	fundPsbtResp, err := b.cfg.WalletKitServer.FundPsbt(ctx, fundPsbtReq)
 	if err != nil {
@@ -358,7 +374,7 @@ func (b *Batcher) BatchFund(ctx context.Context,
 			channel.pendingChanID, unsignedPacket, false,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("error verifying PSBT: %v", err)
+			return nil, fmt.Errorf("error verifying PSBT: %w", err)
 		}
 	}
 
@@ -376,7 +392,7 @@ func (b *Batcher) BatchFund(ctx context.Context,
 	finalTx := &wire.MsgTx{}
 	txReader := bytes.NewReader(finalizePsbtResp.RawFinalTx)
 	if err := finalTx.Deserialize(txReader); err != nil {
-		return nil, fmt.Errorf("error parsing signed raw TX: %v", err)
+		return nil, fmt.Errorf("error parsing signed raw TX: %w", err)
 	}
 	log.Tracef("[batchopenchannel] signed PSBT: %s",
 		base64.StdEncoding.EncodeToString(finalizePsbtResp.SignedPsbt))
@@ -388,7 +404,7 @@ func (b *Batcher) BatchFund(ctx context.Context,
 			channel.pendingChanID, nil, finalTx,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("error finalizing PSBT: %v", err)
+			return nil, fmt.Errorf("error finalizing PSBT: %w", err)
 		}
 	}
 
@@ -487,6 +503,7 @@ func (b *Batcher) cleanup(ctx context.Context) {
 		rpcOP := &lnrpc.OutPoint{
 			OutputIndex: lockedUTXO.Outpoint.OutputIndex,
 			TxidBytes:   lockedUTXO.Outpoint.TxidBytes,
+			TxidStr:     lockedUTXO.Outpoint.TxidStr,
 		}
 		_, err := b.cfg.WalletKitServer.ReleaseOutput(
 			ctx, &walletrpc.ReleaseOutputRequest{

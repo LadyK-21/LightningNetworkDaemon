@@ -6,15 +6,15 @@ package lnd
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // nolint:gosec // used to set up profiling HTTP handlers.
+	"net/http/pprof"
 	"os"
-	"runtime/pprof"
+	"runtime"
+	runtimePprof "runtime/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +23,9 @@ import (
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/build"
-	"github.com/lightningnetwork/lnd/cert"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/cluster"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -37,10 +37,9 @@ import (
 	"github.com/lightningnetwork/lnd/tor"
 	"github.com/lightningnetwork/lnd/walletunlocker"
 	"github.com/lightningnetwork/lnd/watchtower"
-	"golang.org/x/crypto/acme/autocert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/grpc/keepalive"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon.v2"
 )
@@ -59,6 +58,14 @@ const (
 	// admin macaroon unless the administrator explicitly allowed it. Thus
 	// there's no harm allowing group read.
 	adminMacaroonFilePermissions = 0640
+
+	// leaderResignTimeout is the timeout used when resigning from the
+	// leader role. This is kept short so LND can shut down quickly in case
+	// of a system failure or network partition making the cluster
+	// unresponsive. The cluster itself should ensure that the leader is not
+	// elected again until the previous leader has resigned or the leader
+	// election timeout has passed.
+	leaderResignTimeout = 5 * time.Second
 )
 
 // AdminAuthOptions returns a list of DialOptions that can be used to
@@ -74,7 +81,7 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 
 	creds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
 	if err != nil {
-		return nil, fmt.Errorf("unable to read TLS cert: %v", err)
+		return nil, fmt.Errorf("unable to read TLS cert: %w", err)
 	}
 
 	// Create a dial options array.
@@ -85,7 +92,7 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 	// Get the admin macaroon if macaroons are active.
 	if !skipMacaroons && !cfg.NoMacaroons {
 		// Load the admin macaroon file.
-		macBytes, err := ioutil.ReadFile(cfg.AdminMacPath)
+		macBytes, err := os.ReadFile(cfg.AdminMacPath)
 		if err != nil {
 			return nil, fmt.Errorf("unable to read macaroon "+
 				"path (check the network setting!): %v", err)
@@ -93,14 +100,14 @@ func AdminAuthOptions(cfg *Config, skipMacaroons bool) ([]grpc.DialOption,
 
 		mac := &macaroon.Macaroon{}
 		if err = mac.UnmarshalBinary(macBytes); err != nil {
-			return nil, fmt.Errorf("unable to decode macaroon: %v",
+			return nil, fmt.Errorf("unable to decode macaroon: %w",
 				err)
 		}
 
 		// Now we append the macaroon credentials to the dial options.
 		cred, err := macaroons.NewMacaroonCredential(mac)
 		if err != nil {
-			return nil, fmt.Errorf("error cloning mac: %v", err)
+			return nil, fmt.Errorf("error cloning mac: %w", err)
 		}
 		opts = append(opts, grpc.WithPerRPCCredentials(cred))
 	}
@@ -142,87 +149,167 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	interceptor signal.Interceptor) error {
 
 	defer func() {
-		ltndLog.Info("Shutdown complete\n")
-		err := cfg.LogWriter.Close()
+		ltndLog.Info("Shutdown complete")
+		err := cfg.LogRotator.Close()
 		if err != nil {
 			ltndLog.Errorf("Could not close log rotator: %v", err)
 		}
 	}()
 
-	mkErr := func(format string, args ...interface{}) error {
-		ltndLog.Errorf("Shutting down because error in main "+
-			"method: "+format, args...)
-		return fmt.Errorf(format, args...)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx, err := build.WithBuildInfo(ctx, cfg.LogConfig)
+	if err != nil {
+		return fmt.Errorf("unable to add build info to context: %w",
+			err)
+	}
+
+	mkErr := func(msg string, err error, attrs ...any) error {
+		ltndLog.ErrorS(ctx, "Shutting down due to error in main "+
+			"method", err, attrs...)
+
+		var (
+			params = []any{err}
+			fmtStr = msg + ": %w"
+		)
+		for _, attr := range attrs {
+			fmtStr += " %s"
+
+			params = append(params, attr)
+		}
+
+		return fmt.Errorf(fmtStr, params...)
 	}
 
 	// Show version at startup.
-	ltndLog.Infof("Version: %s commit=%s, build=%s, logging=%s, "+
-		"debuglevel=%s", build.Version(), build.Commit,
-		build.Deployment, build.LoggingType, cfg.DebugLevel)
+	ltndLog.InfoS(ctx, "Version Info",
+		slog.String("version", build.Version()),
+		slog.String("commit", build.Commit),
+		slog.Any("debuglevel", build.Deployment),
+		slog.String("logging", cfg.DebugLevel))
 
 	var network string
 	switch {
-	case cfg.Bitcoin.TestNet3 || cfg.Litecoin.TestNet3:
+	case cfg.Bitcoin.TestNet3:
 		network = "testnet"
 
-	case cfg.Bitcoin.MainNet || cfg.Litecoin.MainNet:
+	case cfg.Bitcoin.MainNet:
 		network = "mainnet"
 
-	case cfg.Bitcoin.SimNet || cfg.Litecoin.SimNet:
+	case cfg.Bitcoin.SimNet:
 		network = "simnet"
 
-	case cfg.Bitcoin.RegTest || cfg.Litecoin.RegTest:
+	case cfg.Bitcoin.RegTest:
 		network = "regtest"
 
 	case cfg.Bitcoin.SigNet:
 		network = "signet"
 	}
 
-	ltndLog.Infof("Active chain: %v (network=%v)",
-		strings.Title(cfg.registeredChains.PrimaryChain().String()),
-		network,
-	)
+	ltndLog.InfoS(ctx, "Network Info",
+		"active_chain", strings.Title(BitcoinChainName),
+		"network", network)
 
 	// Enable http profiling server if requested.
-	if cfg.Profile != "" {
+	if cfg.Pprof.Profile != "" {
+		// Create the http handler.
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+		if cfg.Pprof.BlockingProfile != 0 {
+			runtime.SetBlockProfileRate(cfg.Pprof.BlockingProfile)
+		}
+		if cfg.Pprof.MutexProfile != 0 {
+			runtime.SetMutexProfileFraction(cfg.Pprof.MutexProfile)
+		}
+
+		// Redirect all requests to the pprof handler, thus visiting
+		// `127.0.0.1:6060` will be redirected to
+		// `127.0.0.1:6060/debug/pprof`.
+		pprofMux.Handle("/", http.RedirectHandler(
+			"/debug/pprof/", http.StatusSeeOther,
+		))
+
+		ltndLog.InfoS(ctx, "Pprof listening", "addr", cfg.Pprof.Profile)
+
+		// Create the pprof server.
+		pprofServer := &http.Server{
+			Addr:              cfg.Pprof.Profile,
+			Handler:           pprofMux,
+			ReadHeaderTimeout: cfg.HTTPHeaderTimeout,
+		}
+
+		// Shut the server down when lnd is shutting down.
+		defer func() {
+			ltndLog.InfoS(ctx, "Stopping pprof server...")
+			err := pprofServer.Shutdown(ctx)
+			if err != nil {
+				ltndLog.ErrorS(ctx, "Stop pprof server", err)
+			}
+		}()
+
+		// Start the pprof server.
 		go func() {
-			profileRedirect := http.RedirectHandler("/debug/pprof",
-				http.StatusSeeOther)
-			http.Handle("/", profileRedirect)
-			ltndLog.Infof("Pprof listening on %v", cfg.Profile)
-			fmt.Println(http.ListenAndServe(cfg.Profile, nil))
+			err := pprofServer.ListenAndServe()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				ltndLog.ErrorS(ctx, "Could not serve pprof "+
+					"server", err)
+			}
 		}()
 	}
 
 	// Write cpu profile if requested.
-	if cfg.CPUProfile != "" {
-		f, err := os.Create(cfg.CPUProfile)
+	if cfg.Pprof.CPUProfile != "" {
+		f, err := os.Create(cfg.Pprof.CPUProfile)
 		if err != nil {
-			return mkErr("unable to create CPU profile: %v", err)
+			return mkErr("unable to create CPU profile", err)
 		}
-		pprof.StartCPUProfile(f)
-		defer f.Close()
-		defer pprof.StopCPUProfile()
+		_ = runtimePprof.StartCPUProfile(f)
+		defer func() {
+			_ = f.Close()
+		}()
+		defer runtimePprof.StopCPUProfile()
 	}
-
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	// Run configuration dependent DB pre-initialization. Note that this
 	// needs to be done early and once during the startup process, before
 	// any DB access.
 	if err := cfg.DB.Init(ctx, cfg.graphDatabaseDir()); err != nil {
-		return mkErr("error initializing DBs: %v", err)
+		return mkErr("error initializing DBs", err)
 	}
 
-	// Only process macaroons if --no-macaroons isn't set.
-	serverOpts, restDialOpts, restListen, cleanUp, err := getTLSConfig(cfg)
+	tlsManagerCfg := &TLSManagerCfg{
+		TLSCertPath:        cfg.TLSCertPath,
+		TLSKeyPath:         cfg.TLSKeyPath,
+		TLSEncryptKey:      cfg.TLSEncryptKey,
+		TLSExtraIPs:        cfg.TLSExtraIPs,
+		TLSExtraDomains:    cfg.TLSExtraDomains,
+		TLSAutoRefresh:     cfg.TLSAutoRefresh,
+		TLSDisableAutofill: cfg.TLSDisableAutofill,
+		TLSCertDuration:    cfg.TLSCertDuration,
+
+		LetsEncryptDir:    cfg.LetsEncryptDir,
+		LetsEncryptDomain: cfg.LetsEncryptDomain,
+		LetsEncryptListen: cfg.LetsEncryptListen,
+
+		DisableRestTLS: cfg.DisableRestTLS,
+
+		HTTPHeaderTimeout: cfg.HTTPHeaderTimeout,
+	}
+	tlsManager := NewTLSManager(tlsManagerCfg)
+	serverOpts, restDialOpts, restListen, cleanUp,
+		err := tlsManager.SetCertificateBeforeUnlock()
 	if err != nil {
-		return mkErr("unable to load TLS credentials: %v", err)
+		return mkErr("error setting cert before unlock", err)
 	}
-
-	defer cleanUp()
+	if cleanUp != nil {
+		defer cleanUp()
+	}
 
 	// If we have chosen to start with a dedicated listener for the
 	// rpc server, we set it directly.
@@ -235,8 +322,12 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			// connections.
 			lis, err := lncfg.ListenOnAddress(grpcEndpoint)
 			if err != nil {
-				return mkErr("unable to listen on %s: %v",
-					grpcEndpoint, err)
+				return mkErr("unable to listen on grpc "+
+					"endpoint", err,
+					slog.String(
+						"endpoint",
+						grpcEndpoint.String(),
+					))
 			}
 			defer lis.Close()
 
@@ -255,7 +346,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		rpcsLog, cfg.NoMacaroons, cfg.RPCMiddleware.Mandatory,
 	)
 	if err := interceptorChain.Start(); err != nil {
-		return mkErr("error starting interceptor chain: %v", err)
+		return mkErr("error starting interceptor chain", err)
 	}
 	defer func() {
 		err := interceptorChain.Stop()
@@ -265,10 +356,23 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		}
 	}()
 
+	// Allow the user to overwrite some defaults of the gRPC library related
+	// to connection keepalive (server side and client side pings).
+	serverKeepalive := keepalive.ServerParameters{
+		Time:    cfg.GRPC.ServerPingTime,
+		Timeout: cfg.GRPC.ServerPingTimeout,
+	}
+	clientKeepalive := keepalive.EnforcementPolicy{
+		MinTime:             cfg.GRPC.ClientPingMinWait,
+		PermitWithoutStream: cfg.GRPC.ClientAllowPingWithoutStream,
+	}
+
 	rpcServerOpts := interceptorChain.CreateServerOpts()
 	serverOpts = append(serverOpts, rpcServerOpts...)
 	serverOpts = append(
 		serverOpts, grpc.MaxRecvMsgSize(lnrpc.MaxGrpcMsgSize),
+		grpc.KeepaliveParams(serverKeepalive),
+		grpc.KeepaliveEnforcementPolicy(clientKeepalive),
 	)
 
 	grpcServer := grpc.NewServer(serverOpts...)
@@ -283,14 +387,14 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	rpcServer := newRPCServer(cfg, interceptorChain, implCfg, interceptor)
 	err = rpcServer.RegisterWithGrpcServer(grpcServer)
 	if err != nil {
-		return mkErr("error registering gRPC server: %v", err)
+		return mkErr("error registering gRPC server", err)
 	}
 
 	// Now that both the WalletUnlocker and LightningService have been
 	// registered with the GRPC server, we can start listening.
 	err = startGrpcListen(cfg, grpcServer, grpcListeners)
 	if err != nil {
-		return mkErr("error starting gRPC listener: %v", err)
+		return mkErr("error starting gRPC listener", err)
 	}
 
 	// Now start the REST proxy for our gRPC server above. We'll ensure
@@ -298,10 +402,10 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// wildcard to prevent certificate issues when accessing the proxy
 	// externally.
 	stopProxy, err := startRestProxy(
-		cfg, rpcServer, restDialOpts, restListen,
+		ctx, cfg, rpcServer, restDialOpts, restListen,
 	)
 	if err != nil {
-		return mkErr("error starting REST proxy: %v", err)
+		return mkErr("error starting REST proxy", err)
 	}
 	defer stopProxy()
 
@@ -309,6 +413,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// blocked until this instance is elected as the current leader or
 	// shutting down.
 	elected := false
+	var leaderElector cluster.LeaderElector
 	if cfg.Cluster.EnableLeaderElection {
 		electionCtx, cancelElection := context.WithCancel(ctx)
 
@@ -317,10 +422,10 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			cancelElection()
 		}()
 
-		ltndLog.Infof("Using %v leader elector",
-			cfg.Cluster.LeaderElector)
+		ltndLog.InfoS(ctx, "Using leader elector",
+			"elector", cfg.Cluster.LeaderElector)
 
-		leaderElector, err := cfg.Cluster.MakeLeaderElector(
+		leaderElector, err = cfg.Cluster.MakeLeaderElector(
 			electionCtx, cfg.DB,
 		)
 		if err != nil {
@@ -332,42 +437,55 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 				return
 			}
 
-			ltndLog.Infof("Attempting to resign from leader role "+
-				"(%v)", cfg.Cluster.ID)
+			ltndLog.InfoS(ctx, "Attempting to resign from "+
+				"leader role", "cluster_id", cfg.Cluster.ID)
 
-			if err := leaderElector.Resign(); err != nil {
+			// Ensure that we don't block the shutdown process if
+			// the leader resigning process takes too long. The
+			// cluster will ensure that the leader is not elected
+			// again until the previous leader has resigned or the
+			// leader election timeout has passed.
+			timeoutCtx, cancel := context.WithTimeout(
+				ctx, leaderResignTimeout,
+			)
+			defer cancel()
+
+			if err := leaderElector.Resign(timeoutCtx); err != nil {
 				ltndLog.Errorf("Leader elector failed to "+
 					"resign: %v", err)
 			}
 		}()
 
-		ltndLog.Infof("Starting leadership campaign (%v)",
-			cfg.Cluster.ID)
+		ltndLog.InfoS(ctx, "Starting leadership campaign",
+			"cluster_id", cfg.Cluster.ID)
 
 		if err := leaderElector.Campaign(electionCtx); err != nil {
-			return mkErr("leadership campaign failed: %v", err)
+			return mkErr("leadership campaign failed", err)
 		}
 
 		elected = true
-		ltndLog.Infof("Elected as leader (%v)", cfg.Cluster.ID)
+		ltndLog.InfoS(ctx, "Elected as leader",
+			"cluster_id", cfg.Cluster.ID)
 	}
 
 	dbs, cleanUp, err := implCfg.DatabaseBuilder.BuildDatabase(ctx)
 	switch {
-	case err == channeldb.ErrDryRunMigrationOK:
-		ltndLog.Infof("%v, exiting", err)
+	case errors.Is(err, channeldb.ErrDryRunMigrationOK):
+		ltndLog.InfoS(ctx, "Exiting due to BuildDatabase error",
+			slog.Any("err", err))
 		return nil
 	case err != nil:
-		return mkErr("unable to open databases: %v", err)
+		return mkErr("unable to open databases", err)
 	}
 
 	defer cleanUp()
 
 	partialChainControl, walletConfig, cleanUp, err := implCfg.BuildWalletConfig(
-		ctx, dbs, interceptorChain, grpcListeners,
+		ctx, dbs, &implCfg.AuxComponents, interceptorChain,
+		grpcListeners,
 	)
 	if err != nil {
-		return mkErr("error creating wallet config: %v", err)
+		return mkErr("error creating wallet config", err)
 	}
 
 	defer cleanUp()
@@ -376,16 +494,10 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		partialChainControl, walletConfig,
 	)
 	if err != nil {
-		return mkErr("error loading chain control: %v", err)
+		return mkErr("error loading chain control", err)
 	}
 
 	defer cleanUp()
-
-	// Finally before we start the server, we'll register the "holy
-	// trinity" of interface for our current "home chain" with the active
-	// chainRegistry interface.
-	primaryChain := cfg.registeredChains.PrimaryChain()
-	cfg.registeredChains.RegisterChain(primaryChain, activeChainControl)
 
 	// TODO(roasbeef): add rotation
 	idKeyDesc, err := activeChainControl.KeyRing.DeriveKey(
@@ -395,7 +507,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		},
 	)
 	if err != nil {
-		return mkErr("error deriving node key: %v", err)
+		return mkErr("error deriving node key", err)
 	}
 
 	if cfg.Tor.StreamIsolation && cfg.Tor.SkipProxyForClearNetTargets {
@@ -404,14 +516,14 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 
 	if cfg.Tor.Active {
 		if cfg.Tor.SkipProxyForClearNetTargets {
-			srvrLog.Info("Onion services are accessible via Tor! " +
-				"NOTE: Traffic to clearnet services is not " +
-				"routed via Tor.")
+			srvrLog.InfoS(ctx, "Onion services are accessible "+
+				"via Tor! NOTE: Traffic to clearnet services "+
+				"is not routed via Tor.")
 		} else {
-			srvrLog.Infof("Proxying all network traffic via Tor "+
-				"(stream_isolation=%v)! NOTE: Ensure the "+
-				"backend node is proxying over Tor as well",
-				cfg.Tor.StreamIsolation)
+			srvrLog.InfoS(ctx, "Proxying all network traffic "+
+				"via Tor! NOTE: Ensure the backend node is "+
+				"proxying over Tor as well",
+				"stream_isolation", cfg.Tor.StreamIsolation)
 		}
 	}
 
@@ -428,13 +540,13 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		// Start the tor controller before giving it to any other
 		// subsystems.
 		if err := torController.Start(); err != nil {
-			return mkErr("unable to initialize tor controller: %v",
+			return mkErr("unable to initialize tor controller",
 				err)
 		}
 		defer func() {
 			if err := torController.Stop(); err != nil {
-				ltndLog.Errorf("error stopping tor "+
-					"controller: %v", err)
+				ltndLog.ErrorS(ctx, "Error stopping tor "+
+					"controller", err)
 			}
 		}()
 	}
@@ -448,7 +560,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			},
 		)
 		if err != nil {
-			return mkErr("error deriving tower key: %v", err)
+			return mkErr("error deriving tower key", err)
 		}
 
 		wtCfg := &watchtower.Config{
@@ -489,12 +601,12 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			wtCfg, lncfg.NormalizeAddresses,
 		)
 		if err != nil {
-			return mkErr("unable to configure watchtower: %v", err)
+			return mkErr("unable to configure watchtower", err)
 		}
 
 		tower, err = watchtower.New(wtConfig)
 		if err != nil {
-			return mkErr("unable to create watchtower: %v", err)
+			return mkErr("unable to create watchtower", err)
 		}
 	}
 
@@ -513,10 +625,11 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	server, err := newServer(
 		cfg, cfg.Listeners, dbs, activeChainControl, &idKeyDesc,
 		activeChainControl.Cfg.WalletUnlockParams.ChansToRestore,
-		multiAcceptor, torController,
+		multiAcceptor, torController, tlsManager, leaderElector,
+		implCfg,
 	)
 	if err != nil {
-		return mkErr("unable to create server: %v", err)
+		return mkErr("unable to create server", err)
 	}
 
 	// Set up an autopilot manager from the current config. This will be
@@ -527,29 +640,35 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		cfg.ActiveNetParams,
 	)
 	if err != nil {
-		return mkErr("unable to initialize autopilot: %v", err)
+		return mkErr("unable to initialize autopilot", err)
 	}
 
 	atplManager, err := autopilot.NewManager(atplCfg)
 	if err != nil {
-		return mkErr("unable to create autopilot manager: %v", err)
+		return mkErr("unable to create autopilot manager", err)
 	}
 	if err := atplManager.Start(); err != nil {
-		return mkErr("unable to start autopilot manager: %v", err)
+		return mkErr("unable to start autopilot manager", err)
 	}
 	defer atplManager.Stop()
+
+	err = tlsManager.LoadPermanentCertificate(activeChainControl.KeyRing)
+	if err != nil {
+		return mkErr("unable to load permanent TLS certificate", err)
+	}
 
 	// Now we have created all dependencies necessary to populate and
 	// start the RPC server.
 	err = rpcServer.addDeps(
 		server, interceptorChain.MacaroonService(), cfg.SubRPCServers,
 		atplManager, server.invoices, tower, multiAcceptor,
+		server.invoiceHtlcModifier,
 	)
 	if err != nil {
-		return mkErr("unable to add deps to RPC server: %v", err)
+		return mkErr("unable to add deps to RPC server", err)
 	}
 	if err := rpcServer.Start(); err != nil {
-		return mkErr("unable to start RPC server: %v", err)
+		return mkErr("unable to start RPC server", err)
 	}
 	defer rpcServer.Stop()
 
@@ -557,7 +676,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	interceptorChain.SetRPCActive()
 
 	if err := interceptor.Notifier.NotifyReady(true); err != nil {
-		return mkErr("error notifying ready: %v", err)
+		return mkErr("error notifying ready", err)
 	}
 
 	// We'll wait until we're fully synced to continue the start up of the
@@ -566,44 +685,98 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// funds.
 	_, bestHeight, err := activeChainControl.ChainIO.GetBestBlock()
 	if err != nil {
-		return mkErr("unable to determine chain tip: %v", err)
+		return mkErr("unable to determine chain tip", err)
 	}
 
-	ltndLog.Infof("Waiting for chain backend to finish sync, "+
-		"start_height=%v", bestHeight)
+	ltndLog.InfoS(ctx, "Waiting for chain backend to finish sync",
+		slog.Int64("start_height", int64(bestHeight)))
+
+	type syncResult struct {
+		synced        bool
+		bestBlockTime int64
+		err           error
+	}
+
+	var syncedResChan = make(chan syncResult, 1)
 
 	for {
-		if !interceptor.Alive() {
+		// We check if the wallet is synced in a separate goroutine as
+		// the call is blocking, and we want to be able to interrupt it
+		// if the daemon is shutting down.
+		go func() {
+			synced, bestBlockTime, err := activeChainControl.Wallet.
+				IsSynced()
+			syncedResChan <- syncResult{synced, bestBlockTime, err}
+		}()
+
+		select {
+		case <-interceptor.ShutdownChannel():
 			return nil
+
+		case res := <-syncedResChan:
+			if res.err != nil {
+				return mkErr("unable to determine if wallet "+
+					"is synced", res.err)
+			}
+
+			ltndLog.DebugS(ctx, "Syncing to block chain",
+				"best_block_time", time.Unix(res.bestBlockTime, 0),
+				"is_synced", res.synced)
+
+			if res.synced {
+				break
+			}
+
+			// If we're not yet synced, we'll wait for a second
+			// before checking again.
+			select {
+			case <-interceptor.ShutdownChannel():
+				return nil
+
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
-		synced, _, err := activeChainControl.Wallet.IsSynced()
-		if err != nil {
-			return mkErr("unable to determine if wallet is "+
-				"synced: %v", err)
-		}
-
-		if synced {
-			break
-		}
-
-		time.Sleep(time.Second * 1)
+		break
 	}
 
 	_, bestHeight, err = activeChainControl.ChainIO.GetBestBlock()
 	if err != nil {
-		return mkErr("unable to determine chain tip: %v", err)
+		return mkErr("unable to determine chain tip", err)
 	}
 
-	ltndLog.Infof("Chain backend is fully synced (end_height=%v)!",
-		bestHeight)
+	ltndLog.InfoS(ctx, "Chain backend is fully synced!",
+		"end_height", bestHeight)
 
 	// With all the relevant chains initialized, we can finally start the
-	// server itself.
-	if err := server.Start(); err != nil {
-		return mkErr("unable to start server: %v", err)
+	// server itself. We start the server in an asynchronous goroutine so
+	// that we are able to interrupt and shutdown the daemon gracefully in
+	// case the startup of the subservers do not behave as expected.
+	errChan := make(chan error)
+	go func() {
+		errChan <- server.Start()
+	}()
+
+	defer func() {
+		err := server.Stop()
+		if err != nil {
+			ltndLog.WarnS(ctx, "Stopping the server including all "+
+				"its subsystems failed with", err)
+		}
+	}()
+
+	select {
+	case err := <-errChan:
+		if err == nil {
+			break
+		}
+
+		return mkErr("unable to start server", err)
+
+	case <-interceptor.ShutdownChannel():
+		return nil
 	}
-	defer server.Stop()
 
 	// We transition the server state to Active, as the server is up.
 	interceptorChain.SetServerActive()
@@ -613,13 +786,13 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// stopped together with the autopilot service.
 	if cfg.Autopilot.Active {
 		if err := atplManager.StartAgent(); err != nil {
-			return mkErr("unable to start autopilot agent: %v", err)
+			return mkErr("unable to start autopilot agent", err)
 		}
 	}
 
 	if cfg.Watchtower.Active {
 		if err := tower.Start(); err != nil {
-			return mkErr("unable to start watchtower: %v", err)
+			return mkErr("unable to start watchtower", err)
 		}
 		defer tower.Stop()
 	}
@@ -628,188 +801,6 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// the interrupt handler.
 	<-interceptor.ShutdownChannel()
 	return nil
-}
-
-// getTLSConfig returns a TLS configuration for the gRPC server and credentials
-// and a proxy destination for the REST reverse proxy.
-func getTLSConfig(cfg *Config) ([]grpc.ServerOption, []grpc.DialOption,
-	func(net.Addr) (net.Listener, error), func(), error) {
-
-	// Ensure we create TLS key and certificate if they don't exist.
-	if !fileExists(cfg.TLSCertPath) && !fileExists(cfg.TLSKeyPath) {
-		rpcsLog.Infof("Generating TLS certificates...")
-		err := cert.GenCertPair(
-			"lnd autogenerated cert", cfg.TLSCertPath,
-			cfg.TLSKeyPath, cfg.TLSExtraIPs, cfg.TLSExtraDomains,
-			cfg.TLSDisableAutofill, cfg.TLSCertDuration,
-		)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		rpcsLog.Infof("Done generating TLS certificates")
-	}
-
-	certData, parsedCert, err := cert.LoadCert(
-		cfg.TLSCertPath, cfg.TLSKeyPath,
-	)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	// We check whether the certificate we have on disk match the IPs and
-	// domains specified by the config. If the extra IPs or domains have
-	// changed from when the certificate was created, we will refresh the
-	// certificate if auto refresh is active.
-	refresh := false
-	if cfg.TLSAutoRefresh {
-		refresh, err = cert.IsOutdated(
-			parsedCert, cfg.TLSExtraIPs,
-			cfg.TLSExtraDomains, cfg.TLSDisableAutofill,
-		)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-	}
-
-	// If the certificate expired or it was outdated, delete it and the TLS
-	// key and generate a new pair.
-	if time.Now().After(parsedCert.NotAfter) || refresh {
-		ltndLog.Info("TLS certificate is expired or outdated, " +
-			"generating a new one")
-
-		err := os.Remove(cfg.TLSCertPath)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-
-		err = os.Remove(cfg.TLSKeyPath)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-
-		rpcsLog.Infof("Renewing TLS certificates...")
-		err = cert.GenCertPair(
-			"lnd autogenerated cert", cfg.TLSCertPath,
-			cfg.TLSKeyPath, cfg.TLSExtraIPs, cfg.TLSExtraDomains,
-			cfg.TLSDisableAutofill, cfg.TLSCertDuration,
-		)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		rpcsLog.Infof("Done renewing TLS certificates")
-
-		// Reload the certificate data.
-		certData, _, err = cert.LoadCert(
-			cfg.TLSCertPath, cfg.TLSKeyPath,
-		)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-	}
-
-	tlsCfg := cert.TLSConfFromCert(certData)
-
-	restCreds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	// If Let's Encrypt is enabled, instantiate autocert to request/renew
-	// the certificates.
-	cleanUp := func() {}
-	if cfg.LetsEncryptDomain != "" {
-		ltndLog.Infof("Using Let's Encrypt certificate for domain %v",
-			cfg.LetsEncryptDomain)
-
-		manager := autocert.Manager{
-			Cache:      autocert.DirCache(cfg.LetsEncryptDir),
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.LetsEncryptDomain),
-		}
-
-		srv := &http.Server{
-			Addr:    cfg.LetsEncryptListen,
-			Handler: manager.HTTPHandler(nil),
-		}
-		shutdownCompleted := make(chan struct{})
-		cleanUp = func() {
-			err := srv.Shutdown(context.Background())
-			if err != nil {
-				ltndLog.Errorf("Autocert listener shutdown "+
-					" error: %v", err)
-
-				return
-			}
-			<-shutdownCompleted
-			ltndLog.Infof("Autocert challenge listener stopped")
-		}
-
-		go func() {
-			ltndLog.Infof("Autocert challenge listener started "+
-				"at %v", cfg.LetsEncryptListen)
-
-			err := srv.ListenAndServe()
-			if err != http.ErrServerClosed {
-				ltndLog.Errorf("autocert http: %v", err)
-			}
-			close(shutdownCompleted)
-		}()
-
-		getCertificate := func(h *tls.ClientHelloInfo) (
-			*tls.Certificate, error) {
-
-			lecert, err := manager.GetCertificate(h)
-			if err != nil {
-				ltndLog.Errorf("GetCertificate: %v", err)
-				return &certData, nil
-			}
-
-			return lecert, err
-		}
-
-		// The self-signed tls.cert remains available as fallback.
-		tlsCfg.GetCertificate = getCertificate
-	}
-
-	serverCreds := credentials.NewTLS(tlsCfg)
-	serverOpts := []grpc.ServerOption{grpc.Creds(serverCreds)}
-
-	// For our REST dial options, we'll still use TLS, but also increase
-	// the max message size that we'll decode to allow clients to hit
-	// endpoints which return more data such as the DescribeGraph call.
-	// We set this to 200MiB atm. Should be the same value as maxMsgRecvSize
-	// in cmd/lncli/main.go.
-	restDialOpts := []grpc.DialOption{
-		grpc.WithTransportCredentials(restCreds),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(lnrpc.MaxGrpcMsgSize),
-		),
-	}
-
-	// Return a function closure that can be used to listen on a given
-	// address with the current TLS config.
-	restListen := func(addr net.Addr) (net.Listener, error) {
-		// For restListen we will call ListenOnAddress if TLS is
-		// disabled.
-		if cfg.DisableRestTLS {
-			return lncfg.ListenOnAddress(addr)
-		}
-
-		return lncfg.TLSListenOnAddress(addr, tlsCfg)
-	}
-
-	return serverOpts, restDialOpts, restListen, cleanUp, nil
-}
-
-// fileExists reports whether the named file or directory exists.
-// This function is taken from https://github.com/btcsuite/btcd
-func fileExists(name string) bool {
-	if _, err := os.Stat(name); err != nil {
-		if os.IsNotExist(err) {
-			return false
-		}
-	}
-	return true
 }
 
 // bakeMacaroon creates a new macaroon with newest version and the given
@@ -827,46 +818,64 @@ func bakeMacaroon(ctx context.Context, svc *macaroons.Service,
 	return mac.M().MarshalBinary()
 }
 
-// genMacaroons generates three macaroon files; one admin-level, one for
-// invoice access and one read-only. These can also be used to generate more
-// granular macaroons.
-func genMacaroons(ctx context.Context, svc *macaroons.Service,
+// saveMacaroon bakes a macaroon with the specified macaroon permissions and
+// writes it to a file with the given filename and file permissions.
+func saveMacaroon(ctx context.Context, svc *macaroons.Service, filename string,
+	macaroonPermissions []bakery.Op, filePermissions os.FileMode) error {
+
+	macaroonBytes, err := bakeMacaroon(ctx, svc, macaroonPermissions)
+	if err != nil {
+		return err
+	}
+	err = os.WriteFile(filename, macaroonBytes, filePermissions)
+	if err != nil {
+		_ = os.Remove(filename)
+		return err
+	}
+
+	return nil
+}
+
+// genDefaultMacaroons checks for three default macaroon files and generates
+// them if they do not exist; one admin-level, one for invoice access and one
+// read-only. Each macaroon is checked and created independently to ensure all
+// three exist. The admin macaroon can also be used to generate more granular
+// macaroons.
+func genDefaultMacaroons(ctx context.Context, svc *macaroons.Service,
 	admFile, roFile, invoiceFile string) error {
 
 	// First, we'll generate a macaroon that only allows the caller to
 	// access invoice related calls. This is useful for merchants and other
 	// services to allow an isolated instance that can only query and
 	// modify invoices.
-	invoiceMacBytes, err := bakeMacaroon(ctx, svc, invoicePermissions)
-	if err != nil {
-		return err
-	}
-	err = ioutil.WriteFile(invoiceFile, invoiceMacBytes, 0644)
-	if err != nil {
-		_ = os.Remove(invoiceFile)
-		return err
+	if !lnrpc.FileExists(invoiceFile) {
+		err := saveMacaroon(
+			ctx, svc, invoiceFile, invoicePermissions, 0644,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Generate the read-only macaroon and write it to a file.
-	roBytes, err := bakeMacaroon(ctx, svc, readPermissions)
-	if err != nil {
-		return err
-	}
-	if err = ioutil.WriteFile(roFile, roBytes, 0644); err != nil {
-		_ = os.Remove(roFile)
-		return err
+	if !lnrpc.FileExists(roFile) {
+		err := saveMacaroon(
+			ctx, svc, roFile, readPermissions, 0644,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Generate the admin macaroon and write it to a file.
-	admBytes, err := bakeMacaroon(ctx, svc, adminPermissions())
-	if err != nil {
-		return err
-	}
-
-	err = ioutil.WriteFile(admFile, admBytes, adminMacaroonFilePermissions)
-	if err != nil {
-		_ = os.Remove(admFile)
-		return err
+	if !lnrpc.FileExists(admFile) {
+		err := saveMacaroon(
+			ctx, svc, admFile, adminPermissions(),
+			adminMacaroonFilePermissions,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -936,7 +945,8 @@ func startGrpcListen(cfg *Config, grpcServer *grpc.Server,
 
 // startRestProxy starts the given REST proxy on the listeners found in the
 // config.
-func startRestProxy(cfg *Config, rpcServer *rpcServer, restDialOpts []grpc.DialOption,
+func startRestProxy(ctx context.Context, cfg *Config, rpcServer *rpcServer,
+	restDialOpts []grpc.DialOption,
 	restListen func(net.Addr) (net.Listener, error)) (func(), error) {
 
 	// We use the first RPC listener as the destination for our REST proxy.
@@ -963,7 +973,6 @@ func startRestProxy(cfg *Config, rpcServer *rpcServer, restDialOpts []grpc.DialO
 	}
 
 	// Start a REST proxy for our gRPC server.
-	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	shutdownFuncs = append(shutdownFuncs, cancel)
 
@@ -976,10 +985,8 @@ func startRestProxy(cfg *Config, rpcServer *rpcServer, restDialOpts []grpc.DialO
 	// that the marshaler prints all values, even if they are falsey.
 	customMarshalerOption := proxy.WithMarshalerOption(
 		proxy.MIMEWildcard, &proxy.JSONPb{
-			MarshalOptions: protojson.MarshalOptions{
-				UseProtoNames:   true,
-				EmitUnpopulated: true,
-			},
+			MarshalOptions:   *lnrpc.RESTJsonMarshalOpts,
+			UnmarshalOptions: *lnrpc.RESTJsonUnmarshalOpts,
 		},
 	)
 	mux := proxy.NewServeMux(
@@ -994,14 +1001,7 @@ func startRestProxy(cfg *Config, rpcServer *rpcServer, restDialOpts []grpc.DialO
 	)
 
 	// Register our services with the REST proxy.
-	err := lnrpc.RegisterStateHandlerFromEndpoint(
-		ctx, mux, restProxyDest, restDialOpts,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	err = rpcServer.RegisterWithRestProxy(
+	err := rpcServer.RegisterWithRestProxy(
 		ctx, mux, restDialOpts, restProxyDest,
 	)
 	if err != nil {

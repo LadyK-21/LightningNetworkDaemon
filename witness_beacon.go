@@ -1,10 +1,12 @@
 package lnd
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -95,14 +97,15 @@ func (p *preimageBeacon) SubscribeUpdates(
 		Hash:           htlc.RHash,
 		IncomingExpiry: htlc.RefundTimeout,
 		IncomingAmount: htlc.Amt,
-		IncomingCircuit: channeldb.CircuitKey{
+		IncomingCircuit: models.CircuitKey{
 			ChanID: chanID,
 			HtlcID: htlc.HtlcIndex,
 		},
-		OutgoingChanID: payload.FwdInfo.NextHop,
-		OutgoingExpiry: payload.FwdInfo.OutgoingCTLV,
-		OutgoingAmount: payload.FwdInfo.AmountToForward,
-		CustomRecords:  payload.CustomRecords(),
+		OutgoingChanID:       payload.FwdInfo.NextHop,
+		OutgoingExpiry:       payload.FwdInfo.OutgoingCTLV,
+		OutgoingAmount:       payload.FwdInfo.AmountToForward,
+		InOnionCustomRecords: payload.CustomRecords(),
+		InWireCustomRecords:  htlc.CustomRecords,
 	}
 	copy(packet.OnionBlob[:], nextHopOnionBlob)
 
@@ -116,7 +119,7 @@ func (p *preimageBeacon) SubscribeUpdates(
 	return sub, nil
 }
 
-// LookupPreImage attempts to lookup a preimage in the global cache.  True is
+// LookupPreimage attempts to lookup a preimage in the global cache.  True is
 // returned for the second argument if the preimage is found.
 func (p *preimageBeacon) LookupPreimage(
 	payHash lntypes.Hash) (lntypes.Preimage, bool) {
@@ -126,6 +129,11 @@ func (p *preimageBeacon) LookupPreimage(
 
 	// Otherwise, we'll perform a final check using the witness cache.
 	preimage, err := p.wCache.LookupSha256Witness(payHash)
+	if errors.Is(err, channeldb.ErrNoWitnesses) {
+		ltndLog.Debugf("No witness for payment %v", payHash)
+		return lntypes.Preimage{}, false
+	}
+
 	if err != nil {
 		ltndLog.Errorf("Unable to lookup witness: %v", err)
 		return lntypes.Preimage{}, false
@@ -146,7 +154,9 @@ func (p *preimageBeacon) AddPreimages(preimages ...lntypes.Preimage) error {
 	// the caller when delivering notifications.
 	preimageCopies := make([]lntypes.Preimage, 0, len(preimages))
 	for _, preimage := range preimages {
-		srvrLog.Infof("Adding preimage=%v to witness cache", preimage)
+		srvrLog.Infof("Adding preimage=%v to witness cache for %v",
+			preimage, preimage.Hash())
+
 		preimageCopies = append(preimageCopies, preimage)
 	}
 
@@ -172,6 +182,9 @@ func (p *preimageBeacon) AddPreimages(preimages ...lntypes.Preimage) error {
 			}
 		}(client)
 	}
+
+	srvrLog.Debugf("Added %d preimage(s) to witness cache",
+		len(preimageCopies))
 
 	return nil
 }

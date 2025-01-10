@@ -3,27 +3,12 @@ package chainfee
 import (
 	"bytes"
 	"encoding/json"
-	"io"
-	"reflect"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/stretchr/testify/require"
 )
-
-type mockSparseConfFeeSource struct {
-	url  string
-	fees map[uint32]uint32
-}
-
-func (e mockSparseConfFeeSource) GenQueryURL() string {
-	return e.url
-}
-
-func (e mockSparseConfFeeSource) ParseResponse(r io.Reader) (map[uint32]uint32, error) {
-	return e.fees, nil
-}
 
 // TestFeeRateTypes checks that converting fee rates between the
 // different types that represent fee rates and calculating fees
@@ -114,10 +99,6 @@ func TestSparseConfFeeSource(t *testing.T) {
 	// Test that GenQueryURL returns the URL as is.
 	url := "test"
 	feeSource := SparseConfFeeSource{URL: url}
-	queryURL := feeSource.GenQueryURL()
-	if queryURL != url {
-		t.Fatalf("expected query URL of %v, got %v", url, queryURL)
-	}
 
 	// Test parsing a properly formatted JSON API response.
 	// First, create the response as a bytes.Reader.
@@ -126,17 +107,20 @@ func TestSparseConfFeeSource(t *testing.T) {
 		2: 42,
 		3: 54321,
 	}
-	testJSON := map[string]map[uint32]uint32{"fee_by_block_target": testFees}
-	jsonResp, err := json.Marshal(testJSON)
+	testMinRelayFee := SatPerKVByte(1000)
+	testResp := WebAPIResponse{
+		MinRelayFeerate:  testMinRelayFee,
+		FeeByBlockTarget: testFees,
+	}
+
+	jsonResp, err := json.Marshal(testResp)
 	require.NoError(t, err, "unable to marshal JSON API response")
 	reader := bytes.NewReader(jsonResp)
 
 	// Finally, ensure the expected map is returned without error.
-	fees, err := feeSource.ParseResponse(reader)
+	resp, err := feeSource.parseResponse(reader)
 	require.NoError(t, err, "unable to parse API response")
-	if !reflect.DeepEqual(fees, testFees) {
-		t.Fatalf("expected %v, got %v", testFees, fees)
-	}
+	require.Equal(t, testResp, resp, "unexpected resp returned")
 
 	// Test parsing an improperly formatted JSON API response.
 	badFees := map[string]uint32{"hi": 12345, "hello": 42, "satoshi": 54321}
@@ -146,160 +130,233 @@ func TestSparseConfFeeSource(t *testing.T) {
 	reader = bytes.NewReader(jsonResp)
 
 	// Finally, ensure the improperly formatted fees error.
-	_, err = feeSource.ParseResponse(reader)
-	if err == nil {
-		t.Fatalf("expected ParseResponse to fail")
+	_, err = feeSource.parseResponse(reader)
+	require.Error(t, err, "expected error when parsing bad JSON")
+}
+
+// TestFeeSourceCompatibility checks that when a fee source doesn't return a
+// `min_relay_feerate` field in its response, the floor feerate is used.
+//
+// NOTE: Field `min_relay_feerate` was added in v0.18.3.
+func TestFeeSourceCompatibility(t *testing.T) {
+	t.Parallel()
+
+	// Test that GenQueryURL returns the URL as is.
+	url := "test"
+	feeSource := SparseConfFeeSource{URL: url}
+
+	// Test parsing a properly formatted JSON API response.
+	//
+	// Create the resp without the `min_relay_feerate` field.
+	testFees := map[uint32]uint32{
+		1: 12345,
 	}
+	testResp := struct {
+		// FeeByBlockTarget is a map of confirmation targets to sat/kvb
+		// fees.
+		FeeByBlockTarget map[uint32]uint32 `json:"fee_by_block_target"`
+	}{
+		FeeByBlockTarget: testFees,
+	}
+
+	jsonResp, err := json.Marshal(testResp)
+	require.NoError(t, err, "unable to marshal JSON API response")
+	reader := bytes.NewReader(jsonResp)
+
+	// Ensure the expected map is returned without error.
+	resp, err := feeSource.parseResponse(reader)
+	require.NoError(t, err, "unable to parse API response")
+	require.Equal(t, testResp.FeeByBlockTarget, resp.FeeByBlockTarget,
+		"unexpected resp returned")
+
+	// Expect the floor feerate to be used.
+	require.Equal(t, FeePerKwFloor.FeePerKVByte(), resp.MinRelayFeerate)
 }
 
 // TestWebAPIFeeEstimator checks that the WebAPIFeeEstimator returns fee rates
 // as expected.
 func TestWebAPIFeeEstimator(t *testing.T) {
 	t.Parallel()
-	feeFloor := uint32(FeePerKwFloor.FeePerKVByte())
-	testFeeRate := feeFloor * 100
+
+	var (
+		minTarget uint32 = 2
+		maxTarget uint32 = 6
+
+		// Fee rates are in sat/kb.
+		minFeeRate uint32 = 2000 // 500 sat/kw
+		maxFeeRate uint32 = 4000 // 1000 sat/kw
+
+		minFeeUpdateTimeout = 5 * time.Minute
+		maxFeeUpdateTimeout = 20 * time.Minute
+	)
 
 	testCases := []struct {
-		name   string
-		target uint32
-		apiEst uint32
-		est    uint32
-		err    string
+		name            string
+		target          uint32
+		expectedFeeRate uint32
+		expectedErr     string
 	}{
 		{
-			name:   "target_below_min",
-			target: 0,
-			apiEst: 0,
-			est:    0,
-			err:    "too low, minimum",
+			// When requested target is below minBlockTarget, an
+			// error is returned.
+			name:            "target_below_min",
+			target:          0,
+			expectedFeeRate: 0,
+			expectedErr:     "too low, minimum",
 		},
 		{
-			name:   "target_w_too-low_fee",
-			target: 100,
-			apiEst: 42,
-			est:    feeFloor,
-			err:    "",
+			// When requested target is larger than the max cached
+			// target, the fee rate of the max cached target is
+			// returned.
+			name:            "target_w_too-low_fee",
+			target:          maxTarget + 100,
+			expectedFeeRate: minFeeRate,
+			expectedErr:     "",
 		},
 		{
-			name:   "API-omitted_target",
-			target: 2,
-			apiEst: 0,
-			est:    testFeeRate,
-			err:    "",
+			// When requested target is smaller than the min cached
+			// target, the fee rate of the min cached target is
+			// returned.
+			name:            "API-omitted_target",
+			target:          minTarget - 1,
+			expectedFeeRate: maxFeeRate,
+			expectedErr:     "",
 		},
 		{
-			name:   "valid_target",
-			target: 20,
-			apiEst: testFeeRate,
-			est:    testFeeRate,
-			err:    "",
-		},
-		{
-			name:   "valid_target_extrapolated_fee",
-			target: 25,
-			apiEst: 0,
-			est:    testFeeRate,
-			err:    "",
+			// When the target is found, return it.
+			name:            "valid_target",
+			target:          maxTarget,
+			expectedFeeRate: minFeeRate,
+			expectedErr:     "",
 		},
 	}
 
 	// Construct mock fee source for the Estimator to pull fees from.
-	testFees := make(map[uint32]uint32)
-	for _, tc := range testCases {
-		if tc.apiEst != 0 {
-			testFees[tc.target] = tc.apiEst
-		}
+	//
+	// This will create a `feeByBlockTarget` map with the following values,
+	// - 2: 4000 sat/kb
+	// - 6: 2000 sat/kb.
+	feeRates := map[uint32]uint32{
+		minTarget: maxFeeRate,
+		maxTarget: minFeeRate,
+	}
+	resp := WebAPIResponse{
+		FeeByBlockTarget: feeRates,
 	}
 
-	feeSource := mockSparseConfFeeSource{
-		url:  "https://www.github.com",
-		fees: testFees,
-	}
+	// Create a mock fee source and mock its returned map.
+	feeSource := &mockFeeSource{}
+	feeSource.On("GetFeeInfo").Return(resp, nil)
 
-	estimator := NewWebAPIEstimator(feeSource, false)
+	estimator, _ := NewWebAPIEstimator(
+		feeSource, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
 
-	// Test that requesting a fee when no fees have been cached fails.
+	// Test that when the estimator is not started, an error is returned.
 	feeRate, err := estimator.EstimateFeePerKW(5)
-	require.NoErrorf(t, err, "expected no error")
-	require.Equalf(t, FeePerKwFloor, feeRate, "expected fee rate floor "+
-		"returned when no cached fee rate found")
+	require.Error(t, err, "expected an error")
+	require.Zero(t, feeRate, "expected zero fee rate")
 
-	if err := estimator.Start(); err != nil {
-		t.Fatalf("unable to start fee estimator, got: %v", err)
-	}
-	defer estimator.Stop()
+	// Start the estimator.
+	require.NoError(t, estimator.Start(), "unable to start fee estimator")
 
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			est, err := estimator.EstimateFeePerKW(tc.target)
-			if tc.err != "" {
-				if err == nil ||
-					!strings.Contains(err.Error(), tc.err) {
 
-					t.Fatalf("expected fee estimation to "+
-						"fail, instead got: %v", err)
-				}
-			} else {
-				exp := SatPerKVByte(tc.est).FeePerKWeight()
-				if err != nil {
-					t.Fatalf("unable to estimate fee for "+
-						"%v block target, got: %v",
-						tc.target, err)
-				}
-				if est != exp {
-					t.Fatalf("expected fee estimate of "+
-						"%v, got %v", exp, est)
-				}
+			// Test an error case.
+			if tc.expectedErr != "" {
+				require.Error(t, err, "expected error")
+				require.ErrorContains(t, err, tc.expectedErr)
+
+				return
 			}
+
+			// Test an non-error case.
+			require.NoErrorf(t, err, "error from target %v",
+				tc.target)
+
+			exp := SatPerKVByte(tc.expectedFeeRate).FeePerKWeight()
+			require.Equalf(t, exp, est, "target %v failed, fee "+
+				"map is %v", tc.target, feeRate)
 		})
 	}
+
+	// Stop the estimator when test ends.
+	require.NoError(t, estimator.Stop(), "unable to stop fee estimator")
+
+	// Assert the mocked fee source is called as expected.
+	feeSource.AssertExpectations(t)
 }
 
 // TestGetCachedFee checks that the fee caching logic works as expected.
 func TestGetCachedFee(t *testing.T) {
-	target := uint32(2)
-	fee := uint32(100)
+	var (
+		minTarget uint32 = 2
+		maxTarget uint32 = 6
+
+		minFeeRate uint32 = 100
+		maxFeeRate uint32 = 1000
+
+		minFeeUpdateTimeout = 5 * time.Minute
+		maxFeeUpdateTimeout = 20 * time.Minute
+	)
 
 	// Create a dummy estimator without WebAPIFeeSource.
-	estimator := NewWebAPIEstimator(nil, false)
+	estimator, _ := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
 
 	// When the cache is empty, an error should be returned.
-	cachedFee, err := estimator.getCachedFee(target)
+	cachedFee, err := estimator.getCachedFee(minTarget)
 	require.Zero(t, cachedFee)
 	require.ErrorIs(t, err, errEmptyCache)
 
-	// Store a fee rate inside the cache.
-	estimator.feeByBlockTarget[target] = fee
+	// Store a fee rate inside the cache. The cache map now looks like,
+	// {2: 1000, 6: 100}
+	estimator.feeByBlockTarget = map[uint32]uint32{
+		minTarget: maxFeeRate,
+		maxTarget: minFeeRate,
+	}
 
 	testCases := []struct {
 		name        string
 		confTarget  uint32
 		expectedFee uint32
-		expectErr   error
 	}{
 		{
 			// When the target is cached, return it.
 			name:        "return cached fee",
-			confTarget:  target,
-			expectedFee: fee,
-			expectErr:   nil,
+			confTarget:  minTarget,
+			expectedFee: maxFeeRate,
 		},
 		{
 			// When the target is not cached, return the next
-			// lowest target that's cached.
+			// lowest target that's cached. In this case,
+			// requesting fee rate for target 7 will give the
+			// result for target 6.
+			name:        "return lowest cached fee",
+			confTarget:  maxTarget + 1,
+			expectedFee: minFeeRate,
+		},
+		{
+			// When the target is not cached, return the next
+			// lowest target that's cached. In this case,
+			// requesting fee rate for target 5 will give the
+			// result for target 2.
 			name:        "return next cached fee",
-			confTarget:  target + 1,
-			expectedFee: fee,
-			expectErr:   nil,
+			confTarget:  maxTarget - 1,
+			expectedFee: maxFeeRate,
 		},
 		{
 			// When the target is not cached, and the next lowest
 			// target is not cached, return the nearest fee rate.
+			// In this case, requesting fee rate for target 1 will
+			// give the result for target 2.
 			name:        "return highest cached fee",
-			confTarget:  target - 1,
-			expectedFee: fee,
-			expectErr:   nil,
+			confTarget:  minTarget - 1,
+			expectedFee: maxFeeRate,
 		},
 	}
 
@@ -309,8 +366,43 @@ func TestGetCachedFee(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cachedFee, err := estimator.getCachedFee(tc.confTarget)
 
+			require.NoError(t, err)
 			require.Equal(t, tc.expectedFee, cachedFee)
-			require.ErrorIs(t, err, tc.expectErr)
 		})
 	}
+}
+
+func TestRandomFeeUpdateTimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		minFeeUpdateTimeout = 1 * time.Minute
+		maxFeeUpdateTimeout = 2 * time.Minute
+	)
+
+	estimator, _ := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
+
+	for i := 0; i < 1000; i++ {
+		timeout := estimator.randomFeeUpdateTimeout()
+
+		require.GreaterOrEqual(t, timeout, minFeeUpdateTimeout)
+		require.LessOrEqual(t, timeout, maxFeeUpdateTimeout)
+	}
+}
+
+func TestInvalidFeeUpdateTimeout(t *testing.T) {
+	t.Parallel()
+
+	var (
+		minFeeUpdateTimeout = 2 * time.Minute
+		maxFeeUpdateTimeout = 1 * time.Minute
+	)
+
+	_, err := NewWebAPIEstimator(
+		nil, false, minFeeUpdateTimeout, maxFeeUpdateTimeout,
+	)
+	require.Error(t, err, "NewWebAPIEstimator should return an error "+
+		"when minFeeUpdateTimeout > maxFeeUpdateTimeout")
 }

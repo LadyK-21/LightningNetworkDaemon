@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,15 +17,21 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channelnotifier"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntest/channels"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/netann"
+	"github.com/lightningnetwork/lnd/pool"
 	"github.com/lightningnetwork/lnd/queue"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/stretchr/testify/require"
@@ -46,31 +53,51 @@ var (
 	testKeyLoc = keychain.KeyLocator{Family: keychain.KeyFamilyNodeKey}
 )
 
-// noUpdate is a function which can be used as a parameter in createTestPeer to
-// call the setup code with no custom values on the channels set up.
+// noUpdate is a function which can be used as a parameter in
+// createTestPeerWithChannel to call the setup code with no custom values on
+// the channels set up.
 var noUpdate = func(a, b *channeldb.OpenChannel) {}
 
-// createTestPeer creates a channel between two nodes, and returns a peer for
-// one of the nodes, together with the channel seen from both nodes. It takes
-// an updateChan function which can be used to modify the default values on
-// the channel states for each peer.
-func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
-	publTx chan *wire.MsgTx, updateChan func(a, b *channeldb.OpenChannel),
-	mockSwitch *mockMessageSwitch) (
-	*Brontide, *lnwallet.LightningChannel, error) {
+type peerTestCtx struct {
+	peer          *Brontide
+	channel       *lnwallet.LightningChannel
+	notifier      *mock.ChainNotifier
+	publishTx     <-chan *wire.MsgTx
+	mockSwitch    *mockMessageSwitch
+	db            *channeldb.DB
+	privKey       *btcec.PrivateKey
+	mockConn      *mockMessageConn
+	customChan    chan *customMsg
+	chanStatusMgr *netann.ChanStatusManager
+}
 
-	nodeKeyLocator := keychain.KeyLocator{
-		Family: keychain.KeyFamilyNodeKey,
-	}
-	aliceKeyPriv, aliceKeyPub := btcec.PrivKeyFromBytes(
-		channels.AlicesPrivKey,
+// createTestPeerWithChannel creates a channel between two nodes, and returns a
+// peer for one of the nodes, together with the channel seen from both nodes.
+// It takes an updateChan function which can be used to modify the default
+// values on the channel states for each peer.
+func createTestPeerWithChannel(t *testing.T, updateChan func(a,
+	b *channeldb.OpenChannel)) (*peerTestCtx, error) {
+
+	params := createTestPeer(t)
+
+	var (
+		publishTx     = params.publishTx
+		mockSwitch    = params.mockSwitch
+		alicePeer     = params.peer
+		notifier      = params.notifier
+		aliceKeyPriv  = params.privKey
+		dbAlice       = params.db
+		chanStatusMgr = params.chanStatusMgr
 	)
-	aliceKeySigner := keychain.NewPrivKeyMessageSigner(
-		aliceKeyPriv, nodeKeyLocator,
-	)
-	bobKeyPriv, bobKeyPub := btcec.PrivKeyFromBytes(
-		channels.BobsPrivKey,
-	)
+
+	err := chanStatusMgr.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, chanStatusMgr.Stop())
+	})
+
+	aliceKeyPub := alicePeer.IdentityKey()
+	estimator := alicePeer.cfg.FeeEstimator
 
 	channelCapacity := btcutil.Amount(10 * 1e8)
 	channelBal := channelCapacity / 2
@@ -86,14 +113,20 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 	}
 	fundingTxIn := wire.NewTxIn(prevOut, nil, nil)
 
+	bobKeyPriv, bobKeyPub := btcec.PrivKeyFromBytes(
+		channels.BobsPrivKey,
+	)
+
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        aliceDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      btcutil.Amount(rand.Int63()),
 			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutAlice),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: aliceDustLimit,
+			CsvDelay:  uint16(csvTimeoutAlice),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
@@ -112,13 +145,15 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        bobDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      btcutil.Amount(rand.Int63()),
 			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutBob),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: bobDustLimit,
+			CsvDelay:  uint16(csvTimeoutBob),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
@@ -139,23 +174,23 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 
 	bobRoot, err := chainhash.NewHash(bobKeyPriv.Serialize())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	bobPreimageProducer := shachain.NewRevocationProducer(*bobRoot)
 	bobFirstRevoke, err := bobPreimageProducer.AtIndex(0)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	bobCommitPoint := input.ComputeCommitmentPoint(bobFirstRevoke[:])
 
 	aliceRoot, err := chainhash.NewHash(aliceKeyPriv.Serialize())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	alicePreimageProducer := shachain.NewRevocationProducer(*aliceRoot)
 	aliceFirstRevoke, err := alicePreimageProducer.AtIndex(0)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	aliceCommitPoint := input.ComputeCommitmentPoint(aliceFirstRevoke[:])
 
@@ -165,29 +200,14 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 		isAliceInitiator, 0,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	dbAlice, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbAlice.Close())
-	})
+	dbBob := channeldb.OpenForTesting(t, t.TempDir())
 
-	dbBob, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbBob.Close())
-	})
-
-	estimator := chainfee.NewStaticEstimator(12500, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// TODO(roasbeef): need to factor in commit fee?
@@ -212,7 +232,7 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 
 	var chanIDBytes [8]byte
 	if _, err := io.ReadFull(crand.Reader, chanIDBytes[:]); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	shortChanID := lnwire.NewShortChanIDFromInt(
@@ -257,13 +277,9 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 	// Set custom values on the channel states.
 	updateChan(aliceChannelState, bobChannelState)
 
-	aliceAddr := &net.TCPAddr{
-		IP:   net.ParseIP("127.0.0.1"),
-		Port: 18555,
-	}
-
+	aliceAddr := alicePeer.cfg.Addr.Address
 	if err := aliceChannelState.SyncPending(aliceAddr, 0); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	bobAddr := &net.TCPAddr{
@@ -272,18 +288,26 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 	}
 
 	if err := bobChannelState.SyncPending(bobAddr, 0); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	aliceSigner := &mock.SingleSigner{Privkey: aliceKeyPriv}
-	bobSigner := &mock.SingleSigner{Privkey: bobKeyPriv}
+	aliceSigner := input.NewMockSigner(
+		[]*btcec.PrivateKey{aliceKeyPriv}, nil,
+	)
+	bobSigner := input.NewMockSigner(
+		[]*btcec.PrivateKey{bobKeyPriv}, nil,
+	)
 
 	alicePool := lnwallet.NewSigPool(1, aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
 		aliceSigner, aliceChannelState, alicePool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(lnwallet.NewAuxSignerMock(
+			lnwallet.EmptyMockJobHandler,
+		)),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	_ = alicePool.Start()
 	t.Cleanup(func() {
@@ -293,117 +317,37 @@ func createTestPeer(t *testing.T, notifier chainntnfs.ChainNotifier,
 	bobPool := lnwallet.NewSigPool(1, bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
 		bobSigner, bobChannelState, bobPool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(lnwallet.NewAuxSignerMock(
+			lnwallet.EmptyMockJobHandler,
+		)),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	_ = bobPool.Start()
 	t.Cleanup(func() {
 		require.NoError(t, bobPool.Stop())
 	})
 
-	chainIO := &mock.ChainIO{
-		BestHeight: broadcastHeight,
-	}
-	wallet := &lnwallet.LightningWallet{
-		WalletController: &mock.WalletController{
-			RootKey:               aliceKeyPriv,
-			PublishedTransactions: publTx,
-		},
-	}
-
-	// If mockSwitch is not set by the caller, set it to the default as the
-	// caller does not need to control it.
-	if mockSwitch == nil {
-		mockSwitch = &mockMessageSwitch{}
-	}
-
-	nodeSignerAlice := netann.NewNodeSigner(aliceKeySigner)
-
-	const chanActiveTimeout = time.Minute
-
-	chanStatusMgr, err := netann.NewChanStatusManager(&netann.ChanStatusConfig{
-		ChanStatusSampleInterval: 30 * time.Second,
-		ChanEnableTimeout:        chanActiveTimeout,
-		ChanDisableTimeout:       2 * time.Minute,
-		DB:                       dbAlice.ChannelStateDB(),
-		Graph:                    dbAlice.ChannelGraph(),
-		MessageSigner:            nodeSignerAlice,
-		OurPubKey:                aliceKeyPub,
-		OurKeyLoc:                testKeyLoc,
-		IsChannelActive:          func(lnwire.ChannelID) bool { return true },
-		ApplyChannelUpdate: func(*lnwire.ChannelUpdate,
-			*wire.OutPoint, bool) error {
-
-			return nil
-		},
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	if err = chanStatusMgr.Start(); err != nil {
-		return nil, nil, err
-	}
-
-	errBuffer, err := queue.NewCircularBuffer(ErrorBufferSize)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var pubKey [33]byte
-	copy(pubKey[:], aliceKeyPub.SerializeCompressed())
-
-	cfgAddr := &lnwire.NetAddress{
-		IdentityKey: aliceKeyPub,
-		Address:     aliceAddr,
-		ChainNet:    wire.SimNet,
-	}
-
-	interceptableSwitchNotifier := &mock.ChainNotifier{
-		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
-	}
-	interceptableSwitchNotifier.EpochChan <- &chainntnfs.BlockEpoch{
-		Height: 1,
-	}
-
-	interceptableSwitch, err := htlcswitch.NewInterceptableSwitch(
-		&htlcswitch.InterceptableSwitchConfig{
-			CltvRejectDelta:    testCltvRejectDelta,
-			CltvInterceptDelta: testCltvRejectDelta + 3,
-			Notifier:           interceptableSwitchNotifier,
-		},
+	alicePeer.remoteFeatures = lnwire.NewFeatureVector(
+		nil, lnwire.Features,
 	)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cfg := &Config{
-		Addr:              cfgAddr,
-		PubKeyBytes:       pubKey,
-		ErrorBuffer:       errBuffer,
-		ChainIO:           chainIO,
-		Switch:            mockSwitch,
-		ChanActiveTimeout: chanActiveTimeout,
-		InterceptSwitch:   interceptableSwitch,
-		ChannelDB:         dbAlice.ChannelStateDB(),
-		FeeEstimator:      estimator,
-		Wallet:            wallet,
-		ChainNotifier:     notifier,
-		ChanStatusMgr:     chanStatusMgr,
-		Features:          lnwire.NewFeatureVector(nil, lnwire.Features),
-		DisconnectPeer:    func(b *btcec.PublicKey) error { return nil },
-	}
-
-	alicePeer := NewBrontide(*cfg)
-	alicePeer.remoteFeatures = lnwire.NewFeatureVector(nil, lnwire.Features)
 
 	chanID := lnwire.NewChanIDFromOutPoint(channelAlice.ChannelPoint())
-	alicePeer.activeChannels[chanID] = channelAlice
+	alicePeer.activeChannels.Store(chanID, channelAlice)
 
 	alicePeer.wg.Add(1)
 	go alicePeer.channelManager()
 
-	return alicePeer, channelBob, nil
+	return &peerTestCtx{
+		peer:       alicePeer,
+		channel:    channelBob,
+		notifier:   notifier,
+		publishTx:  publishTx,
+		mockSwitch: mockSwitch,
+		mockConn:   params.mockConn,
+	}, nil
 }
 
 // mockMessageSwitch is a mock implementation of the messageSwitch interface
@@ -442,7 +386,9 @@ func (m *mockMessageSwitch) GetLinksByInterface(pub [33]byte) (
 // mockUpdateHandler is a mock implementation of the ChannelUpdateHandler
 // interface. It is used in mockMessageSwitch's GetLinksByInterface method.
 type mockUpdateHandler struct {
-	cid lnwire.ChannelID
+	cid                  lnwire.ChannelID
+	isOutgoingAddBlocked atomic.Bool
+	isIncomingAddBlocked atomic.Bool
 }
 
 // newMockUpdateHandler creates a new mockUpdateHandler.
@@ -467,9 +413,6 @@ func (m *mockUpdateHandler) EligibleToForward() bool { return false }
 // MayAddOutgoingHtlc currently returns nil.
 func (m *mockUpdateHandler) MayAddOutgoingHtlc(lnwire.MilliSatoshi) error { return nil }
 
-// ShutdownIfChannelClean currently returns nil.
-func (m *mockUpdateHandler) ShutdownIfChannelClean() error { return nil }
-
 type mockMessageConn struct {
 	t *testing.T
 
@@ -483,6 +426,61 @@ type mockMessageConn struct {
 
 	readMessages   chan []byte
 	curReadMessage []byte
+
+	// writeRaceDetectingCounter is incremented on any function call
+	// associated with writing to the connection. The race detector will
+	// trigger on this counter if a data race exists.
+	writeRaceDetectingCounter int
+
+	// readRaceDetectingCounter is incremented on any function call
+	// associated with reading from the connection. The race detector will
+	// trigger on this counter if a data race exists.
+	readRaceDetectingCounter int
+}
+
+func (m *mockUpdateHandler) EnableAdds(dir htlcswitch.LinkDirection) bool {
+	if dir == htlcswitch.Outgoing {
+		return m.isOutgoingAddBlocked.Swap(false)
+	}
+
+	return m.isIncomingAddBlocked.Swap(false)
+}
+
+func (m *mockUpdateHandler) DisableAdds(dir htlcswitch.LinkDirection) bool {
+	if dir == htlcswitch.Outgoing {
+		return !m.isOutgoingAddBlocked.Swap(true)
+	}
+
+	return !m.isIncomingAddBlocked.Swap(true)
+}
+
+func (m *mockUpdateHandler) IsFlushing(dir htlcswitch.LinkDirection) bool {
+	switch dir {
+	case htlcswitch.Outgoing:
+		return m.isOutgoingAddBlocked.Load()
+	case htlcswitch.Incoming:
+		return m.isIncomingAddBlocked.Load()
+	}
+
+	return false
+}
+
+func (m *mockUpdateHandler) OnFlushedOnce(hook func()) {
+	hook()
+}
+func (m *mockUpdateHandler) OnCommitOnce(
+	_ htlcswitch.LinkDirection, hook func(),
+) {
+
+	hook()
+}
+func (m *mockUpdateHandler) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
+	// TODO(proofofkeags): Implement
+	c := make(chan fn.Result[lntypes.ChannelParty], 1)
+
+	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not yet implemented")
+
+	return c
 }
 
 func newMockConn(t *testing.T, expectedMessages int) *mockMessageConn {
@@ -495,21 +493,28 @@ func newMockConn(t *testing.T, expectedMessages int) *mockMessageConn {
 
 // SetWriteDeadline mocks setting write deadline for our conn.
 func (m *mockMessageConn) SetWriteDeadline(time.Time) error {
+	m.writeRaceDetectingCounter++
 	return nil
 }
 
 // Flush mocks a message conn flush.
 func (m *mockMessageConn) Flush() (int, error) {
+	m.writeRaceDetectingCounter++
 	return 0, nil
 }
 
 // WriteMessage mocks sending of a message on our connection. It will push
 // the bytes sent into the mock's writtenMessages channel.
 func (m *mockMessageConn) WriteMessage(msg []byte) error {
+	m.writeRaceDetectingCounter++
+
+	msgCopy := make([]byte, len(msg))
+	copy(msgCopy, msg)
+
 	select {
-	case m.writtenMessages <- msg:
+	case m.writtenMessages <- msgCopy:
 	case <-time.After(timeout):
-		m.t.Fatalf("timeout sending message: %v", msg)
+		m.t.Fatalf("timeout sending message: %v", msgCopy)
 	}
 
 	return nil
@@ -528,15 +533,18 @@ func (m *mockMessageConn) assertWrite(expected []byte) {
 }
 
 func (m *mockMessageConn) SetReadDeadline(t time.Time) error {
+	m.readRaceDetectingCounter++
 	return nil
 }
 
 func (m *mockMessageConn) ReadNextHeader() (uint32, error) {
+	m.readRaceDetectingCounter++
 	m.curReadMessage = <-m.readMessages
 	return uint32(len(m.curReadMessage)), nil
 }
 
 func (m *mockMessageConn) ReadNextBody(buf []byte) ([]byte, error) {
+	m.readRaceDetectingCounter++
 	return m.curReadMessage, nil
 }
 
@@ -546,4 +554,261 @@ func (m *mockMessageConn) RemoteAddr() net.Addr {
 
 func (m *mockMessageConn) LocalAddr() net.Addr {
 	return nil
+}
+
+func (m *mockMessageConn) Close() error {
+	return nil
+}
+
+// createTestPeer creates a new peer for testing and returns a context struct
+// containing necessary handles and mock objects for conducting tests on peer
+// functionalities.
+func createTestPeer(t *testing.T) *peerTestCtx {
+	nodeKeyLocator := keychain.KeyLocator{
+		Family: keychain.KeyFamilyNodeKey,
+	}
+
+	aliceKeyPriv, aliceKeyPub := btcec.PrivKeyFromBytes(
+		channels.AlicesPrivKey,
+	)
+
+	aliceKeySigner := keychain.NewPrivKeyMessageSigner(
+		aliceKeyPriv, nodeKeyLocator,
+	)
+
+	aliceAddr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 18555,
+	}
+	cfgAddr := &lnwire.NetAddress{
+		IdentityKey: aliceKeyPub,
+		Address:     aliceAddr,
+		ChainNet:    wire.SimNet,
+	}
+
+	errBuffer, err := queue.NewCircularBuffer(ErrorBufferSize)
+	require.NoError(t, err)
+
+	chainIO := &mock.ChainIO{
+		BestHeight: broadcastHeight,
+	}
+
+	publishTx := make(chan *wire.MsgTx)
+	wallet := &lnwallet.LightningWallet{
+		WalletController: &mock.WalletController{
+			RootKey:               aliceKeyPriv,
+			PublishedTransactions: publishTx,
+		},
+	}
+
+	const chanActiveTimeout = time.Minute
+
+	dbPath := t.TempDir()
+
+	graphBackend, err := kvdb.GetBoltBackend(&kvdb.BoltBackendConfig{
+		DBPath:            dbPath,
+		DBFileName:        "graph.db",
+		NoFreelistSync:    true,
+		AutoCompact:       false,
+		AutoCompactMinAge: kvdb.DefaultBoltAutoCompactMinAge,
+		DBTimeout:         kvdb.DefaultDBTimeout,
+	})
+	require.NoError(t, err)
+
+	dbAliceGraph, err := graphdb.NewChannelGraph(graphBackend)
+	require.NoError(t, err)
+
+	dbAliceChannel := channeldb.OpenForTesting(t, dbPath)
+
+	nodeSignerAlice := netann.NewNodeSigner(aliceKeySigner)
+
+	chanStatusMgr, err := netann.NewChanStatusManager(&netann.
+		ChanStatusConfig{
+		ChanStatusSampleInterval: 30 * time.Second,
+		ChanEnableTimeout:        chanActiveTimeout,
+		ChanDisableTimeout:       2 * time.Minute,
+		DB:                       dbAliceChannel.ChannelStateDB(),
+		Graph:                    dbAliceGraph,
+		MessageSigner:            nodeSignerAlice,
+		OurPubKey:                aliceKeyPub,
+		OurKeyLoc:                testKeyLoc,
+		IsChannelActive: func(lnwire.ChannelID) bool {
+			return true
+		},
+		ApplyChannelUpdate: func(*lnwire.ChannelUpdate1,
+			*wire.OutPoint, bool) error {
+
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	interceptableSwitchNotifier := &mock.ChainNotifier{
+		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
+	}
+	interceptableSwitchNotifier.EpochChan <- &chainntnfs.BlockEpoch{
+		Height: 1,
+	}
+
+	interceptableSwitch, err := htlcswitch.NewInterceptableSwitch(
+		&htlcswitch.InterceptableSwitchConfig{
+			CltvRejectDelta:    testCltvRejectDelta,
+			CltvInterceptDelta: testCltvRejectDelta + 3,
+			Notifier:           interceptableSwitchNotifier,
+		},
+	)
+	require.NoError(t, err)
+
+	// TODO(yy): create interface for lnwallet.LightningChannel so we can
+	// easily mock it without the following setups.
+	notifier := &mock.ChainNotifier{
+		SpendChan: make(chan *chainntnfs.SpendDetail),
+		EpochChan: make(chan *chainntnfs.BlockEpoch),
+		ConfChan:  make(chan *chainntnfs.TxConfirmation),
+	}
+
+	mockSwitch := &mockMessageSwitch{}
+
+	// TODO(yy): change ChannelNotifier to be an interface.
+	channelNotifier := channelnotifier.New(dbAliceChannel.ChannelStateDB())
+	require.NoError(t, channelNotifier.Start())
+	t.Cleanup(func() {
+		require.NoError(t, channelNotifier.Stop(),
+			"stop channel notifier failed")
+	})
+
+	writeBufferPool := pool.NewWriteBuffer(
+		pool.DefaultWriteBufferGCInterval,
+		pool.DefaultWriteBufferExpiryInterval,
+	)
+
+	writePool := pool.NewWrite(
+		writeBufferPool, 1, timeout,
+	)
+	require.NoError(t, writePool.Start())
+
+	readBufferPool := pool.NewReadBuffer(
+		pool.DefaultReadBufferGCInterval,
+		pool.DefaultReadBufferExpiryInterval,
+	)
+
+	readPool := pool.NewRead(
+		readBufferPool, 1, timeout,
+	)
+	require.NoError(t, readPool.Start())
+
+	mockConn := newMockConn(t, 1)
+
+	receivedCustomChan := make(chan *customMsg)
+
+	var pubKey [33]byte
+	copy(pubKey[:], aliceKeyPub.SerializeCompressed())
+
+	estimator := chainfee.NewStaticEstimator(12500, 0)
+
+	cfg := &Config{
+		Addr:              cfgAddr,
+		PubKeyBytes:       pubKey,
+		ErrorBuffer:       errBuffer,
+		ChainIO:           chainIO,
+		Switch:            mockSwitch,
+		ChanActiveTimeout: chanActiveTimeout,
+		InterceptSwitch:   interceptableSwitch,
+		ChannelDB:         dbAliceChannel.ChannelStateDB(),
+		FeeEstimator:      estimator,
+		Wallet:            wallet,
+		ChainNotifier:     notifier,
+		ChanStatusMgr:     chanStatusMgr,
+		Features: lnwire.NewFeatureVector(
+			nil, lnwire.Features,
+		),
+		DisconnectPeer: func(b *btcec.PublicKey) error {
+			return nil
+		},
+		ChannelNotifier:               channelNotifier,
+		PrunePersistentPeerConnection: func([33]byte) {},
+		LegacyFeatures:                lnwire.EmptyFeatureVector(),
+		WritePool:                     writePool,
+		ReadPool:                      readPool,
+		Conn:                          mockConn,
+		HandleCustomMessage: func(
+			peer [33]byte, msg *lnwire.Custom) error {
+
+			receivedCustomChan <- &customMsg{
+				peer: peer,
+				msg:  *msg,
+			}
+
+			return nil
+		},
+		PongBuf: make([]byte, lnwire.MaxPongBytes),
+		FetchLastChanUpdate: func(chanID lnwire.ShortChannelID,
+		) (*lnwire.ChannelUpdate1, error) {
+
+			return &lnwire.ChannelUpdate1{}, nil
+		},
+	}
+
+	alicePeer := NewBrontide(*cfg)
+
+	return &peerTestCtx{
+		publishTx:     publishTx,
+		mockSwitch:    mockSwitch,
+		peer:          alicePeer,
+		notifier:      notifier,
+		db:            dbAliceChannel,
+		privKey:       aliceKeyPriv,
+		mockConn:      mockConn,
+		customChan:    receivedCustomChan,
+		chanStatusMgr: chanStatusMgr,
+	}
+}
+
+// startPeer invokes the `Start` method on the specified peer and handles any
+// initial startup messages for testing.
+func startPeer(t *testing.T, mockConn *mockMessageConn,
+	peer *Brontide) <-chan struct{} {
+
+	// Start the peer in a goroutine so that we can handle and test for
+	// startup messages. Successfully sending and receiving init message,
+	// indicates a successful startup.
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, peer.Start())
+		close(done)
+	}()
+
+	// Receive the init message that should be the first message received on
+	// startup.
+	rawMsg, err := fn.RecvOrTimeout[[]byte](
+		mockConn.writtenMessages, timeout,
+	)
+	require.NoError(t, err)
+
+	msgReader := bytes.NewReader(rawMsg)
+	nextMsg, err := lnwire.ReadMessage(msgReader, 0)
+	require.NoError(t, err)
+
+	_, ok := nextMsg.(*lnwire.Init)
+	require.True(t, ok)
+
+	// Write the reply for the init message to complete the startup.
+	initReplyMsg := lnwire.NewInitMessage(
+		lnwire.NewRawFeatureVector(
+			lnwire.DataLossProtectRequired,
+			lnwire.GossipQueriesOptional,
+		),
+		lnwire.NewRawFeatureVector(),
+	)
+
+	var b bytes.Buffer
+	_, err = lnwire.WriteMessage(&b, initReplyMsg, 0)
+	require.NoError(t, err)
+
+	ok = fn.SendOrQuit[[]byte, struct{}](
+		mockConn.readMessages, b.Bytes(), make(chan struct{}),
+	)
+	require.True(t, ok)
+
+	return done
 }

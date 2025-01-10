@@ -34,6 +34,8 @@ var (
 		0x86, 0xf4, 0xcb, 0xf9, 0x8e, 0xae, 0xd2, 0x21,
 		0xb3, 0x0b, 0xd9, 0xa0, 0xb9, 0x28,
 	}
+
+	testWitness = [][]byte{{0x01}}
 )
 
 type mockHintCache struct {
@@ -171,7 +173,7 @@ func TestTxNotifierRegistrationValidation(t *testing.T) {
 
 	for _, testCase := range testCases {
 		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
+		success := t.Run(testCase.name, func(t *testing.T) {
 			hintCache := newMockHintCache()
 			n := chainntnfs.NewTxNotifier(
 				10, chainntnfs.ReorgSafetyLimit, hintCache, hintCache,
@@ -199,6 +201,10 @@ func TestTxNotifierRegistrationValidation(t *testing.T) {
 					"\"%v\", got \"%v\"", testCase.err, err)
 			}
 		})
+
+		if !success {
+			return
+		}
 	}
 }
 
@@ -747,6 +753,7 @@ func TestTxNotifierHistoricalSpendDispatch(t *testing.T) {
 	spendTx := wire.NewMsgTx(2)
 	spendTx.AddTxIn(&wire.TxIn{
 		PreviousOutPoint: spentOutpoint,
+		Witness:          testWitness,
 		SignatureScript:  testSigScript,
 	})
 	spendTxHash := spendTx.TxHash()
@@ -812,7 +819,7 @@ func TestTxNotifierHistoricalSpendDispatch(t *testing.T) {
 	}
 }
 
-// TestTxNotifierMultipleHistoricalRescans ensures that we don't attempt to
+// TestTxNotifierMultipleHistoricalConfRescans ensures that we don't attempt to
 // request multiple historical confirmation rescans per transactions.
 func TestTxNotifierMultipleHistoricalConfRescans(t *testing.T) {
 	t.Parallel()
@@ -859,7 +866,7 @@ func TestTxNotifierMultipleHistoricalConfRescans(t *testing.T) {
 	}
 }
 
-// TestTxNotifierMultipleHistoricalRescans ensures that we don't attempt to
+// TestTxNotifierMultipleHistoricalSpendRescans ensures that we don't attempt to
 // request multiple historical spend rescans per outpoints.
 func TestTxNotifierMultipleHistoricalSpendRescans(t *testing.T) {
 	t.Parallel()
@@ -894,10 +901,17 @@ func TestTxNotifierMultipleHistoricalSpendRescans(t *testing.T) {
 	// register another notification. We should also expect not to see a
 	// historical rescan request since the confirmation details should be
 	// cached.
+	msgTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: op, Witness: testWitness},
+		},
+		TxOut: []*wire.TxOut{},
+	}
+
 	spendDetails := &chainntnfs.SpendDetail{
 		SpentOutPoint:     &op,
 		SpenderTxHash:     &chainntnfs.ZeroHash,
-		SpendingTx:        wire.NewMsgTx(2),
+		SpendingTx:        msgTx,
 		SpenderInputIndex: 0,
 		SpendingHeight:    startingHeight - 1,
 	}
@@ -1021,10 +1035,17 @@ func TestTxNotifierMultipleHistoricalNtfns(t *testing.T) {
 	// We'll assume a historical rescan was dispatched and found the
 	// following spend details. We'll let the notifier know so that it can
 	// stop watching at tip.
+	msgTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: op, Witness: testWitness},
+		},
+		TxOut: []*wire.TxOut{},
+	}
+
 	expectedSpendDetails := &chainntnfs.SpendDetail{
 		SpentOutPoint:     &op,
 		SpenderTxHash:     &chainntnfs.ZeroHash,
-		SpendingTx:        wire.NewMsgTx(2),
+		SpendingTx:        msgTx,
 		SpenderInputIndex: 0,
 		SpendingHeight:    startingHeight - 1,
 	}
@@ -1724,7 +1745,7 @@ func TestTxNotifierSpendReorg(t *testing.T) {
 	}
 }
 
-// TestTxNotifierUpdateSpendReorg tests that a call to RegisterSpend after the
+// TestTxNotifierSpendReorgMissed tests that a call to RegisterSpend after the
 // spend has been confirmed, and then UpdateSpendDetails (called by historical
 // dispatch), followed by a chain re-org will notify on the Reorg channel. This
 // was not always the case and has since been fixed.
@@ -1744,6 +1765,7 @@ func TestTxNotifierSpendReorgMissed(t *testing.T) {
 	spendTx := wire.NewMsgTx(2)
 	spendTx.AddTxIn(&wire.TxIn{
 		PreviousOutPoint: op,
+		Witness:          testWitness,
 		SignatureScript:  testSigScript,
 	})
 	spendTxHash := spendTx.TxHash()
@@ -2142,7 +2164,7 @@ func TestTxNotifierSpendHintCache(t *testing.T) {
 	}
 }
 
-// TestTxNotifierSpendHinthistoricalRescan checks that the height hints and
+// TestTxNotifierSpendDuringHistoricalRescan checks that the height hints and
 // spend notifications behave as expected when a spend is found at tip during a
 // historical rescan.
 func TestTxNotifierSpendDuringHistoricalRescan(t *testing.T) {

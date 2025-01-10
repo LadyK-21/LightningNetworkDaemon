@@ -6,9 +6,13 @@
 package build
 
 import (
+	"context"
+	"encoding/hex"
 	"fmt"
 	"runtime/debug"
 	"strings"
+
+	"github.com/btcsuite/btclog/v2"
 )
 
 var (
@@ -40,13 +44,13 @@ const (
 	AppMajor uint = 0
 
 	// AppMinor defines the minor version of this binary.
-	AppMinor uint = 15
+	AppMinor uint = 18
 
 	// AppPatch defines the application patch for this binary.
 	AppPatch uint = 99
 
-	// AppPreRelease MUST only contain characters from semanticAlphabet
-	// per the semantic versioning spec.
+	// AppPreRelease MUST only contain characters from semanticAlphabet per
+	// the semantic versioning spec.
 	AppPreRelease = "beta"
 )
 
@@ -100,4 +104,23 @@ func Tags() []string {
 	}
 
 	return strings.Split(RawTags, ",")
+}
+
+// WithBuildInfo derives a child context with the build information attached as
+// attributes. At the moment, this only includes the current build's commit
+// hash.
+func WithBuildInfo(ctx context.Context, cfg *LogConfig) (context.Context,
+	error) {
+
+	if cfg.NoCommitHash {
+		return ctx, nil
+	}
+
+	// Convert the commit hash to a byte slice.
+	commitHash, err := hex.DecodeString(CommitHash)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode commit hash: %w", err)
+	}
+
+	return btclog.WithCtx(ctx, btclog.Hex3("rev", commitHash)), nil
 }

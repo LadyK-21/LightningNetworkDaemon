@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -34,6 +33,9 @@ const (
 	// SubServerConfigDispatcher instance recognize this as the name of the
 	// config file that we need.
 	subServerName = "SignRPC"
+
+	// BIP0340 is the prefix for BIP0340-related tagged hashes.
+	BIP0340 = "BIP0340"
 )
 
 var (
@@ -164,7 +166,7 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		err = ioutil.WriteFile(macFilePath, signerMacBytes, 0644)
+		err = os.WriteFile(macFilePath, signerMacBytes, 0644)
 		if err != nil {
 			_ = os.Remove(macFilePath)
 			return nil, nil, err
@@ -290,7 +292,7 @@ func (s *Server) SignOutputRaw(_ context.Context, in *SignReq) (*SignResp,
 	)
 	txReader := bytes.NewReader(in.RawTxBytes)
 	if err := txToSign.Deserialize(txReader); err != nil {
-		return nil, fmt.Errorf("unable to decode tx: %v", err)
+		return nil, fmt.Errorf("unable to decode tx: %w", err)
 	}
 
 	var (
@@ -517,7 +519,7 @@ func (s *Server) ComputeInputScript(ctx context.Context,
 	var txToSign wire.MsgTx
 	txReader := bytes.NewReader(in.RawTxBytes)
 	if err := txToSign.Deserialize(txReader); err != nil {
-		return nil, fmt.Errorf("unable to decode tx: %v", err)
+		return nil, fmt.Errorf("unable to decode tx: %w", err)
 	}
 
 	var (
@@ -605,6 +607,20 @@ func (s *Server) SignMessage(_ context.Context,
 		return nil, fmt.Errorf("compact format can not be used for " +
 			"Schnorr signatures")
 	}
+	if !in.SchnorrSig && len(in.Tag) > 0 {
+		return nil, fmt.Errorf("tag can only be used when the " +
+			"Schnorr signature option is set")
+	}
+	if bytes.HasPrefix(in.Tag, []byte(BIP0340)) {
+		return nil, fmt.Errorf("tag cannot have BIP0340 prefix")
+	}
+	if bytes.HasPrefix(in.Tag, chainhash.TagTapSighash) {
+		return nil, fmt.Errorf("tag cannot be TapSighash")
+	}
+	if in.DoubleHash && len(in.Tag) > 0 {
+		return nil, fmt.Errorf("double hash and tag can't be set at " +
+			"the same time")
+	}
 
 	// Describe the private key we'll be using for signing.
 	keyLocator := keychain.KeyLocator{
@@ -616,10 +632,10 @@ func (s *Server) SignMessage(_ context.Context,
 	if in.SchnorrSig {
 		sig, err := s.cfg.KeyRing.SignMessageSchnorr(
 			keyLocator, in.Msg, in.DoubleHash,
-			in.SchnorrSigTapTweak,
+			in.SchnorrSigTapTweak, in.Tag,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("can't sign the hash: %v", err)
+			return nil, fmt.Errorf("can't sign the hash: %w", err)
 		}
 
 		sigParsed, err := schnorr.ParseSignature(sig.Serialize())
@@ -642,7 +658,7 @@ func (s *Server) SignMessage(_ context.Context,
 			keyLocator, in.Msg, in.DoubleHash,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("can't sign the hash: %v", err)
+			return nil, fmt.Errorf("can't sign the hash: %w", err)
 		}
 
 		return &SignMessageResp{
@@ -656,11 +672,11 @@ func (s *Server) SignMessage(_ context.Context,
 		keyLocator, in.Msg, in.DoubleHash,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("can't sign the hash: %v", err)
+		return nil, fmt.Errorf("can't sign the hash: %w", err)
 	}
 	wireSig, err := lnwire.NewSigFromSignature(sig)
 	if err != nil {
-		return nil, fmt.Errorf("can't convert to wire format: %v", err)
+		return nil, fmt.Errorf("can't convert to wire format: %w", err)
 	}
 	return &SignMessageResp{
 		Signature: wireSig.ToSignatureBytes(),
@@ -682,6 +698,10 @@ func (s *Server) VerifyMessage(_ context.Context,
 	if in.Pubkey == nil {
 		return nil, fmt.Errorf("a pubkey to verify MUST be passed in")
 	}
+	if !in.IsSchnorrSig && len(in.Tag) > 0 {
+		return nil, fmt.Errorf("tag can only be used when the " +
+			"Schnorr signature option is set")
+	}
 
 	// We allow for Schnorr signatures to be verified.
 	if in.IsSchnorrSig {
@@ -689,17 +709,23 @@ func (s *Server) VerifyMessage(_ context.Context,
 		// for Schnorr signatures.
 		pubkey, err := schnorr.ParsePubKey(in.Pubkey)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse pubkey: %v",
+			return nil, fmt.Errorf("unable to parse pubkey: %w",
 				err)
 		}
 
 		sigParsed, err := schnorr.ParseSignature(in.Signature)
 		if err != nil {
 			return nil, fmt.Errorf("can't parse Schnorr "+
-				"signature: %v", err)
+				"signature: %w", err)
 		}
 
-		digest := chainhash.HashB(in.Msg)
+		var digest []byte
+		if len(in.Tag) == 0 {
+			digest = chainhash.HashB(in.Msg)
+		} else {
+			taggedHash := chainhash.TaggedHash(in.Tag, in.Msg)
+			digest = taggedHash[:]
+		}
 		valid := sigParsed.Verify(digest, pubkey)
 
 		return &VerifyMessageResp{
@@ -709,17 +735,17 @@ func (s *Server) VerifyMessage(_ context.Context,
 
 	pubkey, err := btcec.ParsePubKey(in.Pubkey)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse pubkey: %v", err)
+		return nil, fmt.Errorf("unable to parse pubkey: %w", err)
 	}
 
 	// The signature must be fixed-size LN wire format encoded.
-	wireSig, err := lnwire.NewSigFromRawSignature(in.Signature)
+	wireSig, err := lnwire.NewSigFromECDSARawSignature(in.Signature)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode signature: %v", err)
+		return nil, fmt.Errorf("failed to decode signature: %w", err)
 	}
 	sig, err := wireSig.ToSignature()
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert from wire format: %v",
+		return nil, fmt.Errorf("failed to convert from wire format: %w",
 			err)
 	}
 
@@ -745,7 +771,7 @@ func (s *Server) DeriveSharedKey(_ context.Context, in *SharedKeyRequest) (
 	// Check that EphemeralPubkey is valid.
 	ephemeralPubkey, err := parseRawKeyBytes(in.EphemeralPubkey)
 	if err != nil {
-		return nil, fmt.Errorf("error in ephemeral pubkey: %v", err)
+		return nil, fmt.Errorf("error in ephemeral pubkey: %w", err)
 	}
 	if ephemeralPubkey == nil {
 		return nil, fmt.Errorf("must provide ephemeral pubkey")
@@ -793,7 +819,7 @@ func (s *Server) DeriveSharedKey(_ context.Context, in *SharedKeyRequest) (
 	// *btcec.PublicKey is returned instead.
 	pk, err := parseRawKeyBytes(rawKeyBytes)
 	if err != nil {
-		return nil, fmt.Errorf("error in raw pubkey: %v", err)
+		return nil, fmt.Errorf("error in raw pubkey: %w", err)
 	}
 
 	// Create a key descriptor. When the KeyIndex is not specified, it uses
@@ -811,7 +837,7 @@ func (s *Server) DeriveSharedKey(_ context.Context, in *SharedKeyRequest) (
 	// compressed shared point.
 	sharedKeyHash, err := s.cfg.KeyRing.ECDH(keyDescriptor, ephemeralPubkey)
 	if err != nil {
-		err := fmt.Errorf("unable to derive shared key: %v", err)
+		err := fmt.Errorf("unable to derive shared key: %w", err)
 		log.Error(err)
 		return nil, err
 	}
@@ -824,33 +850,39 @@ func (s *Server) DeriveSharedKey(_ context.Context, in *SharedKeyRequest) (
 func (s *Server) MuSig2CombineKeys(_ context.Context,
 	in *MuSig2CombineKeysRequest) (*MuSig2CombineKeysResponse, error) {
 
-	// Parse the public keys of all signing participants. This must also
-	// include our own, local key.
-	allSignerPubKeys := make([]*btcec.PublicKey, len(in.AllSignerPubkeys))
-	if len(in.AllSignerPubkeys) < 2 {
-		return nil, fmt.Errorf("need at least two signing public keys")
+	// Check the now mandatory version first. We made the version mandatory,
+	// so we don't get unexpected/undefined behavior for old clients that
+	// don't specify the version. Since this API is still declared to be
+	// experimental this should be the approach that leads to the least
+	// amount of unexpected behavior.
+	version, err := UnmarshalMuSig2Version(in.Version)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing version: %w", err)
 	}
 
-	for idx, pubKeyBytes := range in.AllSignerPubkeys {
-		pubKey, err := schnorr.ParsePubKey(pubKeyBytes)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing signer public "+
-				"key %d: %v", idx, err)
-		}
-		allSignerPubKeys[idx] = pubKey
+	// Parse the public keys of all signing participants. This must also
+	// include our own, local key.
+	allSignerPubKeys, err := input.MuSig2ParsePubKeys(
+		version, in.AllSignerPubkeys,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing all signer public "+
+			"keys: %w", err)
 	}
 
 	// Are there any tweaks to apply to the combined public key?
 	tweaks, err := UnmarshalTweaks(in.Tweaks, in.TaprootTweak)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling tweak options: %v",
+		return nil, fmt.Errorf("error unmarshaling tweak options: %w",
 			err)
 	}
 
 	// Combine the keys now without creating a session in memory.
-	combinedKey, err := input.MuSig2CombineKeys(allSignerPubKeys, tweaks)
+	combinedKey, err := input.MuSig2CombineKeys(
+		version, allSignerPubKeys, true, tweaks,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("error combining keys: %v", err)
+		return nil, fmt.Errorf("error combining keys: %w", err)
 	}
 
 	var internalKeyBytes []byte
@@ -865,7 +897,43 @@ func (s *Server) MuSig2CombineKeys(_ context.Context,
 			combinedKey.FinalKey,
 		),
 		TaprootInternalKey: internalKeyBytes,
+		Version:            in.Version,
 	}, nil
+}
+
+// secNonceToPubNonce takes our two secret nonces, and produces their two
+// corresponding EC points, serialized in compressed format.
+//
+// NOTE: This was copied from btcsuite/btcec/musig2/nonces.go.
+func secNonceToPubNonce(secNonce [musig2.SecNonceSize]byte,
+) [musig2.PubNonceSize]byte {
+
+	var k1Mod, k2Mod btcec.ModNScalar
+	k1Mod.SetByteSlice(secNonce[:btcec.PrivKeyBytesLen])
+	k2Mod.SetByteSlice(secNonce[btcec.PrivKeyBytesLen:])
+
+	var r1, r2 btcec.JacobianPoint
+	btcec.ScalarBaseMultNonConst(&k1Mod, &r1)
+	btcec.ScalarBaseMultNonConst(&k2Mod, &r2)
+
+	// Next, we'll convert the key in jacobian format to a normal public
+	// key expressed in affine coordinates.
+	r1.ToAffine()
+	r2.ToAffine()
+	r1Pub := btcec.NewPublicKey(&r1.X, &r1.Y)
+	r2Pub := btcec.NewPublicKey(&r2.X, &r2.Y)
+
+	var pubNonce [musig2.PubNonceSize]byte
+
+	// The public nonces are serialized as: R1 || R2, where both keys are
+	// serialized in compressed format.
+	copy(pubNonce[:], r1Pub.SerializeCompressed())
+	copy(
+		pubNonce[btcec.PubKeyBytesLenCompressed:],
+		r2Pub.SerializeCompressed(),
+	)
+
+	return pubNonce
 }
 
 // MuSig2CreateSession creates a new MuSig2 signing session using the local
@@ -875,6 +943,16 @@ func (s *Server) MuSig2CombineKeys(_ context.Context,
 // submitted as well to reduce the number of RPC calls necessary later on.
 func (s *Server) MuSig2CreateSession(_ context.Context,
 	in *MuSig2SessionRequest) (*MuSig2SessionResponse, error) {
+
+	// Check the now mandatory version first. We made the version mandatory,
+	// so we don't get unexpected/undefined behavior for old clients that
+	// don't specify the version. Since this API is still declared to be
+	// experimental this should be the approach that leads to the least
+	// amount of unexpected behavior.
+	version, err := UnmarshalMuSig2Version(in.Version)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing version: %w", err)
+	}
 
 	// A key locator is always mandatory.
 	if in.KeyLoc == nil {
@@ -887,18 +965,12 @@ func (s *Server) MuSig2CreateSession(_ context.Context,
 
 	// Parse the public keys of all signing participants. This must also
 	// include our own, local key.
-	allSignerPubKeys := make([]*btcec.PublicKey, len(in.AllSignerPubkeys))
-	if len(in.AllSignerPubkeys) < 2 {
-		return nil, fmt.Errorf("need at least two signing public keys")
-	}
-
-	for idx, pubKeyBytes := range in.AllSignerPubkeys {
-		pubKey, err := schnorr.ParsePubKey(pubKeyBytes)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing signer public "+
-				"key %d: %v", idx, err)
-		}
-		allSignerPubKeys[idx] = pubKey
+	allSignerPubKeys, err := input.MuSig2ParsePubKeys(
+		version, in.AllSignerPubkeys,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing all signer public "+
+			"keys: %w", err)
 	}
 
 	// We participate a nonce ourselves, so we can't have more nonces than
@@ -910,27 +982,48 @@ func (s *Server) MuSig2CreateSession(_ context.Context,
 			len(in.OtherSignerPublicNonces), maxNonces)
 	}
 
+	var localNonces *musig2.Nonces
+
+	// If the pre generated local nonces were specified, then check to make
+	// sure they're the correct size and format.
+	nonceLen := len(in.PregeneratedLocalNonce)
+	switch {
+	case nonceLen != 0 && nonceLen != musig2.SecNonceSize:
+		return nil, fmt.Errorf("local nonces must be %v bytes, "+
+			"instead was %v", musig2.SecNonceSize, nonceLen)
+
+	case nonceLen == musig2.SecNonceSize:
+		var secNonce [musig2.SecNonceSize]byte
+		copy(secNonce[:], in.PregeneratedLocalNonce)
+
+		localNonces = &musig2.Nonces{
+			SecNonce: secNonce,
+			PubNonce: secNonceToPubNonce(secNonce),
+		}
+	}
+
 	// Parse all other nonces we might already know.
 	otherSignerNonces, err := parseMuSig2PublicNonces(
 		in.OtherSignerPublicNonces, true,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing other nonces: %v", err)
+		return nil, fmt.Errorf("error parsing other nonces: %w", err)
 	}
 
 	// Are there any tweaks to apply to the combined public key?
 	tweaks, err := UnmarshalTweaks(in.Tweaks, in.TaprootTweak)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling tweak options: %v",
+		return nil, fmt.Errorf("error unmarshaling tweak options: %w",
 			err)
 	}
 
 	// Register the session with the internal wallet/signer now.
 	session, err := s.cfg.Signer.MuSig2CreateSession(
-		keyLoc, allSignerPubKeys, tweaks, otherSignerNonces,
+		version, keyLoc, allSignerPubKeys, tweaks, otherSignerNonces,
+		localNonces,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error registering session: %v", err)
+		return nil, fmt.Errorf("error registering session: %w", err)
 	}
 
 	var internalKeyBytes []byte
@@ -948,6 +1041,7 @@ func (s *Server) MuSig2CreateSession(_ context.Context,
 		TaprootInternalKey: internalKeyBytes,
 		LocalPublicNonces:  session.PublicNonce[:],
 		HaveAllNonces:      session.HaveAllNonces,
+		Version:            in.Version,
 	}, nil
 }
 
@@ -959,7 +1053,7 @@ func (s *Server) MuSig2RegisterNonces(_ context.Context,
 	// Check session ID length.
 	sessionID, err := parseMuSig2SessionID(in.SessionId)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing session ID: %v", err)
+		return nil, fmt.Errorf("error parsing session ID: %w", err)
 	}
 
 	// Parse the other signing participants' nonces. We can't validate the
@@ -972,7 +1066,7 @@ func (s *Server) MuSig2RegisterNonces(_ context.Context,
 		in.OtherSignerPublicNonces, false,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing other nonces: %v", err)
+		return nil, fmt.Errorf("error parsing other nonces: %w", err)
 	}
 
 	// Register the nonces now.
@@ -980,7 +1074,7 @@ func (s *Server) MuSig2RegisterNonces(_ context.Context,
 		sessionID, otherSignerNonces,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error registering nonces: %v", err)
+		return nil, fmt.Errorf("error registering nonces: %w", err)
 	}
 
 	return &MuSig2RegisterNoncesResponse{HaveAllNonces: haveAllNonces}, nil
@@ -998,7 +1092,7 @@ func (s *Server) MuSig2Sign(_ context.Context,
 	// Check session ID length.
 	sessionID, err := parseMuSig2SessionID(in.SessionId)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing session ID: %v", err)
+		return nil, fmt.Errorf("error parsing session ID: %w", err)
 	}
 
 	// Schnorr signatures only work reliably if the message is 32 bytes.
@@ -1012,12 +1106,12 @@ func (s *Server) MuSig2Sign(_ context.Context,
 	// Create our own partial signature with the local signing key.
 	partialSig, err := s.cfg.Signer.MuSig2Sign(sessionID, msg, in.Cleanup)
 	if err != nil {
-		return nil, fmt.Errorf("error signing: %v", err)
+		return nil, fmt.Errorf("error signing: %w", err)
 	}
 
 	serializedPartialSig, err := input.SerializePartialSignature(partialSig)
 	if err != nil {
-		return nil, fmt.Errorf("error serializing sig: %v", err)
+		return nil, fmt.Errorf("error serializing sig: %w", err)
 	}
 
 	return &MuSig2SignResponse{
@@ -1034,7 +1128,7 @@ func (s *Server) MuSig2CombineSig(_ context.Context,
 	// Check session ID length.
 	sessionID, err := parseMuSig2SessionID(in.SessionId)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing session ID: %v", err)
+		return nil, fmt.Errorf("error parsing session ID: %w", err)
 	}
 
 	// Parse all other signatures. This can be called multiple times, so we
@@ -1044,7 +1138,7 @@ func (s *Server) MuSig2CombineSig(_ context.Context,
 		in.OtherPartialSignatures,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing partial signatures: %v",
+		return nil, fmt.Errorf("error parsing partial signatures: %w",
 			err)
 	}
 
@@ -1054,7 +1148,7 @@ func (s *Server) MuSig2CombineSig(_ context.Context,
 		sessionID, partialSigs,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error combining signatures: %v", err)
+		return nil, fmt.Errorf("error combining signatures: %w", err)
 	}
 
 	resp := &MuSig2CombineSigResponse{
@@ -1075,12 +1169,12 @@ func (s *Server) MuSig2Cleanup(_ context.Context,
 	// Check session ID length.
 	sessionID, err := parseMuSig2SessionID(in.SessionId)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing session ID: %v", err)
+		return nil, fmt.Errorf("error parsing session ID: %w", err)
 	}
 
 	err = s.cfg.Signer.MuSig2Cleanup(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("error cleaning up session: %v", err)
+		return nil, fmt.Errorf("error cleaning up session: %w", err)
 	}
 
 	return &MuSig2CleanupResponse{}, nil

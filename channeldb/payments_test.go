@@ -13,17 +13,20 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
 var (
 	priv, _ = btcec.NewPrivateKey()
 	pub     = priv.PubKey()
+	vertex  = route.NewVertex(pub)
 
 	testHop1 = &route.Hop{
-		PubKeyBytes:      route.NewVertex(pub),
+		PubKeyBytes:      vertex,
 		ChannelID:        12345,
 		OutgoingTimeLock: 111,
 		AmtToForward:     555,
@@ -36,20 +39,61 @@ var (
 	}
 
 	testHop2 = &route.Hop{
-		PubKeyBytes:      route.NewVertex(pub),
+		PubKeyBytes:      vertex,
 		ChannelID:        12345,
 		OutgoingTimeLock: 111,
 		AmtToForward:     555,
 		LegacyPayload:    true,
 	}
 
+	testHop3 = &route.Hop{
+		PubKeyBytes:      route.NewVertex(pub),
+		ChannelID:        12345,
+		OutgoingTimeLock: 111,
+		AmtToForward:     555,
+		CustomRecords: record.CustomSet{
+			65536: []byte{},
+			80001: []byte{},
+		},
+		AMP:      record.NewAMP([32]byte{0x69}, [32]byte{0x42}, 1),
+		Metadata: []byte{1, 2, 3},
+	}
+
 	testRoute = route.Route{
 		TotalTimeLock: 123,
 		TotalAmount:   1234567,
-		SourcePubKey:  route.NewVertex(pub),
+		SourcePubKey:  vertex,
 		Hops: []*route.Hop{
+			testHop3,
 			testHop2,
 			testHop1,
+		},
+	}
+
+	testBlindedRoute = route.Route{
+		TotalTimeLock: 150,
+		TotalAmount:   1000,
+		SourcePubKey:  vertex,
+		Hops: []*route.Hop{
+			{
+				PubKeyBytes:      vertex,
+				ChannelID:        9876,
+				OutgoingTimeLock: 120,
+				AmtToForward:     900,
+				EncryptedData:    []byte{1, 3, 3},
+				BlindingPoint:    pub,
+			},
+			{
+				PubKeyBytes:   vertex,
+				EncryptedData: []byte{3, 2, 1},
+			},
+			{
+				PubKeyBytes:      vertex,
+				Metadata:         []byte{4, 5, 6},
+				AmtToForward:     500,
+				OutgoingTimeLock: 100,
+				TotalAmtMsat:     500,
+			},
 		},
 	}
 )
@@ -66,14 +110,14 @@ func makeFakeInfo() (*PaymentCreationInfo, *HTLCAttemptInfo) {
 		// Use single second precision to avoid false positive test
 		// failures due to the monotonic time component.
 		CreationTime:   time.Unix(time.Now().Unix(), 0),
-		PaymentRequest: []byte(""),
+		PaymentRequest: []byte("test"),
 	}
 
-	a := NewHtlcAttemptInfo(
+	a := NewHtlcAttempt(
 		44, priv, testRoute, time.Unix(100, 0), &hash,
 	)
 
-	return c, a
+	return c, &a.HTLCAttemptInfo
 }
 
 func TestSentPaymentSerialization(t *testing.T) {
@@ -82,51 +126,64 @@ func TestSentPaymentSerialization(t *testing.T) {
 	c, s := makeFakeInfo()
 
 	var b bytes.Buffer
-	if err := serializePaymentCreationInfo(&b, c); err != nil {
-		t.Fatalf("unable to serialize creation info: %v", err)
-	}
+	require.NoError(t, serializePaymentCreationInfo(&b, c), "serialize")
+
+	// Assert the length of the serialized creation info is as expected,
+	// without any custom records.
+	baseLength := 32 + 8 + 8 + 4 + len(c.PaymentRequest)
+	require.Len(t, b.Bytes(), baseLength)
 
 	newCreationInfo, err := deserializePaymentCreationInfo(&b)
-	require.NoError(t, err, "unable to deserialize creation info")
-
-	if !reflect.DeepEqual(c, newCreationInfo) {
-		t.Fatalf("Payments do not match after "+
-			"serialization/deserialization %v vs %v",
-			spew.Sdump(c), spew.Sdump(newCreationInfo),
-		)
-	}
+	require.NoError(t, err, "deserialize")
+	require.Equal(t, c, newCreationInfo)
 
 	b.Reset()
-	if err := serializeHTLCAttemptInfo(&b, s); err != nil {
-		t.Fatalf("unable to serialize info: %v", err)
+
+	// Now we add some custom records to the creation info and serialize it
+	// again.
+	c.FirstHopCustomRecords = lnwire.CustomRecords{
+		lnwire.MinCustomRecordsTlvType: []byte{1, 2, 3},
 	}
+	require.NoError(t, serializePaymentCreationInfo(&b, c), "serialize")
+
+	newCreationInfo, err = deserializePaymentCreationInfo(&b)
+	require.NoError(t, err, "deserialize")
+	require.Equal(t, c, newCreationInfo)
+
+	b.Reset()
+	require.NoError(t, serializeHTLCAttemptInfo(&b, s), "serialize")
 
 	newWireInfo, err := deserializeHTLCAttemptInfo(&b)
-	require.NoError(t, err, "unable to deserialize info")
-	newWireInfo.AttemptID = s.AttemptID
+	require.NoError(t, err, "deserialize")
 
-	// First we verify all the records match up porperly, as they aren't
-	// able to be properly compared using reflect.DeepEqual.
-	err = assertRouteEqual(&s.Route, &newWireInfo.Route)
-	if err != nil {
-		t.Fatalf("Routes do not match after "+
-			"serialization/deserialization: %v", err)
+	// First we verify all the records match up properly.
+	require.Equal(t, s.Route, newWireInfo.Route)
+
+	// We now add the new fields and custom records to the route and
+	// serialize it again.
+	b.Reset()
+	s.Route.FirstHopAmount = tlv.NewRecordT[tlv.TlvType0](
+		tlv.NewBigSizeT(lnwire.MilliSatoshi(1234)),
+	)
+	s.Route.FirstHopWireCustomRecords = lnwire.CustomRecords{
+		lnwire.MinCustomRecordsTlvType + 3: []byte{4, 5, 6},
 	}
+	require.NoError(t, serializeHTLCAttemptInfo(&b, s), "serialize")
+
+	newWireInfo, err = deserializeHTLCAttemptInfo(&b)
+	require.NoError(t, err, "deserialize")
+	require.Equal(t, s.Route, newWireInfo.Route)
 
 	// Clear routes to allow DeepEqual to compare the remaining fields.
 	newWireInfo.Route = route.Route{}
 	s.Route = route.Route{}
+	newWireInfo.AttemptID = s.AttemptID
 
 	// Call session key method to set our cached session key so we can use
 	// DeepEqual, and assert that our key equals the original key.
 	require.Equal(t, s.cachedSessionKey, newWireInfo.SessionKey())
 
-	if !reflect.DeepEqual(s, newWireInfo) {
-		t.Fatalf("Payments do not match after "+
-			"serialization/deserialization %v vs %v",
-			spew.Sdump(s), spew.Sdump(newWireInfo),
-		)
-	}
+	require.Equal(t, s, newWireInfo)
 }
 
 // assertRouteEquals compares to routes for equality and returns an error if
@@ -140,27 +197,24 @@ func assertRouteEqual(a, b *route.Route) error {
 	return nil
 }
 
+// TestRouteSerialization tests serialization of a regular and blinded route.
 func TestRouteSerialization(t *testing.T) {
 	t.Parallel()
 
+	testSerializeRoute(t, testRoute)
+	testSerializeRoute(t, testBlindedRoute)
+}
+
+func testSerializeRoute(t *testing.T, route route.Route) {
 	var b bytes.Buffer
-	if err := SerializeRoute(&b, testRoute); err != nil {
-		t.Fatal(err)
-	}
+	err := SerializeRoute(&b, route)
+	require.NoError(t, err)
 
 	r := bytes.NewReader(b.Bytes())
 	route2, err := DeserializeRoute(r)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	// First we verify all the records match up porperly, as they aren't
-	// able to be properly compared using reflect.DeepEqual.
-	err = assertRouteEqual(&testRoute, &route2)
-	if err != nil {
-		t.Fatalf("routes not equal: \n%v vs \n%v",
-			spew.Sdump(testRoute), spew.Sdump(route2))
-	}
+	reflect.DeepEqual(route, route2)
 }
 
 // deletePayment removes a payment with paymentHash from the payments database.
@@ -391,6 +445,48 @@ func TestQueryPayments(t *testing.T) {
 			lastIndex:      4,
 			expectedSeqNrs: []uint64{3, 4},
 		},
+		{
+			name: "query in forwards order, with start creation " +
+				"time",
+			query: PaymentsQuery{
+				IndexOffset:       0,
+				MaxPayments:       2,
+				Reversed:          false,
+				IncludeIncomplete: true,
+				CreationDateStart: 5,
+			},
+			firstIndex:     5,
+			lastIndex:      6,
+			expectedSeqNrs: []uint64{5, 6},
+		},
+		{
+			name: "query in forwards order, with start creation " +
+				"time at end, overflow",
+			query: PaymentsQuery{
+				IndexOffset:       0,
+				MaxPayments:       2,
+				Reversed:          false,
+				IncludeIncomplete: true,
+				CreationDateStart: 7,
+			},
+			firstIndex:     7,
+			lastIndex:      7,
+			expectedSeqNrs: []uint64{7},
+		},
+		{
+			name: "query with start and end creation time",
+			query: PaymentsQuery{
+				IndexOffset:       9,
+				MaxPayments:       math.MaxUint64,
+				Reversed:          true,
+				IncludeIncomplete: true,
+				CreationDateStart: 3,
+				CreationDateEnd:   5,
+			},
+			firstIndex:     3,
+			lastIndex:      5,
+			expectedSeqNrs: []uint64{3, 4, 5},
+		},
 	}
 
 	for _, tt := range tests {
@@ -426,6 +522,9 @@ func TestQueryPayments(t *testing.T) {
 					t.Fatalf("unable to create test "+
 						"payment: %v", err)
 				}
+				// Override creation time to allow for testing
+				// of CreationDateStart and CreationDateEnd.
+				info.CreationTime = time.Unix(int64(i+1), 0)
 
 				// Create a new payment entry in the database.
 				err = pControl.InitPayment(info.PaymentIdentifier, info)

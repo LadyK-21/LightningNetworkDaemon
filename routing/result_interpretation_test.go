@@ -4,7 +4,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -14,44 +16,179 @@ var (
 		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4},
 	}
 
-	routeOneHop = route.Route{
+	routeOneHop = extractMCRoute(&route.Route{
 		SourcePubKey: hops[0],
 		TotalAmount:  100,
 		Hops: []*route.Hop{
-			{PubKeyBytes: hops[1], AmtToForward: 99},
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
 		},
-	}
+	})
 
-	routeTwoHop = route.Route{
+	routeTwoHop = extractMCRoute(&route.Route{
 		SourcePubKey: hops[0],
 		TotalAmount:  100,
 		Hops: []*route.Hop{
-			{PubKeyBytes: hops[1], AmtToForward: 99},
-			{PubKeyBytes: hops[2], AmtToForward: 97},
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
+			{
+				PubKeyBytes:  hops[2],
+				AmtToForward: 97,
+			},
 		},
-	}
+	})
 
-	routeThreeHop = route.Route{
+	routeThreeHop = extractMCRoute(&route.Route{
 		SourcePubKey: hops[0],
 		TotalAmount:  100,
 		Hops: []*route.Hop{
-			{PubKeyBytes: hops[1], AmtToForward: 99},
-			{PubKeyBytes: hops[2], AmtToForward: 97},
-			{PubKeyBytes: hops[3], AmtToForward: 94},
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
+			{
+				PubKeyBytes:  hops[2],
+				AmtToForward: 97,
+			},
+			{
+				PubKeyBytes:  hops[3],
+				AmtToForward: 94,
+			},
 		},
-	}
+	})
 
-	routeFourHop = route.Route{
+	routeFourHop = extractMCRoute(&route.Route{
 		SourcePubKey: hops[0],
 		TotalAmount:  100,
 		Hops: []*route.Hop{
-			{PubKeyBytes: hops[1], AmtToForward: 99},
-			{PubKeyBytes: hops[2], AmtToForward: 97},
-			{PubKeyBytes: hops[3], AmtToForward: 94},
-			{PubKeyBytes: hops[4], AmtToForward: 90},
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
+			{
+				PubKeyBytes:  hops[2],
+				AmtToForward: 97,
+			},
+			{
+				PubKeyBytes:  hops[3],
+				AmtToForward: 94,
+			},
+			{
+				PubKeyBytes:  hops[4],
+				AmtToForward: 90,
+			},
 		},
-	}
+	})
+
+	// blindedMultiHop is a blinded path where there are cleartext hops
+	// before the introduction node, and an intermediate blinded hop before
+	// the recipient after it.
+	blindedMultiHop = extractMCRoute(&route.Route{
+		SourcePubKey: hops[0],
+		TotalAmount:  100,
+		Hops: []*route.Hop{
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
+			{
+				PubKeyBytes: hops[2],
+				// Intermediate blinded hops don't have an
+				// amount set.
+				AmtToForward:  0,
+				BlindingPoint: genTestPubKey(),
+			},
+			{
+				PubKeyBytes: hops[3],
+				// Intermediate blinded hops don't have an
+				// amount set.
+				AmtToForward: 0,
+			},
+			{
+				PubKeyBytes:  hops[4],
+				AmtToForward: 77,
+			},
+		},
+	})
+
+	// blindedSingleHop is a blinded path with a single blinded hop after
+	// the introduction node.
+	blindedSingleHop = extractMCRoute(&route.Route{
+		SourcePubKey: hops[0],
+		TotalAmount:  100,
+		Hops: []*route.Hop{
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 99,
+			},
+			{
+				PubKeyBytes: hops[2],
+				// Intermediate blinded hops don't have an
+				// amount set.
+				AmtToForward:  0,
+				BlindingPoint: genTestPubKey(),
+			},
+			{
+				PubKeyBytes:  hops[3],
+				AmtToForward: 88,
+			},
+		},
+	})
+
+	// blindedMultiToIntroduction is a blinded path which goes directly
+	// to the introduction node, with multiple blinded hops after it.
+	blindedMultiToIntroduction = extractMCRoute(&route.Route{
+		SourcePubKey: hops[0],
+		TotalAmount:  100,
+		Hops: []*route.Hop{
+			{
+				PubKeyBytes: hops[1],
+				// Intermediate blinded hops don't have an
+				// amount set.
+				AmtToForward:  0,
+				BlindingPoint: genTestPubKey(),
+			},
+			{
+				PubKeyBytes: hops[2],
+				// Intermediate blinded hops don't have an
+				// amount set.
+				AmtToForward: 0,
+			},
+			{
+				PubKeyBytes:  hops[3],
+				AmtToForward: 58,
+			},
+		},
+	})
+
+	// blindedIntroReceiver is a blinded path where the introduction node
+	// is the recipient.
+	blindedIntroReceiver = extractMCRoute(&route.Route{
+		SourcePubKey: hops[0],
+		TotalAmount:  100,
+		Hops: []*route.Hop{
+			{
+				PubKeyBytes:  hops[1],
+				AmtToForward: 95,
+			},
+			{
+				PubKeyBytes:   hops[2],
+				AmtToForward:  90,
+				BlindingPoint: genTestPubKey(),
+			},
+		},
+	})
 )
+
+func genTestPubKey() *btcec.PublicKey {
+	key, _ := btcec.NewPrivateKey()
+
+	return key.PubKey()
+}
 
 func getTestPair(from, to int) DirectedNodePair {
 	return NewDirectedNodePair(hops[from], hops[to])
@@ -64,7 +201,7 @@ func getPolicyFailure(from, to int) *DirectedNodePair {
 
 type resultTestCase struct {
 	name          string
-	route         *route.Route
+	route         *mcRoute
 	success       bool
 	failureSrcIdx int
 	failure       lnwire.FailureMessage
@@ -77,7 +214,7 @@ var resultTestCases = []resultTestCase{
 	// interpreted.
 	{
 		name:          "fail",
-		route:         &routeTwoHop,
+		route:         routeTwoHop,
 		failureSrcIdx: 1,
 		failure:       lnwire.NewTemporaryChannelFailure(nil),
 
@@ -89,12 +226,12 @@ var resultTestCases = []resultTestCase{
 		},
 	},
 
-	// Tests that a expiry too soon failure result is properly interpreted.
+	// Tests that an expiry too soon failure result is properly interpreted.
 	{
 		name:          "fail expiry too soon",
-		route:         &routeFourHop,
+		route:         routeFourHop,
 		failureSrcIdx: 3,
-		failure:       lnwire.NewExpiryTooSoon(lnwire.ChannelUpdate{}),
+		failure:       lnwire.NewExpiryTooSoon(lnwire.ChannelUpdate1{}),
 
 		expectedResult: &interpretedResult{
 			pairResults: map[DirectedNodePair]pairResult{
@@ -112,7 +249,7 @@ var resultTestCases = []resultTestCase{
 	// failure, but mark all pairs along the route as successful.
 	{
 		name:          "fail incorrect details",
-		route:         &routeTwoHop,
+		route:         routeTwoHop,
 		failureSrcIdx: 2,
 		failure:       lnwire.NewFailIncorrectDetails(97, 0),
 
@@ -128,7 +265,7 @@ var resultTestCases = []resultTestCase{
 	// Tests a successful direct payment.
 	{
 		name:    "success direct",
-		route:   &routeOneHop,
+		route:   routeOneHop,
 		success: true,
 
 		expectedResult: &interpretedResult{
@@ -141,7 +278,7 @@ var resultTestCases = []resultTestCase{
 	// Tests a successful two hop payment.
 	{
 		name:    "success",
-		route:   &routeTwoHop,
+		route:   routeTwoHop,
 		success: true,
 
 		expectedResult: &interpretedResult{
@@ -155,7 +292,7 @@ var resultTestCases = []resultTestCase{
 	// Tests a malformed htlc from a direct peer.
 	{
 		name:          "fail malformed htlc from direct peer",
-		route:         &routeTwoHop,
+		route:         routeTwoHop,
 		failureSrcIdx: 0,
 		failure:       lnwire.NewInvalidOnionKey(nil),
 
@@ -174,7 +311,7 @@ var resultTestCases = []resultTestCase{
 	// destination.
 	{
 		name:          "fail malformed htlc from direct final peer",
-		route:         &routeOneHop,
+		route:         routeOneHop,
 		failureSrcIdx: 0,
 		failure:       lnwire.NewInvalidOnionKey(nil),
 
@@ -194,10 +331,11 @@ var resultTestCases = []resultTestCase{
 	// in a policy failure for the outgoing hop.
 	{
 		name:          "fail fee insufficient intermediate",
-		route:         &routeFourHop,
+		route:         routeFourHop,
 		failureSrcIdx: 2,
-		failure:       lnwire.NewFeeInsufficient(0, lnwire.ChannelUpdate{}),
-
+		failure: lnwire.NewFeeInsufficient(
+			0, lnwire.ChannelUpdate1{},
+		),
 		expectedResult: &interpretedResult{
 			pairResults: map[DirectedNodePair]pairResult{
 				getTestPair(0, 1): {
@@ -216,7 +354,7 @@ var resultTestCases = []resultTestCase{
 	// failure is terminal since the receiver can't process our onion.
 	{
 		name:          "fail invalid onion payload final hop four",
-		route:         &routeFourHop,
+		route:         routeFourHop,
 		failureSrcIdx: 4,
 		failure:       lnwire.NewInvalidOnionPayload(0, 0),
 
@@ -245,7 +383,7 @@ var resultTestCases = []resultTestCase{
 	// Tests an invalid onion payload from a final hop on a three hop route.
 	{
 		name:          "fail invalid onion payload final hop three",
-		route:         &routeThreeHop,
+		route:         routeThreeHop,
 		failureSrcIdx: 3,
 		failure:       lnwire.NewInvalidOnionPayload(0, 0),
 
@@ -272,7 +410,7 @@ var resultTestCases = []resultTestCase{
 	// can still try other paths.
 	{
 		name:          "fail invalid onion payload intermediate",
-		route:         &routeFourHop,
+		route:         routeFourHop,
 		failureSrcIdx: 3,
 		failure:       lnwire.NewInvalidOnionPayload(0, 0),
 
@@ -300,7 +438,7 @@ var resultTestCases = []resultTestCase{
 	// since the remote node can't process our onion.
 	{
 		name:          "fail invalid onion payload direct",
-		route:         &routeOneHop,
+		route:         routeOneHop,
 		failureSrcIdx: 1,
 		failure:       lnwire.NewInvalidOnionPayload(0, 0),
 
@@ -319,7 +457,7 @@ var resultTestCases = []resultTestCase{
 	// penalize mpp timeouts.
 	{
 		name:          "one hop mpp timeout",
-		route:         &routeOneHop,
+		route:         routeOneHop,
 		failureSrcIdx: 1,
 		failure:       &lnwire.FailMPPTimeout{},
 
@@ -336,7 +474,7 @@ var resultTestCases = []resultTestCase{
 	// temporary measure while we decide how to penalize mpp timeouts.
 	{
 		name:          "two hop mpp timeout",
-		route:         &routeTwoHop,
+		route:         routeTwoHop,
 		failureSrcIdx: 2,
 		failure:       &lnwire.FailMPPTimeout{},
 
@@ -353,7 +491,7 @@ var resultTestCases = []resultTestCase{
 	// disabled channel should be penalized for any amount.
 	{
 		name:          "two hop channel disabled",
-		route:         &routeTwoHop,
+		route:         routeTwoHop,
 		failureSrcIdx: 1,
 		failure:       &lnwire.FailChannelDisabled{},
 
@@ -366,6 +504,223 @@ var resultTestCases = []resultTestCase{
 			policyFailure: getPolicyFailure(1, 2),
 		},
 	},
+	// Test the case where a node after the introduction node returns a
+	// error. In this case the introduction node is penalized because it
+	// has not followed the specification properly.
+	{
+		name:          "error after introduction",
+		route:         blindedMultiToIntroduction,
+		failureSrcIdx: 2,
+		// Note that the failure code doesn't matter in this case -
+		// all we're worried about is errors originating after the
+		// introduction node.
+		failure: &lnwire.FailExpiryTooSoon{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): failPairResult(0),
+				getTestPair(1, 0): failPairResult(0),
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+			},
+			// Note: introduction node is failed even though the
+			// error source is after it.
+			nodeFailure: &hops[1],
+		},
+	},
+	// Test the case where we get a blinding failure from a blinded final
+	// hop when we expected the introduction node to convert.
+	{
+		name:          "final failure expected intro",
+		route:         blindedMultiHop,
+		failureSrcIdx: 4,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+				getTestPair(2, 3): failPairResult(0),
+				getTestPair(3, 2): failPairResult(0),
+			},
+			// Note that the introduction node is penalized, not
+			// the final hop.
+			nodeFailure:        &hops[2],
+			finalFailureReason: &reasonError,
+		},
+	},
+	// Test a multi-hop blinded route where the failure occurs at the
+	// introduction point.
+	{
+		name:          "blinded multi-hop introduction",
+		route:         blindedMultiHop,
+		failureSrcIdx: 2,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				getTestPair(1, 2): successPairResult(99),
+
+				// The amount for the last hop is always the
+				// receiver amount because the amount to forward
+				// is always set to 0 for intermediate blinded
+				// hops.
+				getTestPair(3, 4): failPairResult(77),
+			},
+		},
+	},
+	// Test a multi-hop blinded route where the failure occurs at the
+	// introduction point, which is a direct peer.
+	{
+		name:          "blinded multi-hop introduction peer",
+		route:         blindedMultiToIntroduction,
+		failureSrcIdx: 1,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+
+				// The amount for the last hop is always the
+				// receiver amount because the amount to forward
+				// is always set to 0 for intermediate blinded
+				// hops.
+				getTestPair(2, 3): failPairResult(58),
+			},
+		},
+	},
+	// Test a single-hop blinded route where the recipient is directly
+	// connected to the introduction node.
+	{
+		name:          "blinded single hop introduction failure",
+		route:         blindedSingleHop,
+		failureSrcIdx: 2,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				getTestPair(1, 2): successPairResult(99),
+			},
+			finalFailureReason: &reasonError,
+		},
+	},
+	// Test the case where a node before the introduction node returns a
+	// blinding error and is penalized for returning the wrong error.
+	{
+		name:          "error before introduction",
+		route:         blindedMultiHop,
+		failureSrcIdx: 1,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				// Failures from failing hops[1].
+				getTestPair(0, 1): failPairResult(0),
+				getTestPair(1, 0): failPairResult(0),
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+			},
+			nodeFailure: &hops[1],
+		},
+	},
+	// Test the case where an intermediate node that is not in a blinded
+	// route returns an invalid blinding error and there was one
+	// successful hop before the incorrect error.
+	{
+		name:          "intermediate unexpected blinding",
+		route:         routeThreeHop,
+		failureSrcIdx: 2,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				// Failures from failing hops[2].
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+				getTestPair(2, 3): failPairResult(0),
+				getTestPair(3, 2): failPairResult(0),
+			},
+			nodeFailure: &hops[2],
+		},
+	},
+	// Test the case where an intermediate node that is not in a blinded
+	// route returns an invalid blinding error and there were no successful
+	// hops before the erring incoming link (the erring node if our peer).
+	{
+		name:          "peer unexpected blinding",
+		route:         routeThreeHop,
+		failureSrcIdx: 1,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				// Failures from failing hops[1].
+				getTestPair(0, 1): failPairResult(0),
+				getTestPair(1, 0): failPairResult(0),
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+			},
+			nodeFailure: &hops[1],
+		},
+	},
+	// A node in a non-blinded route returns a blinding related error.
+	{
+		name:          "final node unexpected blinding",
+		route:         routeThreeHop,
+		failureSrcIdx: 3,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				getTestPair(1, 2): successPairResult(99),
+				getTestPair(2, 3): failPairResult(0),
+				getTestPair(3, 2): failPairResult(0),
+			},
+			nodeFailure:        &hops[3],
+			finalFailureReason: &reasonError,
+		},
+	},
+	// Introduction node returns invalid blinding erroneously.
+	{
+		name:          "final node intro blinding",
+		route:         blindedIntroReceiver,
+		failureSrcIdx: 2,
+		failure:       &lnwire.FailInvalidBlinding{},
+
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+				getTestPair(1, 2): failPairResult(0),
+				getTestPair(2, 1): failPairResult(0),
+			},
+			nodeFailure:        &hops[2],
+			finalFailureReason: &reasonError,
+		},
+	},
+	// Test a multi-hop blinded route and that in a success case the amounts
+	// for the blinded route part are correctly set to the receiver amount.
+	{
+		name:    "blinded multi-hop success",
+		route:   blindedMultiToIntroduction,
+		success: true,
+		expectedResult: &interpretedResult{
+			pairResults: map[DirectedNodePair]pairResult{
+				getTestPair(0, 1): successPairResult(100),
+
+				// For the route blinded part of the route the
+				// success amount is determined by the receiver
+				// amount because the intermediate blinded hops
+				// set the forwarded amount to 0.
+				getTestPair(1, 2): successPairResult(58),
+				getTestPair(2, 3): successPairResult(58),
+			},
+		},
+	},
 }
 
 // TestResultInterpretation executes a list of test cases that test the result
@@ -375,10 +730,15 @@ func TestResultInterpretation(t *testing.T) {
 
 	for _, testCase := range resultTestCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			i := interpretResult(
-				testCase.route, testCase.success,
-				&testCase.failureSrcIdx, testCase.failure,
-			)
+			var failure fn.Option[paymentFailure]
+			if !testCase.success {
+				failure = fn.Some(*newPaymentFailure(
+					&testCase.failureSrcIdx,
+					testCase.failure,
+				))
+			}
+
+			i := interpretResult(testCase.route, failure)
 
 			expected := testCase.expectedResult
 

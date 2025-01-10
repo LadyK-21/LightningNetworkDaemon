@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -54,13 +55,13 @@ type ChanStatusConfig struct {
 	// IsChannelActive checks whether the channel identified by the provided
 	// ChannelID is considered active. This should only return true if the
 	// channel has been sufficiently confirmed, the channel has received
-	// FundingLocked, and the remote peer is online.
+	// ChannelReady, and the remote peer is online.
 	IsChannelActive func(lnwire.ChannelID) bool
 
 	// ApplyChannelUpdate processes new ChannelUpdates signed by our node by
 	// updating our local routing table and broadcasting the update to our
 	// peers.
-	ApplyChannelUpdate func(*lnwire.ChannelUpdate, *wire.OutPoint,
+	ApplyChannelUpdate func(*lnwire.ChannelUpdate1, *wire.OutPoint,
 		bool) error
 
 	// DB stores the set of channels that are to be monitored.
@@ -195,7 +196,7 @@ func (m *ChanStatusManager) start() error {
 		// have been pruned from the channel graph but not yet from our
 		// set of channels. We'll skip it as we can't determine its
 		// initial state.
-		case err == channeldb.ErrEdgeNotFound:
+		case errors.Is(err, graphdb.ErrEdgeNotFound):
 			log.Warnf("Unable to find channel policies for %v, "+
 				"skipping. This is typical if the channel is "+
 				"in the process of closing.", c.FundingOutpoint)
@@ -225,7 +226,9 @@ func (m *ChanStatusManager) start() error {
 // Stop safely shuts down the ChanStatusManager.
 func (m *ChanStatusManager) Stop() error {
 	m.stopped.Do(func() {
-		log.Info("Channel Status Manager shutting down")
+		log.Info("Channel Status Manager shutting down...")
+		defer log.Debug("Channel Status Manager shutdown complete")
+
 		close(m.quit)
 		m.wg.Wait()
 	})
@@ -389,7 +392,7 @@ func (m *ChanStatusManager) processEnableRequest(outpoint wire.OutPoint,
 
 	// Quickly check to see if the requested channel is active within the
 	// htlcswitch and return an error if it isn't.
-	chanID := lnwire.NewChanIDFromOutPoint(&outpoint)
+	chanID := lnwire.NewChanIDFromOutPoint(outpoint)
 	if !m.cfg.IsChannelActive(chanID) {
 		return ErrEnableInactiveChan
 	}
@@ -398,6 +401,9 @@ func (m *ChanStatusManager) processEnableRequest(outpoint wire.OutPoint,
 
 	// Channel is already enabled, nothing to do.
 	case ChanStatusEnabled:
+		log.Debugf("Channel(%v) already enabled, skipped "+
+			"announcement", outpoint)
+
 		return nil
 
 	// The channel is enabled, though we are now canceling the scheduled
@@ -526,7 +532,7 @@ func (m *ChanStatusManager) markPendingInactiveChannels() {
 		// If our bookkeeping shows the channel as active, sample the
 		// htlcswitch to see if it believes the link is also active. If
 		// so, we will skip marking it as ChanStatusPendingDisabled.
-		chanID := lnwire.NewChanIDFromOutPoint(&c.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(c.FundingOutpoint)
 		if m.cfg.IsChannelActive(chanID) {
 			continue
 		}
@@ -575,7 +581,7 @@ func (m *ChanStatusManager) disableInactiveChannels() {
 			// that the channel has been closed. Thus we remove the
 			// outpoint from the set of tracked outpoints to prevent
 			// further attempts.
-			if err == channeldb.ErrEdgeNotFound {
+			if errors.Is(err, graphdb.ErrEdgeNotFound) {
 				log.Debugf("Removing channel(%v) from "+
 					"consideration for passive disabling",
 					outpoint)
@@ -645,7 +651,7 @@ func (m *ChanStatusManager) signAndSendNextUpdate(outpoint wire.OutPoint,
 // in case our ChannelEdgePolicy is not found in the database. Also returns if
 // the channel is private by checking AuthProof for nil.
 func (m *ChanStatusManager) fetchLastChanUpdateByOutPoint(op wire.OutPoint) (
-	*lnwire.ChannelUpdate, bool, error) {
+	*lnwire.ChannelUpdate1, bool, error) {
 
 	// Get the edge info and policies for this channel from the graph.
 	info, edge1, edge2, err := m.cfg.Graph.FetchChannelEdgesByOutpoint(&op)

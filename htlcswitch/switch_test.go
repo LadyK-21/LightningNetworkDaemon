@@ -1,7 +1,7 @@
 package htlcswitch
 
 import (
-	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -17,17 +17,20 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var zeroCircuit = channeldb.CircuitKey{}
+var zeroCircuit = models.CircuitKey{}
 var emptyScid = lnwire.ShortChannelID{}
 
 func genPreimage() ([32]byte, error) {
@@ -83,7 +86,7 @@ func TestSwitchAddDuplicateLink(t *testing.T) {
 // TestSwitchHasActiveLink tests the behavior of HasActiveLink, and asserts that
 // it only returns true if a link's short channel id has confirmed (meaning the
 // channel is no longer pending) and it's EligibleToForward method returns true,
-// i.e. it has received FundingLocked from the remote peer.
+// i.e. it has received ChannelReady from the remote peer.
 func TestSwitchHasActiveLink(t *testing.T) {
 	t.Parallel()
 
@@ -116,7 +119,7 @@ func TestSwitchHasActiveLink(t *testing.T) {
 		t.Fatalf("link should not be active yet, still pending")
 	}
 
-	// Finally, simulate the link receiving funding locked by setting its
+	// Finally, simulate the link receiving channel_ready by setting its
 	// eligibility to true.
 	aliceChannelLink.eligible = true
 
@@ -999,9 +1002,7 @@ func TestSwitchForwardFailAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1093,9 +1094,7 @@ func TestSwitchForwardFailAfterFullAdd(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1189,9 +1188,7 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1283,9 +1280,7 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1382,9 +1377,7 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1468,9 +1461,7 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1538,9 +1529,7 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1619,9 +1608,7 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1695,9 +1682,7 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -1775,9 +1760,7 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
@@ -1867,9 +1850,7 @@ func TestSwitchForwardCircuitPersistence(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
-	cdb3, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to reopen channeldb")
-	t.Cleanup(func() { cdb3.Close() })
+	cdb3 := channeldb.OpenForTesting(t, tempPath)
 
 	s3, err := initSwitchWithDB(testStartingHeight, cdb3)
 	require.NoError(t, err, "unable reinit switch")
@@ -2701,7 +2682,7 @@ func TestSwitchSendPayment(t *testing.T) {
 
 	// First check that the switch will correctly respond that this payment
 	// ID is unknown.
-	_, err = s.GetPaymentResult(
+	_, err = s.GetAttemptResult(
 		paymentID, rhash, newMockDeobfuscator(),
 	)
 	if err != ErrPaymentIDNotFound {
@@ -2719,7 +2700,7 @@ func TestSwitchSendPayment(t *testing.T) {
 			return
 		}
 
-		resultChan, err := s.GetPaymentResult(
+		resultChan, err := s.GetAttemptResult(
 			paymentID, rhash, newMockDeobfuscator(),
 		)
 		if err != nil {
@@ -3074,11 +3055,11 @@ func TestUpdateFailMalformedHTLCErrorConversion(t *testing.T) {
 	})
 }
 
-// TestSwitchGetPaymentResult tests that the switch interacts as expected with
+// TestSwitchGetAttemptResult tests that the switch interacts as expected with
 // the circuit map and network result store when looking up the result of a
 // payment ID. This is important for not to lose results under concurrent
 // lookup and receiving results.
-func TestSwitchGetPaymentResult(t *testing.T) {
+func TestSwitchGetAttemptResult(t *testing.T) {
 	t.Parallel()
 
 	const paymentID = 123
@@ -3102,7 +3083,7 @@ func TestSwitchGetPaymentResult(t *testing.T) {
 	// added anything to the store yet, ErrPaymentIDNotFound should be
 	// returned.
 	lookup <- nil
-	_, err = s.GetPaymentResult(
+	_, err = s.GetAttemptResult(
 		paymentID, lntypes.Hash{}, newMockDeobfuscator(),
 	)
 	if err != ErrPaymentIDNotFound {
@@ -3112,7 +3093,7 @@ func TestSwitchGetPaymentResult(t *testing.T) {
 	// Next let the lookup find the circuit in the circuit map. It should
 	// subscribe to payment results, and return the result when available.
 	lookup <- &PaymentCircuit{}
-	resultChan, err := s.GetPaymentResult(
+	resultChan, err := s.GetAttemptResult(
 		paymentID, lntypes.Hash{}, newMockDeobfuscator(),
 	)
 	require.NoError(t, err, "unable to get payment result")
@@ -3153,7 +3134,7 @@ func TestSwitchGetPaymentResult(t *testing.T) {
 	// in the circuit map, it should be immediately available from the
 	// store.
 	lookup <- nil
-	resultChan, err = s.GetPaymentResult(
+	resultChan, err = s.GetAttemptResult(
 		paymentID, lntypes.Hash{}, newMockDeobfuscator(),
 	)
 	require.NoError(t, err, "unable to get payment result")
@@ -3259,7 +3240,7 @@ func TestInvalidFailure(t *testing.T) {
 		},
 	}
 
-	resultChan, err := s.GetPaymentResult(
+	resultChan, err := s.GetAttemptResult(
 		paymentID, rhash, &deobfuscator,
 	)
 	if err != nil {
@@ -3285,7 +3266,7 @@ func TestInvalidFailure(t *testing.T) {
 		},
 	}
 
-	resultChan, err = s.GetPaymentResult(
+	resultChan, err = s.GetAttemptResult(
 		paymentID, rhash, &deobfuscator,
 	)
 	if err != nil {
@@ -3565,7 +3546,9 @@ func (n *threeHopNetwork) sendThreeHopPayment(t *testing.T) (*lnwire.UpdateAddHT
 		t.Fatal(err)
 	}
 
-	err = n.carolServer.registry.AddInvoice(*invoice, htlc.PaymentHash)
+	err = n.carolServer.registry.AddInvoice(
+		context.Background(), *invoice, htlc.PaymentHash,
+	)
 	require.NoError(t, err, "unable to add invoice in carol registry")
 
 	if err := n.aliceServer.htlcSwitch.SendHTLC(
@@ -3587,7 +3570,7 @@ func getThreeHopEvents(channels *clusterChannels, htlcID uint64,
 
 	aliceKey := HtlcKey{
 		IncomingCircuit: zeroCircuit,
-		OutgoingCircuit: channeldb.CircuitKey{
+		OutgoingCircuit: models.CircuitKey{
 			ChanID: channels.aliceToBob.ShortChanID(),
 			HtlcID: htlcID,
 		},
@@ -3608,11 +3591,11 @@ func getThreeHopEvents(channels *clusterChannels, htlcID uint64,
 	}
 
 	bobKey := HtlcKey{
-		IncomingCircuit: channeldb.CircuitKey{
+		IncomingCircuit: models.CircuitKey{
 			ChanID: channels.bobToAlice.ShortChanID(),
 			HtlcID: htlcID,
 		},
-		OutgoingCircuit: channeldb.CircuitKey{
+		OutgoingCircuit: models.CircuitKey{
 			ChanID: channels.bobToCarol.ShortChanID(),
 			HtlcID: htlcID,
 		},
@@ -3693,7 +3676,7 @@ func getThreeHopEvents(channels *clusterChannels, htlcID uint64,
 	carolEvents := []interface{}{
 		&SettleEvent{
 			HtlcKey: HtlcKey{
-				IncomingCircuit: channeldb.CircuitKey{
+				IncomingCircuit: models.CircuitKey{
 					ChanID: channels.carolToBob.ShortChanID(),
 					HtlcID: htlcID,
 				},
@@ -3703,7 +3686,7 @@ func getThreeHopEvents(channels *clusterChannels, htlcID uint64,
 			HtlcEventType: HtlcEventTypeReceive,
 			Timestamp:     ts,
 		}, &FinalHtlcEvent{
-			CircuitKey: channeldb.CircuitKey{
+			CircuitKey: models.CircuitKey{
 				ChanID: channels.carolToBob.ShortChanID(),
 				HtlcID: htlcID,
 			},
@@ -3822,9 +3805,7 @@ func newInterceptableSwitchTestContext(
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err, "unable to open channeldb")
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err, "unable to init switch")
@@ -3947,7 +3928,7 @@ func TestSwitchHoldForward(t *testing.T) {
 	// Simulate an error during the composition of the failure message.
 	currentCallback := c.s.cfg.FetchLastChannelUpdate
 	c.s.cfg.FetchLastChannelUpdate = func(
-		lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
+		lnwire.ShortChannelID) (*lnwire.ChannelUpdate1, error) {
 
 		return nil, errors.New("cannot fetch update")
 	}
@@ -4088,10 +4069,10 @@ func TestSwitchHoldForward(t *testing.T) {
 	expectedFailure := &lnwire.FailInvalidOnionKey{
 		OnionSHA256: shaOnionBlob,
 	}
-	var b bytes.Buffer
-	require.NoError(t, lnwire.EncodeFailure(&b, expectedFailure, 0))
 
-	assert.Equal(t, lnwire.OpaqueReason(b.Bytes()), failPacket.Reason)
+	fwdErr, err := newMockDeobfuscator().DecryptError(failPacket.Reason)
+	require.NoError(t, err)
+	require.Equal(t, expectedFailure, fwdErr.WireMessage())
 
 	assertNumCircuits(t, c.s, 0, 0)
 
@@ -4257,7 +4238,7 @@ func TestInterceptableSwitchWatchDog(t *testing.T) {
 }
 
 // TestSwitchDustForwarding tests that the switch properly fails HTLC's which
-// have incoming or outgoing links that breach their dust thresholds.
+// have incoming or outgoing links that breach their fee thresholds.
 func TestSwitchDustForwarding(t *testing.T) {
 	t.Parallel()
 
@@ -4285,15 +4266,21 @@ func TestSwitchDustForwarding(t *testing.T) {
 
 	// We'll test that once the default threshold is exceeded on the
 	// Alice -> Bob channel, either side's calls to SendHTLC will fail.
-	//
-	// Alice will send 357 HTLC's of 700sats. Bob will also send 357 HTLC's
-	// of 700sats. If either side attempts to send a dust HTLC, it will
-	// fail so amounts below 800sats will breach the dust threshold.
+	numHTLCs := maxInflightHtlcs
+	aliceAttemptID, bobAttemptID := numHTLCs, numHTLCs
 	amt := lnwire.NewMSatFromSatoshis(700)
 	aliceBobFirstHop := n.aliceChannelLink.ShortChanID()
 
-	sendDustHtlcs(t, n, true, amt, aliceBobFirstHop)
-	sendDustHtlcs(t, n, false, amt, aliceBobFirstHop)
+	// We decreased the max number of inflight HTLCs therefore we also need
+	// do decrease the max fee exposure.
+	maxFeeExposure := lnwire.NewMSatFromSatoshis(74500)
+	n.aliceChannelLink.cfg.MaxFeeExposure = maxFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = maxFeeExposure
+
+	// Alice will send 50 HTLC's of 700sats. Bob will also send 50 HTLC's
+	// of 700sats.
+	sendDustHtlcs(t, n, true, amt, aliceBobFirstHop, numHTLCs)
+	sendDustHtlcs(t, n, false, amt, aliceBobFirstHop, numHTLCs)
 
 	// Generate the parameters needed for Bob to send another dust HTLC.
 	_, timelock, hops := generateHops(
@@ -4313,52 +4300,68 @@ func TestSwitchDustForwarding(t *testing.T) {
 		OnionBlob:   blob,
 	}
 
-	checkAlmostDust := func(link *channelLink, mbox MailBox,
-		remote bool) bool {
+	// This is the expected dust without taking the commitfee into account.
+	expectedDust := maxInflightHtlcs * 2 * amt
 
-		timeout := time.After(15 * time.Second)
-		pollInterval := 300 * time.Millisecond
-		expectedDust := 357 * 2 * amt
+	assertAlmostDust := func(link *channelLink, mbox MailBox,
+		whoseCommit lntypes.ChannelParty) {
 
-		for {
-			<-time.After(pollInterval)
-
-			select {
-			case <-timeout:
-				return false
-			default:
-			}
-
-			linkDust := link.getDustSum(remote)
+		err := wait.NoError(func() error {
+			linkDust := link.getDustSum(
+				whoseCommit, fn.None[chainfee.SatPerKWeight](),
+			)
 			localMailDust, remoteMailDust := mbox.DustPackets()
 
 			totalDust := linkDust
-			if remote {
+			if whoseCommit.IsRemote() {
 				totalDust += remoteMailDust
 			} else {
 				totalDust += localMailDust
 			}
 
 			if totalDust == expectedDust {
-				break
+				return nil
 			}
-		}
 
-		return true
+			return fmt.Errorf("got totalDust=%v, expectedDust=%v",
+				totalDust, expectedDust)
+		}, 15*time.Second)
+		require.NoError(t, err, "timeout checking dust")
 	}
 
-	// Wait until Bob is almost at the dust threshold.
+	// Wait until Bob is almost at the fee threshold.
 	bobMbox := n.bobServer.htlcSwitch.mailOrchestrator.GetOrCreateMailBox(
 		n.firstBobChannelLink.ChanID(),
 		n.firstBobChannelLink.ShortChanID(),
 	)
-	require.True(t, checkAlmostDust(n.firstBobChannelLink, bobMbox, false))
+	assertAlmostDust(n.firstBobChannelLink, bobMbox, lntypes.Local)
 
-	// Assert that the HTLC is failed due to the dust threshold.
+	// Sending one more HTLC should fail. SendHTLC won't error, but the
+	// HTLC should be failed backwards. When sending we only check for the
+	// dust amount without the commitment fee. When the HTLC is added to the
+	// commitment state (link) we also take into account the commitment fee
+	// and with a fee of 6000 sat/kw and a commitment size of 724 (non
+	// anchor channel) we are overexposed in fees (maxFeeExposure) that's
+	// why the HTLC is failed back.
 	err = n.bobServer.htlcSwitch.SendHTLC(
-		aliceBobFirstHop, uint64(357), failingHtlc,
+		aliceBobFirstHop, uint64(bobAttemptID), failingHtlc,
 	)
-	require.ErrorIs(t, err, errDustThresholdExceeded)
+	require.Nil(t, err)
+
+	// Use the network result store to ensure the HTLC was failed
+	// backwards.
+	bobResultChan, err := n.bobServer.htlcSwitch.GetAttemptResult(
+		uint64(bobAttemptID), failingHash, newMockDeobfuscator(),
+	)
+	require.NoError(t, err)
+
+	result, ok := <-bobResultChan
+	require.True(t, ok)
+	assertFailureCode(
+		t, result.Error, lnwire.CodeTemporaryChannelFailure,
+	)
+
+	bobAttemptID++
 
 	// Generate the parameters needed for bob to send a non-dust HTLC.
 	nondustAmt := lnwire.NewMSatFromSatoshis(10_000)
@@ -4369,8 +4372,9 @@ func TestSwitchDustForwarding(t *testing.T) {
 	blob, err = generateRoute(hops...)
 	require.NoError(t, err)
 
-	// Now attempt to send an HTLC above Bob's dust limit. It should
-	// succeed.
+	// Now attempt to send an HTLC above Bob's dust limit. Even though this
+	// is not a dust HTLC, it should fail because the increase in weight
+	// pushes us over the threshold.
 	nondustPreimage := lntypes.Preimage{0, 0, 4}
 	nondustHash := nondustPreimage.Hash()
 	nondustHtlc := &lnwire.UpdateAddHTLC{
@@ -4380,12 +4384,23 @@ func TestSwitchDustForwarding(t *testing.T) {
 		OnionBlob:   blob,
 	}
 
-	// Assert that SendHTLC succeeds and evaluateDustThreshold returns
-	// false.
 	err = n.bobServer.htlcSwitch.SendHTLC(
-		aliceBobFirstHop, uint64(358), nondustHtlc,
+		aliceBobFirstHop, uint64(bobAttemptID), nondustHtlc,
 	)
 	require.NoError(t, err)
+	assertAlmostDust(n.firstBobChannelLink, bobMbox, lntypes.Local)
+
+	// Check that the HTLC failed.
+	bobResultChan, err = n.bobServer.htlcSwitch.GetAttemptResult(
+		uint64(bobAttemptID), nondustHash, newMockDeobfuscator(),
+	)
+	require.NoError(t, err)
+
+	result, ok = <-bobResultChan
+	require.True(t, ok)
+	assertFailureCode(
+		t, result.Error, lnwire.CodeTemporaryChannelFailure,
+	)
 
 	// Introduce Carol into the mix and assert that sending a multi-hop
 	// dust HTLC to Alice will fail. Bob should fail back the HTLC with a
@@ -4415,21 +4430,19 @@ func TestSwitchDustForwarding(t *testing.T) {
 		carolHtlc,
 	)
 	require.NoError(t, err)
-	carolAttemptID++
 
-	carolResultChan, err := n.carolServer.htlcSwitch.GetPaymentResult(
-		uint64(carolAttemptID-1), carolHash, newMockDeobfuscator(),
+	carolResultChan, err := n.carolServer.htlcSwitch.GetAttemptResult(
+		uint64(carolAttemptID), carolHash, newMockDeobfuscator(),
 	)
 	require.NoError(t, err)
 
-	result, ok := <-carolResultChan
+	result, ok = <-carolResultChan
 	require.True(t, ok)
 	assertFailureCode(
 		t, result.Error, lnwire.CodeTemporaryChannelFailure,
 	)
 
-	// Send an HTLC from Alice to Carol and assert that it is failed at the
-	// call to SendHTLC.
+	// Send an HTLC from Alice to Carol and assert that it gets failed.
 	htlcAmt, totalTimelock, aliceHops := generateHops(
 		amt, testStartingHeight, n.firstBobChannelLink,
 		n.carolChannelLink,
@@ -4448,30 +4461,43 @@ func TestSwitchDustForwarding(t *testing.T) {
 	}
 
 	// Wait until Alice's expected dust for the remote commitment is just
-	// under the dust threshold.
+	// under the fee threshold.
 	aliceOrch := n.aliceServer.htlcSwitch.mailOrchestrator
 	aliceMbox := aliceOrch.GetOrCreateMailBox(
 		n.aliceChannelLink.ChanID(), n.aliceChannelLink.ShortChanID(),
 	)
-	require.True(t, checkAlmostDust(n.aliceChannelLink, aliceMbox, true))
+	assertAlmostDust(n.aliceChannelLink, aliceMbox, lntypes.Remote)
 
 	err = n.aliceServer.htlcSwitch.SendHTLC(
-		n.aliceChannelLink.ShortChanID(), uint64(357),
+		n.aliceChannelLink.ShortChanID(), uint64(aliceAttemptID),
 		aliceMultihopHtlc,
 	)
-	require.ErrorIs(t, err, errDustThresholdExceeded)
+	require.Nil(t, err)
+
+	aliceResultChan, err := n.aliceServer.htlcSwitch.GetAttemptResult(
+		uint64(aliceAttemptID), aliceMultihopHash,
+		newMockDeobfuscator(),
+	)
+	require.NoError(t, err)
+
+	result, ok = <-aliceResultChan
+	require.True(t, ok)
+	assertFailureCode(
+		t, result.Error, lnwire.CodeTemporaryChannelFailure,
+	)
+
+	// Check that there are numHTLCs circuits open for both Alice and Bob.
+	require.Equal(t, numHTLCs, n.aliceServer.htlcSwitch.circuits.NumOpen())
+	require.Equal(t, numHTLCs, n.bobServer.htlcSwitch.circuits.NumOpen())
 }
 
 // sendDustHtlcs is a helper function used to send many dust HTLC's to test the
-// Switch's dust-threshold logic. It takes a boolean denoting whether or not
-// Alice is the sender.
+// Switch's channel-max-fee-exposure logic. It takes a boolean denoting whether
+// or not Alice is the sender.
 func sendDustHtlcs(t *testing.T, n *threeHopNetwork, alice bool,
-	amt lnwire.MilliSatoshi, sid lnwire.ShortChannelID) {
+	amt lnwire.MilliSatoshi, sid lnwire.ShortChannelID, numHTLCs int) {
 
 	t.Helper()
-
-	// The number of dust HTLC's we'll send for both Alice and Bob.
-	numHTLCs := 357
 
 	// Extract the destination into a variable. If alice is the sender, the
 	// destination is Bob.
@@ -4525,8 +4551,8 @@ func sendDustHtlcs(t *testing.T, n *threeHopNetwork, alice bool,
 		}
 
 		for {
-			// It may be the case that the dust threshold is hit
-			// before all 357*2 HTLC's are sent due to double
+			// It may be the case that the fee threshold is hit
+			// before all numHTLCs*2 HTLC's are sent due to double
 			// counting. Get around this by continuing to send
 			// until successful.
 			err = sendingSwitch.SendHTLC(sid, attemptID, htlc)
@@ -4540,7 +4566,7 @@ func sendDustHtlcs(t *testing.T, n *threeHopNetwork, alice bool,
 }
 
 // TestSwitchMailboxDust tests that the switch takes into account the mailbox
-// dust when evaluating the dust threshold. The mockChannelLink does not have
+// dust when evaluating the fee threshold. The mockChannelLink does not have
 // channel state, so this only tests the switch-mailbox interaction.
 func TestSwitchMailboxDust(t *testing.T) {
 	t.Parallel()
@@ -4610,7 +4636,7 @@ func TestSwitchMailboxDust(t *testing.T) {
 	var carolHTLCID uint64
 
 	// It will take aliceCount HTLC's of 350sats to fill up Alice's mailbox
-	// to the point where another would put Alice over the dust threshold.
+	// to the point where another would put Alice over the fee threshold.
 	aliceCount := 1428
 
 	mailbox := s.mailOrchestrator.GetOrCreateMailBox(chanID1, aliceChanID)
@@ -4632,10 +4658,10 @@ func TestSwitchMailboxDust(t *testing.T) {
 		carolHTLCID++
 	}
 
-	// Sending one more HTLC to Alice should result in the dust threshold
+	// Sending one more HTLC to Alice should result in the fee threshold
 	// being breached.
 	err = s.SendHTLC(aliceChanID, 0, addMsg)
-	require.ErrorIs(t, err, errDustThresholdExceeded)
+	require.ErrorIs(t, err, errFeeExposureExceeded)
 
 	// We'll now call ForwardPackets from Bob to ensure that the mailbox
 	// sum is also accounted for in the forwarding case.
@@ -4864,9 +4890,7 @@ func testSwitchForwardFailAlias(t *testing.T, zeroConf bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)
@@ -4940,9 +4964,7 @@ func testSwitchForwardFailAlias(t *testing.T, zeroConf bool) {
 	err = cdb.Close()
 	require.NoError(t, err)
 
-	cdb2, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb2.Close() })
+	cdb2 := channeldb.OpenForTesting(t, tempPath)
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err)
@@ -5080,9 +5102,7 @@ func testSwitchAliasFailAdd(t *testing.T, zeroConf, private, useAlias bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	defer cdb.Close()
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)
@@ -5261,9 +5281,11 @@ func testSwitchHandlePacketForward(t *testing.T, zeroConf, private,
 	t.Parallel()
 
 	// Create a link for Alice that we'll add to the switch.
-	aliceLink, _, _, _, _, err :=
+	harness, err :=
 		newSingleLinkTestHarness(t, btcutil.SatoshiPerBitcoin, 0)
 	require.NoError(t, err)
+
+	aliceLink := harness.aliceLink
 
 	s, err := initSwitchWithTempDB(t, testStartingHeight)
 	if err != nil {
@@ -5311,7 +5333,6 @@ func testSwitchHandlePacketForward(t *testing.T, zeroConf, private,
 	if zeroConf {
 		// Store the alias in the shortChanID field and mark the real
 		// scid in the database.
-		aliceChannelLink.shortChanID = aliceAlias
 		err = aliceChannelState.MarkRealScid(aliceScid)
 		require.NoError(t, err)
 
@@ -5340,6 +5361,7 @@ func testSwitchHandlePacketForward(t *testing.T, zeroConf, private,
 	ogPacket := &htlcPacket{
 		incomingChanID: bobLink.ShortChanID(),
 		incomingHTLCID: 0,
+		incomingAmount: 1000,
 		obfuscator:     NewMockObfuscator(),
 		htlc: &lnwire.UpdateAddHTLC{
 			PaymentHash: rhash,
@@ -5419,9 +5441,7 @@ func testSwitchAliasInterceptFail(t *testing.T, zeroConf bool) {
 
 	tempPath := t.TempDir()
 
-	cdb, err := channeldb.Open(tempPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { cdb.Close() })
+	cdb := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(testStartingHeight, cdb)
 	require.NoError(t, err)
@@ -5515,9 +5535,12 @@ func testSwitchAliasInterceptFail(t *testing.T, zeroConf bool) {
 		failHtlc, ok := failPacket.htlc.(*lnwire.UpdateFailHTLC)
 		require.True(t, ok)
 
-		r := bytes.NewReader(failHtlc.Reason)
-		failure, err := lnwire.DecodeFailure(r, 0)
+		fwdErr, err := newMockDeobfuscator().DecryptError(
+			failHtlc.Reason,
+		)
 		require.NoError(t, err)
+
+		failure := fwdErr.WireMessage()
 
 		failureMsg, ok := failure.(*lnwire.FailTemporaryChannelFailure)
 		require.True(t, ok)

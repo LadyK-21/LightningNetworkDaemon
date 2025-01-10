@@ -14,6 +14,8 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/netann"
@@ -65,8 +67,8 @@ func createChannel(t *testing.T) *channeldb.OpenChannel {
 // our `pubkey` with the direction bit set appropriately in the policies. Our
 // update will be created with the disabled bit set if startEnabled is false.
 func createEdgePolicies(t *testing.T, channel *channeldb.OpenChannel,
-	pubkey *btcec.PublicKey, startEnabled bool) (*channeldb.ChannelEdgeInfo,
-	*channeldb.ChannelEdgePolicy, *channeldb.ChannelEdgePolicy) {
+	pubkey *btcec.PublicKey, startEnabled bool) (*models.ChannelEdgeInfo,
+	*models.ChannelEdgePolicy, *models.ChannelEdgePolicy) {
 
 	var (
 		pubkey1 [33]byte
@@ -98,18 +100,18 @@ func createEdgePolicies(t *testing.T, channel *channeldb.OpenChannel,
 	// bit.
 	dir2 |= lnwire.ChanUpdateDirection
 
-	return &channeldb.ChannelEdgeInfo{
+	return &models.ChannelEdgeInfo{
 			ChannelPoint:  channel.FundingOutpoint,
 			NodeKey1Bytes: pubkey1,
 			NodeKey2Bytes: pubkey2,
 		},
-		&channeldb.ChannelEdgePolicy{
+		&models.ChannelEdgePolicy{
 			ChannelID:    channel.ShortChanID().ToUint64(),
 			ChannelFlags: dir1,
 			LastUpdate:   time.Now(),
 			SigBytes:     testSigBytes,
 		},
-		&channeldb.ChannelEdgePolicy{
+		&models.ChannelEdgePolicy{
 			ChannelID:    channel.ShortChanID().ToUint64(),
 			ChannelFlags: dir2,
 			LastUpdate:   time.Now(),
@@ -120,12 +122,12 @@ func createEdgePolicies(t *testing.T, channel *channeldb.OpenChannel,
 type mockGraph struct {
 	mu        sync.Mutex
 	channels  []*channeldb.OpenChannel
-	chanInfos map[wire.OutPoint]*channeldb.ChannelEdgeInfo
-	chanPols1 map[wire.OutPoint]*channeldb.ChannelEdgePolicy
-	chanPols2 map[wire.OutPoint]*channeldb.ChannelEdgePolicy
+	chanInfos map[wire.OutPoint]*models.ChannelEdgeInfo
+	chanPols1 map[wire.OutPoint]*models.ChannelEdgePolicy
+	chanPols2 map[wire.OutPoint]*models.ChannelEdgePolicy
 	sidToCid  map[lnwire.ShortChannelID]wire.OutPoint
 
-	updates chan *lnwire.ChannelUpdate
+	updates chan *lnwire.ChannelUpdate1
 }
 
 func newMockGraph(t *testing.T, numChannels int,
@@ -133,11 +135,11 @@ func newMockGraph(t *testing.T, numChannels int,
 
 	g := &mockGraph{
 		channels:  make([]*channeldb.OpenChannel, 0, numChannels),
-		chanInfos: make(map[wire.OutPoint]*channeldb.ChannelEdgeInfo),
-		chanPols1: make(map[wire.OutPoint]*channeldb.ChannelEdgePolicy),
-		chanPols2: make(map[wire.OutPoint]*channeldb.ChannelEdgePolicy),
+		chanInfos: make(map[wire.OutPoint]*models.ChannelEdgeInfo),
+		chanPols1: make(map[wire.OutPoint]*models.ChannelEdgePolicy),
+		chanPols2: make(map[wire.OutPoint]*models.ChannelEdgePolicy),
 		sidToCid:  make(map[lnwire.ShortChannelID]wire.OutPoint),
-		updates:   make(chan *lnwire.ChannelUpdate, 2*numChannels),
+		updates:   make(chan *lnwire.ChannelUpdate1, 2*numChannels),
 	}
 
 	for i := 0; i < numChannels; i++ {
@@ -159,15 +161,15 @@ func (g *mockGraph) FetchAllOpenChannels() ([]*channeldb.OpenChannel, error) {
 }
 
 func (g *mockGraph) FetchChannelEdgesByOutpoint(
-	op *wire.OutPoint) (*channeldb.ChannelEdgeInfo,
-	*channeldb.ChannelEdgePolicy, *channeldb.ChannelEdgePolicy, error) {
+	op *wire.OutPoint) (*models.ChannelEdgeInfo,
+	*models.ChannelEdgePolicy, *models.ChannelEdgePolicy, error) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	info, ok := g.chanInfos[*op]
 	if !ok {
-		return nil, nil, nil, channeldb.ErrEdgeNotFound
+		return nil, nil, nil, graphdb.ErrEdgeNotFound
 	}
 
 	pol1 := g.chanPols1[*op]
@@ -176,7 +178,7 @@ func (g *mockGraph) FetchChannelEdgesByOutpoint(
 	return info, pol1, pol2, nil
 }
 
-func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate,
+func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate1,
 	op *wire.OutPoint, private bool) error {
 
 	g.mu.Lock()
@@ -209,7 +211,7 @@ func (g *mockGraph) ApplyChannelUpdate(update *lnwire.ChannelUpdate,
 
 	timestamp := time.Unix(int64(update.Timestamp), 0)
 
-	policy := &channeldb.ChannelEdgePolicy{
+	policy := &models.ChannelEdgePolicy{
 		ChannelID:    update.ShortChannelID.ToUint64(),
 		ChannelFlags: update.ChannelFlags,
 		LastUpdate:   timestamp,
@@ -247,8 +249,8 @@ func (g *mockGraph) addChannel(channel *channeldb.OpenChannel) {
 }
 
 func (g *mockGraph) addEdgePolicy(c *channeldb.OpenChannel,
-	info *channeldb.ChannelEdgeInfo,
-	pol1, pol2 *channeldb.ChannelEdgePolicy) {
+	info *models.ChannelEdgeInfo,
+	pol1, pol2 *models.ChannelEdgePolicy) {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -390,7 +392,7 @@ func (h *testHarness) markActive(channels []*channeldb.OpenChannel) {
 	h.t.Helper()
 
 	for _, channel := range channels {
-		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 		h.htlcSwitch.SetStatus(chanID, true)
 	}
 }
@@ -401,7 +403,7 @@ func (h *testHarness) markInactive(channels []*channeldb.OpenChannel) {
 	h.t.Helper()
 
 	for _, channel := range channels {
-		chanID := lnwire.NewChanIDFromOutPoint(&channel.FundingOutpoint)
+		chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
 		h.htlcSwitch.SetStatus(chanID, false)
 	}
 }
@@ -696,7 +698,7 @@ var stateMachineTests = []stateMachineTest{
 			// Request that they be enabled, which should return an
 			// error as the graph doesn't have an edge for them.
 			h.assertEnables(
-				unknownChans, channeldb.ErrEdgeNotFound, false,
+				unknownChans, graphdb.ErrEdgeNotFound, false,
 			)
 			// No updates should be sent as a result of the failure.
 			h.assertNoUpdates(h.safeDisableTimeout)
@@ -716,7 +718,7 @@ var stateMachineTests = []stateMachineTest{
 			// Request that they be disabled, which should return an
 			// error as the graph doesn't have an edge for them.
 			h.assertDisables(
-				unknownChans, channeldb.ErrEdgeNotFound, false,
+				unknownChans, graphdb.ErrEdgeNotFound, false,
 			)
 			// No updates should be sent as a result of the failure.
 			h.assertNoUpdates(h.safeDisableTimeout)
@@ -746,7 +748,9 @@ var stateMachineTests = []stateMachineTest{
 
 			// Check that trying to enable the channel with unknown
 			// edges results in a failure.
-			h.assertEnables(newChans, channeldb.ErrEdgeNotFound, false)
+			h.assertEnables(
+				newChans, graphdb.ErrEdgeNotFound, false,
+			)
 
 			// Now, insert edge policies for the channel into the
 			// graph, starting with the channel enabled, and mark
@@ -793,7 +797,9 @@ var stateMachineTests = []stateMachineTest{
 
 			// Check that trying to enable the channel with unknown
 			// edges results in a failure.
-			h.assertDisables(rmChans, channeldb.ErrEdgeNotFound, false)
+			h.assertDisables(
+				rmChans, graphdb.ErrEdgeNotFound, false,
+			)
 		},
 	},
 	{

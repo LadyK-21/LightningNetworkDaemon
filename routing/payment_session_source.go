@@ -2,25 +2,29 @@ package routing
 
 import (
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
+	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
 )
 
-// A compile time assertion to ensure MissionControl meets the
+// A compile time assertion to ensure SessionSource meets the
 // PaymentSessionSource interface.
 var _ PaymentSessionSource = (*SessionSource)(nil)
 
 // SessionSource defines a source for the router to retrieve new payment
 // sessions.
 type SessionSource struct {
-	// Graph is the channel graph that will be used to gather metrics from
-	// and also to carry out path finding queries.
-	Graph *channeldb.ChannelGraph
+	// GraphSessionFactory can be used to gain access to a Graph session.
+	// If the backing DB allows it, this will mean that a read transaction
+	// is being held during the use of the session.
+	GraphSessionFactory GraphSessionFactory
 
 	// SourceNode is the graph's source node.
-	SourceNode *channeldb.LightningNode
+	SourceNode *models.LightningNode
 
 	// GetLink is a method that allows querying the lower link layer
 	// to determine the up to date available bandwidth at a prospective link
@@ -36,44 +40,32 @@ type SessionSource struct {
 	// then take into account this set of pruned vertexes/edges to reduce
 	// route failure and pass on graph information gained to the next
 	// execution.
-	MissionControl MissionController
+	MissionControl MissionControlQuerier
 
 	// PathFindingConfig defines global parameters that control the
-	// trade-off in path finding between fees and probabiity.
+	// trade-off in path finding between fees and probability.
 	PathFindingConfig PathFindingConfig
-}
-
-// getRoutingGraph returns a routing graph and a clean-up function for
-// pathfinding.
-func (m *SessionSource) getRoutingGraph() (routingGraph, func(), error) {
-	routingTx, err := NewCachedGraph(m.SourceNode, m.Graph)
-	if err != nil {
-		return nil, nil, err
-	}
-	return routingTx, func() {
-		err := routingTx.close()
-		if err != nil {
-			log.Errorf("Error closing db tx: %v", err)
-		}
-	}, nil
 }
 
 // NewPaymentSession creates a new payment session backed by the latest prune
 // view from Mission Control. An optional set of routing hints can be provided
 // in order to populate additional edges to explore when finding a path to the
 // payment's destination.
-func (m *SessionSource) NewPaymentSession(p *LightningPayment) (
-	PaymentSession, error) {
+func (m *SessionSource) NewPaymentSession(p *LightningPayment,
+	firstHopBlob fn.Option[tlv.Blob],
+	trafficShaper fn.Option[htlcswitch.AuxTrafficShaper]) (PaymentSession,
+	error) {
 
-	getBandwidthHints := func(graph routingGraph) (bandwidthHints, error) {
+	getBandwidthHints := func(graph Graph) (bandwidthHints, error) {
 		return newBandwidthManager(
 			graph, m.SourceNode.PubKeyBytes, m.GetLink,
+			firstHopBlob, trafficShaper,
 		)
 	}
 
 	session, err := newPaymentSession(
-		p, getBandwidthHints, m.getRoutingGraph,
-		m.MissionControl, m.PathFindingConfig,
+		p, m.SourceNode.PubKeyBytes, getBandwidthHints,
+		m.GraphSessionFactory, m.MissionControl, m.PathFindingConfig,
 	)
 	if err != nil {
 		return nil, err
@@ -94,9 +86,9 @@ func (m *SessionSource) NewPaymentSessionEmpty() PaymentSession {
 // RouteHintsToEdges converts a list of invoice route hints to an edge map that
 // can be passed into pathfinding.
 func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
-	map[route.Vertex][]*channeldb.CachedEdgePolicy, error) {
+	map[route.Vertex][]AdditionalEdge, error) {
 
-	edges := make(map[route.Vertex][]*channeldb.CachedEdgePolicy)
+	edges := make(map[route.Vertex][]AdditionalEdge)
 
 	// Traverse through all of the available hop hints and include them in
 	// our edges map, indexed by the public key of the channel's starting
@@ -110,7 +102,7 @@ func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
 			// we'll need to look at the next hint's start node. If
 			// we've reached the end of the hints list, we can
 			// assume we've reached the destination.
-			endNode := &channeldb.LightningNode{}
+			endNode := &models.LightningNode{}
 			if i != len(routeHint)-1 {
 				endNode.AddPubKey(routeHint[i+1].NodeID)
 			} else {
@@ -126,7 +118,7 @@ func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
 			// Finally, create the channel edge from the hop hint
 			// and add it to list of edges corresponding to the node
 			// at the start of the channel.
-			edge := &channeldb.CachedEdgePolicy{
+			edgePolicy := &models.CachedEdgePolicy{
 				ToNodePubKey: func() route.Vertex {
 					return endNode.PubKeyBytes
 				},
@@ -139,6 +131,10 @@ func RouteHintsToEdges(routeHints [][]zpay32.HopHint, target route.Vertex) (
 					hopHint.FeeProportionalMillionths,
 				),
 				TimeLockDelta: hopHint.CLTVExpiryDelta,
+			}
+
+			edge := &PrivateEdge{
+				policy: edgePolicy,
 			}
 
 			v := route.NewVertex(hopHint.NodeID)

@@ -21,8 +21,12 @@ const _ = grpc.SupportPackageIsVersion7
 type RouterClient interface {
 	// SendPaymentV2 attempts to route a payment described by the passed
 	// PaymentRequest to the final destination. The call returns a stream of
-	// payment updates.
+	// payment updates. When using this RPC, make sure to set a fee limit, as the
+	// default routing fee limit is 0 sats. Without a non-zero fee limit only
+	// routes without fees will be attempted which often fails with
+	// FAILURE_REASON_NO_ROUTE.
 	SendPaymentV2(ctx context.Context, in *SendPaymentRequest, opts ...grpc.CallOption) (Router_SendPaymentV2Client, error)
+	// lncli: `trackpayment`
 	// TrackPaymentV2 returns an update stream for the payment identified by the
 	// payment hash.
 	TrackPaymentV2(ctx context.Context, in *TrackPaymentRequest, opts ...grpc.CallOption) (Router_TrackPaymentV2Client, error)
@@ -49,28 +53,41 @@ type RouterClient interface {
 	// route manually. This can be used for things like rebalancing, and atomic
 	// swaps.
 	SendToRouteV2(ctx context.Context, in *SendToRouteRequest, opts ...grpc.CallOption) (*lnrpc.HTLCAttempt, error)
+	// lncli: `resetmc`
 	// ResetMissionControl clears all mission control state and starts with a clean
 	// slate.
 	ResetMissionControl(ctx context.Context, in *ResetMissionControlRequest, opts ...grpc.CallOption) (*ResetMissionControlResponse, error)
+	// lncli: `querymc`
 	// QueryMissionControl exposes the internal mission control state to callers.
 	// It is a development feature.
 	QueryMissionControl(ctx context.Context, in *QueryMissionControlRequest, opts ...grpc.CallOption) (*QueryMissionControlResponse, error)
+	// lncli: `importmc`
 	// XImportMissionControl is an experimental API that imports the state provided
 	// to the internal mission control's state, using all results which are more
 	// recent than our existing values. These values will only be imported
 	// in-memory, and will not be persisted across restarts.
 	XImportMissionControl(ctx context.Context, in *XImportMissionControlRequest, opts ...grpc.CallOption) (*XImportMissionControlResponse, error)
+	// lncli: `getmccfg`
 	// GetMissionControlConfig returns mission control's current config.
 	GetMissionControlConfig(ctx context.Context, in *GetMissionControlConfigRequest, opts ...grpc.CallOption) (*GetMissionControlConfigResponse, error)
+	// lncli: `setmccfg`
 	// SetMissionControlConfig will set mission control's config, if the config
 	// provided is valid.
 	SetMissionControlConfig(ctx context.Context, in *SetMissionControlConfigRequest, opts ...grpc.CallOption) (*SetMissionControlConfigResponse, error)
-	// QueryProbability returns the current success probability estimate for a
-	// given node pair and amount.
+	// lncli: `queryprob`
+	// Deprecated. QueryProbability returns the current success probability
+	// estimate for a given node pair and amount. The call returns a zero success
+	// probability if no channel is available or if the amount violates min/max
+	// HTLC constraints.
 	QueryProbability(ctx context.Context, in *QueryProbabilityRequest, opts ...grpc.CallOption) (*QueryProbabilityResponse, error)
+	// lncli: `buildroute`
 	// BuildRoute builds a fully specified route based on a list of hop public
 	// keys. It retrieves the relevant channel policies from the graph in order to
 	// calculate the correct fees and time locks.
+	// Note that LND will use its default final_cltv_delta if no value is supplied.
+	// Make sure to add the correct final_cltv_delta depending on the invoice
+	// restriction. Moreover the caller has to make sure to provide the
+	// payment_addr if the route is paying an invoice which signaled it.
 	BuildRoute(ctx context.Context, in *BuildRouteRequest, opts ...grpc.CallOption) (*BuildRouteResponse, error)
 	// SubscribeHtlcEvents creates a uni-directional stream from the server to
 	// the client which delivers a stream of htlc events.
@@ -93,11 +110,24 @@ type RouterClient interface {
 	// In case of interception, the htlc can be either settled, cancelled or
 	// resumed later by using the ResolveHoldForward endpoint.
 	HtlcInterceptor(ctx context.Context, opts ...grpc.CallOption) (Router_HtlcInterceptorClient, error)
+	// lncli: `updatechanstatus`
 	// UpdateChanStatus attempts to manually set the state of a channel
 	// (enabled, disabled, or auto). A manual "disable" request will cause the
 	// channel to stay disabled until a subsequent manual request of either
 	// "enable" or "auto".
 	UpdateChanStatus(ctx context.Context, in *UpdateChanStatusRequest, opts ...grpc.CallOption) (*UpdateChanStatusResponse, error)
+	// XAddLocalChanAliases is an experimental API that creates a set of new
+	// channel SCID alias mappings. The final total set of aliases in the manager
+	// after the add operation is returned. This is only a locally stored alias,
+	// and will not be communicated to the channel peer via any message. Therefore,
+	// routing over such an alias will only work if the peer also calls this same
+	// RPC on their end. If an alias already exists, an error is returned
+	XAddLocalChanAliases(ctx context.Context, in *AddAliasesRequest, opts ...grpc.CallOption) (*AddAliasesResponse, error)
+	// XDeleteLocalChanAliases is an experimental API that deletes a set of alias
+	// mappings. The final total set of aliases in the manager after the delete
+	// operation is returned. The deletion will not be communicated to the channel
+	// peer via any message.
+	XDeleteLocalChanAliases(ctx context.Context, in *DeleteAliasesRequest, opts ...grpc.CallOption) (*DeleteAliasesResponse, error)
 }
 
 type routerClient struct {
@@ -433,14 +463,36 @@ func (c *routerClient) UpdateChanStatus(ctx context.Context, in *UpdateChanStatu
 	return out, nil
 }
 
+func (c *routerClient) XAddLocalChanAliases(ctx context.Context, in *AddAliasesRequest, opts ...grpc.CallOption) (*AddAliasesResponse, error) {
+	out := new(AddAliasesResponse)
+	err := c.cc.Invoke(ctx, "/routerrpc.Router/XAddLocalChanAliases", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *routerClient) XDeleteLocalChanAliases(ctx context.Context, in *DeleteAliasesRequest, opts ...grpc.CallOption) (*DeleteAliasesResponse, error) {
+	out := new(DeleteAliasesResponse)
+	err := c.cc.Invoke(ctx, "/routerrpc.Router/XDeleteLocalChanAliases", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RouterServer is the server API for Router service.
 // All implementations must embed UnimplementedRouterServer
 // for forward compatibility
 type RouterServer interface {
 	// SendPaymentV2 attempts to route a payment described by the passed
 	// PaymentRequest to the final destination. The call returns a stream of
-	// payment updates.
+	// payment updates. When using this RPC, make sure to set a fee limit, as the
+	// default routing fee limit is 0 sats. Without a non-zero fee limit only
+	// routes without fees will be attempted which often fails with
+	// FAILURE_REASON_NO_ROUTE.
 	SendPaymentV2(*SendPaymentRequest, Router_SendPaymentV2Server) error
+	// lncli: `trackpayment`
 	// TrackPaymentV2 returns an update stream for the payment identified by the
 	// payment hash.
 	TrackPaymentV2(*TrackPaymentRequest, Router_TrackPaymentV2Server) error
@@ -467,28 +519,41 @@ type RouterServer interface {
 	// route manually. This can be used for things like rebalancing, and atomic
 	// swaps.
 	SendToRouteV2(context.Context, *SendToRouteRequest) (*lnrpc.HTLCAttempt, error)
+	// lncli: `resetmc`
 	// ResetMissionControl clears all mission control state and starts with a clean
 	// slate.
 	ResetMissionControl(context.Context, *ResetMissionControlRequest) (*ResetMissionControlResponse, error)
+	// lncli: `querymc`
 	// QueryMissionControl exposes the internal mission control state to callers.
 	// It is a development feature.
 	QueryMissionControl(context.Context, *QueryMissionControlRequest) (*QueryMissionControlResponse, error)
+	// lncli: `importmc`
 	// XImportMissionControl is an experimental API that imports the state provided
 	// to the internal mission control's state, using all results which are more
 	// recent than our existing values. These values will only be imported
 	// in-memory, and will not be persisted across restarts.
 	XImportMissionControl(context.Context, *XImportMissionControlRequest) (*XImportMissionControlResponse, error)
+	// lncli: `getmccfg`
 	// GetMissionControlConfig returns mission control's current config.
 	GetMissionControlConfig(context.Context, *GetMissionControlConfigRequest) (*GetMissionControlConfigResponse, error)
+	// lncli: `setmccfg`
 	// SetMissionControlConfig will set mission control's config, if the config
 	// provided is valid.
 	SetMissionControlConfig(context.Context, *SetMissionControlConfigRequest) (*SetMissionControlConfigResponse, error)
-	// QueryProbability returns the current success probability estimate for a
-	// given node pair and amount.
+	// lncli: `queryprob`
+	// Deprecated. QueryProbability returns the current success probability
+	// estimate for a given node pair and amount. The call returns a zero success
+	// probability if no channel is available or if the amount violates min/max
+	// HTLC constraints.
 	QueryProbability(context.Context, *QueryProbabilityRequest) (*QueryProbabilityResponse, error)
+	// lncli: `buildroute`
 	// BuildRoute builds a fully specified route based on a list of hop public
 	// keys. It retrieves the relevant channel policies from the graph in order to
 	// calculate the correct fees and time locks.
+	// Note that LND will use its default final_cltv_delta if no value is supplied.
+	// Make sure to add the correct final_cltv_delta depending on the invoice
+	// restriction. Moreover the caller has to make sure to provide the
+	// payment_addr if the route is paying an invoice which signaled it.
 	BuildRoute(context.Context, *BuildRouteRequest) (*BuildRouteResponse, error)
 	// SubscribeHtlcEvents creates a uni-directional stream from the server to
 	// the client which delivers a stream of htlc events.
@@ -511,11 +576,24 @@ type RouterServer interface {
 	// In case of interception, the htlc can be either settled, cancelled or
 	// resumed later by using the ResolveHoldForward endpoint.
 	HtlcInterceptor(Router_HtlcInterceptorServer) error
+	// lncli: `updatechanstatus`
 	// UpdateChanStatus attempts to manually set the state of a channel
 	// (enabled, disabled, or auto). A manual "disable" request will cause the
 	// channel to stay disabled until a subsequent manual request of either
 	// "enable" or "auto".
 	UpdateChanStatus(context.Context, *UpdateChanStatusRequest) (*UpdateChanStatusResponse, error)
+	// XAddLocalChanAliases is an experimental API that creates a set of new
+	// channel SCID alias mappings. The final total set of aliases in the manager
+	// after the add operation is returned. This is only a locally stored alias,
+	// and will not be communicated to the channel peer via any message. Therefore,
+	// routing over such an alias will only work if the peer also calls this same
+	// RPC on their end. If an alias already exists, an error is returned
+	XAddLocalChanAliases(context.Context, *AddAliasesRequest) (*AddAliasesResponse, error)
+	// XDeleteLocalChanAliases is an experimental API that deletes a set of alias
+	// mappings. The final total set of aliases in the manager after the delete
+	// operation is returned. The deletion will not be communicated to the channel
+	// peer via any message.
+	XDeleteLocalChanAliases(context.Context, *DeleteAliasesRequest) (*DeleteAliasesResponse, error)
 	mustEmbedUnimplementedRouterServer()
 }
 
@@ -576,6 +654,12 @@ func (UnimplementedRouterServer) HtlcInterceptor(Router_HtlcInterceptorServer) e
 }
 func (UnimplementedRouterServer) UpdateChanStatus(context.Context, *UpdateChanStatusRequest) (*UpdateChanStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateChanStatus not implemented")
+}
+func (UnimplementedRouterServer) XAddLocalChanAliases(context.Context, *AddAliasesRequest) (*AddAliasesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method XAddLocalChanAliases not implemented")
+}
+func (UnimplementedRouterServer) XDeleteLocalChanAliases(context.Context, *DeleteAliasesRequest) (*DeleteAliasesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method XDeleteLocalChanAliases not implemented")
 }
 func (UnimplementedRouterServer) mustEmbedUnimplementedRouterServer() {}
 
@@ -940,6 +1024,42 @@ func _Router_UpdateChanStatus_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Router_XAddLocalChanAliases_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddAliasesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RouterServer).XAddLocalChanAliases(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/routerrpc.Router/XAddLocalChanAliases",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RouterServer).XAddLocalChanAliases(ctx, req.(*AddAliasesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Router_XDeleteLocalChanAliases_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteAliasesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RouterServer).XDeleteLocalChanAliases(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/routerrpc.Router/XDeleteLocalChanAliases",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RouterServer).XDeleteLocalChanAliases(ctx, req.(*DeleteAliasesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Router_ServiceDesc is the grpc.ServiceDesc for Router service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -990,6 +1110,14 @@ var Router_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateChanStatus",
 			Handler:    _Router_UpdateChanStatus_Handler,
+		},
+		{
+			MethodName: "XAddLocalChanAliases",
+			Handler:    _Router_XAddLocalChanAliases_Handler,
+		},
+		{
+			MethodName: "XDeleteLocalChanAliases",
+			Handler:    _Router_XDeleteLocalChanAliases_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

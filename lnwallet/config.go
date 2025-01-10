@@ -2,8 +2,10 @@ package lnwallet
 
 import (
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -49,11 +51,24 @@ type Config struct {
 	// used to lookup the existence of outputs within the UTXO set.
 	ChainIO BlockChainIO
 
-	// DefaultConstraints is the set of default constraints that will be
-	// used for any incoming or outgoing channel reservation requests.
-	DefaultConstraints channeldb.ChannelConstraints
-
 	// NetParams is the set of parameters that tells the wallet which chain
 	// it will be operating on.
 	NetParams chaincfg.Params
+
+	// Rebroadcaster is an optional config param that can be used to
+	// passively rebroadcast transactions in the background until they're
+	// detected as being confirmed.
+	Rebroadcaster Rebroadcaster
+
+	// CoinSelectionStrategy is the strategy that is used for selecting
+	// coins when funding a transaction.
+	CoinSelectionStrategy wallet.CoinSelectionStrategy
+
+	// AuxLeafStore is an optional store that can be used to store auxiliary
+	// leaves for certain custom channel types.
+	AuxLeafStore fn.Option[AuxLeafStore]
+
+	// AuxSigner is an optional signer that can be used to sign auxiliary
+	// leaves for certain custom channel types.
+	AuxSigner fn.Option[AuxSigner]
 }

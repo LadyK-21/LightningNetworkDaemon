@@ -9,7 +9,9 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
@@ -20,13 +22,7 @@ import (
 func TestChainArbitratorRepublishCloses(t *testing.T) {
 	t.Parallel()
 
-	db, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
 	// Create 10 test channels and sync them to the database.
 	const numChans = 10
@@ -60,12 +56,14 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 	for i := 0; i < numChans/2; i++ {
 		closeTx := channels[i].FundingTxn.Copy()
 		closeTx.TxIn[0].PreviousOutPoint = channels[i].FundingOutpoint
-		err := channels[i].MarkCommitmentBroadcasted(closeTx, true)
+		err := channels[i].MarkCommitmentBroadcasted(
+			closeTx, lntypes.Local,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = channels[i].MarkCoopBroadcasted(closeTx, true)
+		err = channels[i].MarkCoopBroadcasted(closeTx, lntypes.Local)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,20 +77,21 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 		ChainIO: &mock.ChainIO{},
 		Notifier: &mock.ChainNotifier{
 			SpendChan: make(chan *chainntnfs.SpendDetail),
-			EpochChan: make(chan *chainntnfs.BlockEpoch),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
 		},
 		PublishTx: func(tx *wire.MsgTx, _ string) error {
 			published[tx.TxHash()]++
 			return nil
 		},
-		Clock: clock.NewDefaultClock(),
+		Clock:  clock.NewDefaultClock(),
+		Budget: *DefaultBudgetConfig(),
 	}
 	chainArb := NewChainArbitrator(
 		chainArbCfg, db,
 	)
 
-	if err := chainArb.Start(); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chainArb.Start(beat); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -134,11 +133,7 @@ func TestChainArbitratorRepublishCloses(t *testing.T) {
 func TestResolveContract(t *testing.T) {
 	t.Parallel()
 
-	db, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err, "unable to open db")
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
 	// With the DB created, we'll make a new channel, and mark it as
 	// pending open within the database.
@@ -163,18 +158,24 @@ func TestResolveContract(t *testing.T) {
 		ChainIO: &mock.ChainIO{},
 		Notifier: &mock.ChainNotifier{
 			SpendChan: make(chan *chainntnfs.SpendDetail),
-			EpochChan: make(chan *chainntnfs.BlockEpoch),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
 		},
 		PublishTx: func(tx *wire.MsgTx, _ string) error {
 			return nil
 		},
-		Clock: clock.NewDefaultClock(),
+		Clock:  clock.NewDefaultClock(),
+		Budget: *DefaultBudgetConfig(),
+		QueryIncomingCircuit: func(
+			circuit models.CircuitKey) *models.CircuitKey {
+
+			return nil
+		},
 	}
 	chainArb := NewChainArbitrator(
 		chainArbCfg, db,
 	)
-	if err := chainArb.Start(); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chainArb.Start(beat); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

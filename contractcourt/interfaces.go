@@ -1,10 +1,12 @@
 package contractcourt
 
 import (
+	"context"
 	"io"
 
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
@@ -18,7 +20,7 @@ import (
 type Registry interface {
 	// LookupInvoice attempts to look up an invoice according to its 32
 	// byte payment hash.
-	LookupInvoice(lntypes.Hash) (channeldb.Invoice, error)
+	LookupInvoice(context.Context, lntypes.Hash) (invoices.Invoice, error)
 
 	// NotifyExitHopHtlc attempts to mark an invoice as settled. If the
 	// invoice is a debug invoice, then this method is a noop as debug
@@ -27,7 +29,8 @@ type Registry interface {
 	// the resolution is sent on the passed in hodlChan later.
 	NotifyExitHopHtlc(payHash lntypes.Hash, paidAmount lnwire.MilliSatoshi,
 		expiry uint32, currentHeight int32,
-		circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+		circuitKey models.CircuitKey, hodlChan chan<- interface{},
+		wireCustomRecords lnwire.CustomRecords,
 		payload invoices.Payload) (invoices.HtlcResolution, error)
 
 	// HodlUnsubscribeAll unsubscribes from all htlc resolutions.
@@ -38,7 +41,8 @@ type Registry interface {
 type OnionProcessor interface {
 	// ReconstructHopIterator attempts to decode a valid sphinx packet from
 	// the passed io.Reader instance.
-	ReconstructHopIterator(r io.Reader, rHash []byte) (hop.Iterator, error)
+	ReconstructHopIterator(r io.Reader, rHash []byte,
+		blindingInfo hop.ReconstructBlindingInfo) (hop.Iterator, error)
 }
 
 // UtxoSweeper defines the sweep functions that contract court requires.
@@ -46,12 +50,6 @@ type UtxoSweeper interface {
 	// SweepInput sweeps inputs back into the wallet.
 	SweepInput(input input.Input, params sweep.Params) (chan sweep.Result,
 		error)
-
-	// CreateSweepTx accepts a list of inputs and signs and generates a txn
-	// that spends from them. This method also makes an accurate fee
-	// estimate before generating the required witnesses.
-	CreateSweepTx(inputs []input.Input, feePref sweep.FeePreference,
-		currentBlockHeight uint32) (*wire.MsgTx, error)
 
 	// RelayFeePerKW returns the minimum fee rate required for transactions
 	// to be relayed.
@@ -62,7 +60,7 @@ type UtxoSweeper interface {
 	// fee preference that will be used for a new sweep transaction of the
 	// input that will act as a replacement transaction (RBF) of the
 	// original sweeping transaction, if any.
-	UpdateParams(input wire.OutPoint, params sweep.ParamsUpdate) (
+	UpdateParams(input wire.OutPoint, params sweep.Params) (
 		chan sweep.Result, error)
 }
 
@@ -70,6 +68,6 @@ type UtxoSweeper interface {
 type HtlcNotifier interface {
 	// NotifyFinalHtlcEvent notifies the HtlcNotifier that the final outcome
 	// for an htlc has been determined.
-	NotifyFinalHtlcEvent(key channeldb.CircuitKey,
+	NotifyFinalHtlcEvent(key models.CircuitKey,
 		info channeldb.FinalHtlcInfo)
 }

@@ -5,7 +5,23 @@ import (
 	"io"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/tlv"
 )
+
+const (
+	CRDynHeight tlv.Type = 20
+)
+
+// DynHeight is a newtype wrapper to get the proper RecordProducer instance
+// to smoothly integrate with the ChannelReestablish Message instance.
+type DynHeight uint64
+
+// Record implements the RecordProducer interface, allowing a full tlv.Record
+// object to be constructed from a DynHeight.
+func (d *DynHeight) Record() tlv.Record {
+	return tlv.MakePrimitiveRecord(CRDynHeight, (*uint64)(d))
+}
 
 // ChannelReestablish is a message sent between peers that have an existing
 // open channel upon connection reestablishment. This message allows both sides
@@ -62,6 +78,17 @@ type ChannelReestablish struct {
 	// current un-revoked commitment transaction of the sending party.
 	LocalUnrevokedCommitPoint *btcec.PublicKey
 
+	// LocalNonce is an optional field that stores a local musig2 nonce.
+	// This will only be populated if the simple taproot channels type was
+	// negotiated.
+	//
+	LocalNonce OptMusig2NonceTLV
+
+	// DynHeight is an optional field that stores the dynamic commitment
+	// negotiation height that is incremented upon successful completion of
+	// a dynamic commitment negotiation
+	DynHeight fn.Option[DynHeight]
+
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
@@ -108,6 +135,20 @@ func (a *ChannelReestablish) Encode(w *bytes.Buffer, pver uint32) error {
 	if err := WritePublicKey(w, a.LocalUnrevokedCommitPoint); err != nil {
 		return err
 	}
+
+	recordProducers := make([]tlv.RecordProducer, 0, 1)
+	a.LocalNonce.WhenSome(func(localNonce Musig2NonceTLV) {
+		recordProducers = append(recordProducers, &localNonce)
+	})
+	a.DynHeight.WhenSome(func(h DynHeight) {
+		recordProducers = append(recordProducers, &h)
+	})
+
+	err := EncodeMessageExtraData(&a.ExtraData, recordProducers...)
+	if err != nil {
+		return err
+	}
+
 	return WriteBytes(w, a.ExtraData)
 }
 
@@ -156,7 +197,34 @@ func (a *ChannelReestablish) Decode(r io.Reader, pver uint32) error {
 		return err
 	}
 
-	return a.ExtraData.Decode(r)
+	var tlvRecords ExtraOpaqueData
+	if err := ReadElements(r, &tlvRecords); err != nil {
+		return err
+	}
+
+	var (
+		dynHeight  DynHeight
+		localNonce = a.LocalNonce.Zero()
+	)
+	typeMap, err := tlvRecords.ExtractRecords(
+		&localNonce, &dynHeight,
+	)
+	if err != nil {
+		return err
+	}
+
+	if val, ok := typeMap[a.LocalNonce.TlvType()]; ok && val == nil {
+		a.LocalNonce = tlv.SomeRecordT(localNonce)
+	}
+	if val, ok := typeMap[CRDynHeight]; ok && val == nil {
+		a.DynHeight = fn.Some(dynHeight)
+	}
+
+	if len(tlvRecords) != 0 {
+		a.ExtraData = tlvRecords
+	}
+
+	return nil
 }
 
 // MsgType returns the integer uniquely identifying this message type on the

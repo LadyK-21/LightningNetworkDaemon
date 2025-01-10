@@ -4,16 +4,25 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -120,8 +129,8 @@ func TestMaybeMatchScript(t *testing.T) {
 			t.Parallel()
 
 			err := validateShutdownScript(
-				func() error { return nil }, test.upfrontScript,
-				test.shutdownScript, &chaincfg.SimNetParams,
+				test.upfrontScript, test.shutdownScript,
+				&chaincfg.SimNetParams,
 			)
 
 			if err != test.expectedErr {
@@ -135,13 +144,30 @@ type mockChannel struct {
 	chanPoint wire.OutPoint
 	initiator bool
 	scid      lnwire.ShortChannelID
+	chanType  channeldb.ChannelType
+	localKey  keychain.KeyDescriptor
+	remoteKey keychain.KeyDescriptor
 }
 
-func (m *mockChannel) ChannelPoint() *wire.OutPoint {
-	return &m.chanPoint
+func (m *mockChannel) ChannelPoint() wire.OutPoint {
+	return m.chanPoint
 }
 
-func (m *mockChannel) MarkCoopBroadcasted(*wire.MsgTx, bool) error {
+func (m *mockChannel) LocalCommitmentBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (m *mockChannel) FundingBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (m *mockChannel) MarkCoopBroadcasted(*wire.MsgTx,
+	lntypes.ChannelParty) error {
+
+	return nil
+}
+
+func (m *mockChannel) MarkShutdownSent(*channeldb.ShutdownInfo) error {
 	return nil
 }
 
@@ -163,24 +189,115 @@ func (m *mockChannel) RemoteUpfrontShutdownScript() lnwire.DeliveryAddress {
 
 func (m *mockChannel) CreateCloseProposal(fee btcutil.Amount,
 	localScript, remoteScript []byte,
-) (input.Signature, *chainhash.Hash, btcutil.Amount, error) {
+	_ ...lnwallet.ChanCloseOpt) (input.Signature, *wire.MsgTx,
+	btcutil.Amount, error) {
+
+	if m.chanType.IsTaproot() {
+		return lnwallet.NewMusigPartialSig(
+			&musig2.PartialSignature{
+				S: new(btcec.ModNScalar),
+				R: new(btcec.PublicKey),
+			},
+			lnwire.Musig2Nonce{}, lnwire.Musig2Nonce{}, nil,
+			fn.None[chainhash.Hash](),
+		), nil, 0, nil
+	}
 
 	return nil, nil, 0, nil
 }
 
 func (m *mockChannel) CompleteCooperativeClose(localSig,
 	remoteSig input.Signature, localScript, remoteScript []byte,
-	proposedFee btcutil.Amount) (*wire.MsgTx, btcutil.Amount, error) {
+	proposedFee btcutil.Amount,
+	_ ...lnwallet.ChanCloseOpt) (*wire.MsgTx, btcutil.Amount, error) {
 
-	return nil, 0, nil
+	return &wire.MsgTx{}, 0, nil
 }
 
-func (m *mockChannel) LocalBalanceDust() bool {
-	return false
+func (m *mockChannel) LocalBalanceDust() (bool, btcutil.Amount) {
+	return false, 0
 }
 
-func (m *mockChannel) RemoteBalanceDust() bool {
-	return false
+func (m *mockChannel) RemoteBalanceDust() (bool, btcutil.Amount) {
+	return false, 0
+}
+
+func (m *mockChannel) CommitBalances() (btcutil.Amount, btcutil.Amount) {
+	return 0, 0
+}
+
+func (m *mockChannel) CommitFee() btcutil.Amount {
+	return 0
+}
+
+func (m *mockChannel) ChanType() channeldb.ChannelType {
+	return m.chanType
+}
+
+func (m *mockChannel) FundingTxOut() *wire.TxOut {
+	return nil
+}
+
+func (m *mockChannel) MultiSigKeys() (
+	keychain.KeyDescriptor, keychain.KeyDescriptor) {
+
+	return m.localKey, m.remoteKey
+}
+
+func newMockTaprootChan(t *testing.T, initiator bool) *mockChannel {
+	taprootBits := channeldb.SimpleTaprootFeatureBit |
+		channeldb.AnchorOutputsBit |
+		channeldb.ZeroHtlcTxFeeBit |
+		channeldb.SingleFunderTweaklessBit
+
+	localKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	remoteKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	return &mockChannel{
+		chanPoint: wire.OutPoint{
+			Hash:  chainhash.Hash{},
+			Index: 0,
+		},
+		initiator: initiator,
+		chanType:  taprootBits,
+		localKey: keychain.KeyDescriptor{
+			PubKey: localKey.PubKey(),
+		},
+		remoteKey: keychain.KeyDescriptor{
+			PubKey: remoteKey.PubKey(),
+		},
+	}
+}
+
+type mockMusigSession struct {
+}
+
+func newMockMusigSession() *mockMusigSession {
+	return &mockMusigSession{}
+}
+
+func (m *mockMusigSession) ProposalClosingOpts() ([]lnwallet.ChanCloseOpt,
+	error) {
+
+	return nil, nil
+}
+
+func (m *mockMusigSession) CombineClosingOpts(localSig,
+	remoteSig lnwire.PartialSig,
+) (input.Signature, input.Signature, []lnwallet.ChanCloseOpt, error) {
+
+	return &lnwallet.MusigPartialSig{}, &lnwallet.MusigPartialSig{}, nil,
+		nil
+}
+
+func (m *mockMusigSession) ClosingNonce() (*musig2.Nonces, error) {
+	return &musig2.Nonces{}, nil
+}
+
+func (m *mockMusigSession) InitRemoteNonce(nonce *musig2.Nonces) {
 }
 
 type mockCoopFeeEstimator struct {
@@ -244,7 +361,8 @@ func TestMaxFeeClamp(t *testing.T) {
 					Channel:      &channel,
 					MaxFee:       test.inputMaxFee,
 					FeeEstimator: &SimpleCoopFeeEstimator{},
-				}, nil, test.idealFee, 0, nil, false,
+				}, DeliveryAddrWithKey{}, test.idealFee, 0, nil,
+				lntypes.Remote,
 			)
 
 			// We'll call initFeeBaseline early here since we need
@@ -285,7 +403,8 @@ func TestMaxFeeBailOut(t *testing.T) {
 				MaxFee: idealFee * 2,
 			}
 			chanCloser := NewChanCloser(
-				closeCfg, nil, idealFee, 0, nil, false,
+				closeCfg, DeliveryAddrWithKey{}, idealFee, 0,
+				nil, lntypes.Remote,
 			)
 
 			// We'll now force the channel state into the
@@ -306,19 +425,211 @@ func TestMaxFeeBailOut(t *testing.T) {
 				FeeSatoshis: absoluteFee * 2,
 			}
 
-			_, _, err := chanCloser.ProcessCloseMsg(closeMsg)
+			_, err := chanCloser.ReceiveClosingSigned(*closeMsg)
 
 			switch isInitiator {
 			// If we're the initiator, then we expect an error at
 			// this point.
 			case true:
-				require.ErrorIs(t, err, ErrProposalExeceedsMaxFee)
+				require.ErrorIs(
+					t, err, ErrProposalExceedsMaxFee,
+				)
 
 			// Otherwise, we expect things to fail for some other
 			// reason (invalid sig, etc).
 			case false:
-				require.NotErrorIs(t, err, ErrProposalExeceedsMaxFee)
+				require.NotErrorIs(
+					t, err, ErrProposalExceedsMaxFee,
+				)
 			}
 		})
 	}
+}
+
+// TestParseUpfrontShutdownAddress tests the we are able to parse the upfront
+// shutdown address properly.
+func TestParseUpfrontShutdownAddress(t *testing.T) {
+	t.Parallel()
+
+	var (
+		testnetAddress = "tb1qdfkmwwgdaa5dnezrlhtftvmj5qn2kwgp7n0z6r"
+		regtestAddress = "bcrt1q09crvvuj95x5nk64wsxf5n6ky0kr8358vpx4d8"
+	)
+
+	tests := []struct {
+		name        string
+		address     string
+		params      chaincfg.Params
+		expectedErr string
+	}{
+		{
+			name:        "invalid closing address",
+			address:     "non-valid-address",
+			params:      chaincfg.RegressionNetParams,
+			expectedErr: "invalid address",
+		},
+		{
+			name:        "closing address from another net",
+			address:     testnetAddress,
+			params:      chaincfg.RegressionNetParams,
+			expectedErr: "not a regtest address",
+		},
+		{
+			name:    "valid p2wkh closing address",
+			address: regtestAddress,
+			params:  chaincfg.RegressionNetParams,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParseUpfrontShutdownAddress(
+				tc.address, &tc.params,
+			)
+
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestTaprootFastClose tests that we are able to properly execute a fast close
+// (skip negotiation) for taproot channels.
+func TestTaprootFastClose(t *testing.T) {
+	t.Parallel()
+
+	aliceChan := newMockTaprootChan(t, true)
+	bobChan := newMockTaprootChan(t, false)
+
+	broadcastSignal := make(chan struct{}, 2)
+
+	idealFee := chainfee.SatPerKWeight(506)
+
+	// Next, we'll make a channel for Alice and Bob, with Alice being the
+	// initiator.
+	aliceCloser := NewChanCloser(
+		ChanCloseCfg{
+			Channel:      aliceChan,
+			MusigSession: newMockMusigSession(),
+			BroadcastTx: func(_ *wire.MsgTx, _ string) error {
+				broadcastSignal <- struct{}{}
+				return nil
+			},
+			MaxFee:       chainfee.SatPerKWeight(1000),
+			FeeEstimator: &SimpleCoopFeeEstimator{},
+			DisableChannel: func(wire.OutPoint) error {
+				return nil
+			},
+		}, DeliveryAddrWithKey{}, idealFee, 0, nil, lntypes.Local,
+	)
+	aliceCloser.initFeeBaseline()
+
+	bobCloser := NewChanCloser(
+		ChanCloseCfg{
+			Channel:      bobChan,
+			MusigSession: newMockMusigSession(),
+			MaxFee:       chainfee.SatPerKWeight(1000),
+			BroadcastTx: func(_ *wire.MsgTx, _ string) error {
+				broadcastSignal <- struct{}{}
+				return nil
+			},
+			FeeEstimator: &SimpleCoopFeeEstimator{},
+			DisableChannel: func(wire.OutPoint) error {
+				return nil
+			},
+		}, DeliveryAddrWithKey{}, idealFee, 0, nil, lntypes.Remote,
+	)
+	bobCloser.initFeeBaseline()
+
+	// With our set up complete, we'll now initialize the shutdown
+	// procedure kicked off by Alice.
+	msg, err := aliceCloser.ShutdownChan()
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+
+	// Bob will then process this message. As he's the responder, he should
+	// only send the shutdown message back to Alice.
+	oShutdown, err := bobCloser.ReceiveShutdown(*msg)
+	require.NoError(t, err)
+	oClosingSigned, err := bobCloser.BeginNegotiation()
+	require.NoError(t, err)
+	tx, _ := bobCloser.ClosingTx()
+	require.Nil(t, tx)
+	require.True(t, oShutdown.IsSome())
+	require.True(t, oClosingSigned.IsNone())
+
+	// Alice should process the shutdown message, and create a closing
+	// signed of her own.
+	oShutdown, err = aliceCloser.ReceiveShutdown(oShutdown.UnwrapOrFail(t))
+	require.NoError(t, err)
+	oClosingSigned, err = aliceCloser.BeginNegotiation()
+	require.NoError(t, err)
+	tx, _ = aliceCloser.ClosingTx()
+	require.Nil(t, tx)
+	require.True(t, oShutdown.IsNone())
+	require.True(t, oClosingSigned.IsSome())
+
+	aliceClosingSigned := oClosingSigned.UnwrapOrFail(t)
+
+	// Next, Bob will process the closing signed message, and send back a
+	// new one that should match exactly the offer Alice sent.
+	oClosingSigned, err = bobCloser.ReceiveClosingSigned(aliceClosingSigned)
+	require.NoError(t, err)
+	tx, _ = bobCloser.ClosingTx()
+	require.NotNil(t, tx)
+	require.True(t, oClosingSigned.IsSome())
+
+	bobClosingSigned := oClosingSigned.UnwrapOrFail(t)
+
+	// At this point, Bob has accepted the offer, so he can broadcast the
+	// closing transaction, and considers the channel closed.
+	_, err = lnutils.RecvOrTimeout(broadcastSignal, time.Second*1)
+	require.NoError(t, err)
+
+	// Bob's fee proposal should exactly match Alice's initial fee.
+	require.Equal(
+		t, aliceClosingSigned.FeeSatoshis, bobClosingSigned.FeeSatoshis,
+	)
+
+	// If we modify Bob's offer, and try to have Alice process it, then she
+	// should reject it.
+	ogOffer := bobClosingSigned.FeeSatoshis
+	bobClosingSigned.FeeSatoshis /= 2
+
+	_, err = aliceCloser.ReceiveClosingSigned(bobClosingSigned)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "was not accepted")
+
+	// We'll now restore the original offer before passing it on to Alice.
+	bobClosingSigned.FeeSatoshis = ogOffer
+
+	// If we use the original offer, then Alice should accept this message,
+	// and finalize the shutdown process. We expect a message here as Alice
+	// will echo back the final message.
+	oClosingSigned, err = aliceCloser.ReceiveClosingSigned(bobClosingSigned)
+	require.NoError(t, err)
+	tx, _ = aliceCloser.ClosingTx()
+	require.NotNil(t, tx)
+	require.True(t, oClosingSigned.IsSome())
+
+	aliceClosingSigned = oClosingSigned.UnwrapOrFail(t)
+
+	// Alice should now also broadcast her closing transaction.
+	_, err = lnutils.RecvOrTimeout(broadcastSignal, time.Second*1)
+	require.NoError(t, err)
+
+	// Finally, Bob will process Alice's echo message, and conclude.
+	oClosingSigned, err = bobCloser.ReceiveClosingSigned(aliceClosingSigned)
+	require.NoError(t, err)
+	tx, _ = bobCloser.ClosingTx()
+	require.NotNil(t, tx)
+	require.True(t, oClosingSigned.IsNone())
 }

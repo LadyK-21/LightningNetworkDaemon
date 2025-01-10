@@ -136,7 +136,8 @@ func (n *NeutrinoNotifier) Stop() error {
 		return nil
 	}
 
-	chainntnfs.Log.Info("neutrino notifier shutting down")
+	chainntnfs.Log.Info("neutrino notifier shutting down...")
+	defer chainntnfs.Log.Debug("neutrino notifier shutdown complete")
 
 	close(n.quit)
 	n.wg.Wait()
@@ -151,7 +152,12 @@ func (n *NeutrinoNotifier) Stop() error {
 
 		close(epochClient.epochChan)
 	}
-	n.txNotifier.TearDown()
+
+	// The txNotifier is only initialized in the start method therefore we
+	// need to make sure we don't access a nil pointer here.
+	if n.txNotifier != nil {
+		n.txNotifier.TearDown()
+	}
 
 	return nil
 }
@@ -432,7 +438,9 @@ func (n *NeutrinoNotifier) notificationDispatcher() {
 				// chain asynchronously to prevent blocking
 				// potentially long rescans.
 				n.wg.Add(1)
-				go func() {
+
+				//nolint:ll
+				go func(msg *chainntnfs.HistoricalConfDispatch) {
 					defer n.wg.Done()
 
 					confDetails, err := n.historicalConfDetails(
@@ -457,7 +465,7 @@ func (n *NeutrinoNotifier) notificationDispatcher() {
 					if err != nil {
 						chainntnfs.Log.Error(err)
 					}
-				}()
+				}(msg)
 
 			case *blockEpochRegistration:
 				chainntnfs.Log.Infof("New block epoch subscription")
@@ -579,8 +587,8 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 		// can compute the current block hash.
 		blockHash, err := n.p2pNode.GetBlockHash(int64(scanHeight))
 		if err != nil {
-			return nil, fmt.Errorf("unable to get header for height=%v: %v",
-				scanHeight, err)
+			return nil, fmt.Errorf("unable to get header for "+
+				"height=%v: %w", scanHeight, err)
 		}
 
 		// With the hash computed, we can now fetch the basic filter for this
@@ -597,8 +605,8 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 			neutrino.MaxBatchSize(int64(scanHeight-startHeight+1)),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to retrieve regular filter for "+
-				"height=%v: %v", scanHeight, err)
+			return nil, fmt.Errorf("unable to retrieve regular "+
+				"filter for height=%v: %w", scanHeight, err)
 		}
 
 		// In the case that the filter exists, we'll attempt to see if
@@ -606,7 +614,8 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 		key := builder.DeriveKey(blockHash)
 		match, err := regFilter.Match(key, confRequest.PkScript.Script())
 		if err != nil {
-			return nil, fmt.Errorf("unable to query filter: %v", err)
+			return nil, fmt.Errorf("unable to query filter: %w",
+				err)
 		}
 
 		// If there's no match, then we can continue forward to the
@@ -620,7 +629,8 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 		// to send the proper response.
 		block, err := n.GetBlock(*blockHash)
 		if err != nil {
-			return nil, fmt.Errorf("unable to get block from network: %v", err)
+			return nil, fmt.Errorf("unable to get block from "+
+				"network: %w", err)
 		}
 
 		// For every transaction in the block, check which one matches
@@ -632,7 +642,7 @@ func (n *NeutrinoNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequ
 			}
 
 			return &chainntnfs.TxConfirmation{
-				Tx:          tx.MsgTx(),
+				Tx:          tx.MsgTx().Copy(),
 				BlockHash:   blockHash,
 				BlockHeight: scanHeight,
 				TxIndex:     uint32(i),
@@ -660,11 +670,11 @@ func (n *NeutrinoNotifier) handleBlockConnected(newBlock *filteredBlock) error {
 	// result in the items we care about being dispatched.
 	rawBlock, err := n.GetBlock(newBlock.hash)
 	if err != nil {
-		return fmt.Errorf("unable to get full block: %v", err)
+		return fmt.Errorf("unable to get full block: %w", err)
 	}
 	err = n.txNotifier.ConnectTip(rawBlock, newBlock.height)
 	if err != nil {
-		return fmt.Errorf("unable to connect tip: %v", err)
+		return fmt.Errorf("unable to connect tip: %w", err)
 	}
 
 	chainntnfs.Log.Infof("New block: height=%v, sha=%v", newBlock.height,
@@ -679,17 +689,23 @@ func (n *NeutrinoNotifier) handleBlockConnected(newBlock *filteredBlock) error {
 	n.bestBlock.Height = int32(newBlock.height)
 	n.bestBlock.BlockHeader = newBlock.header
 
+	err = n.txNotifier.NotifyHeight(newBlock.height)
+	if err != nil {
+		return fmt.Errorf("unable to notify height: %w", err)
+	}
+
 	n.notifyBlockEpochs(
 		int32(newBlock.height), &newBlock.hash, newBlock.header,
 	)
-	return n.txNotifier.NotifyHeight(newBlock.height)
+
+	return nil
 }
 
 // getFilteredBlock is a utility to retrieve the full filtered block from a block epoch.
 func (n *NeutrinoNotifier) getFilteredBlock(epoch chainntnfs.BlockEpoch) (*filteredBlock, error) {
 	rawBlock, err := n.GetBlock(*epoch.Hash)
 	if err != nil {
-		return nil, fmt.Errorf("unable to get block: %v", err)
+		return nil, fmt.Errorf("unable to get block: %w", err)
 	}
 
 	txns := rawBlock.Transactions()
@@ -797,7 +813,7 @@ func (n *NeutrinoNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 		return nil, chainntnfs.ErrChainNotifierShuttingDown
 	}
 	if err != nil {
-		return nil, fmt.Errorf("unable to update filter: %v", err)
+		return nil, fmt.Errorf("unable to update filter: %w", err)
 	}
 
 	// If the txNotifier didn't return any details to perform a historical
@@ -934,7 +950,7 @@ func (n *NeutrinoNotifier) RegisterConfirmationsNtfn(txid *chainhash.Hash,
 	params := n.p2pNode.ChainParams()
 	_, addrs, _, err := txscript.ExtractPkScriptAddrs(pkScript, &params)
 	if err != nil {
-		return nil, fmt.Errorf("unable to extract script: %v", err)
+		return nil, fmt.Errorf("unable to extract script: %w", err)
 	}
 
 	// We'll send the filter update request to the notifier's main event
@@ -959,7 +975,7 @@ func (n *NeutrinoNotifier) RegisterConfirmationsNtfn(txid *chainhash.Hash,
 		return nil, chainntnfs.ErrChainNotifierShuttingDown
 	}
 	if err != nil {
-		return nil, fmt.Errorf("unable to update filter: %v", err)
+		return nil, fmt.Errorf("unable to update filter: %w", err)
 	}
 
 	// If a historical rescan was not requested by the txNotifier, then we
