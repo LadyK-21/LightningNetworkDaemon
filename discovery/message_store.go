@@ -72,7 +72,7 @@ func NewMessageStore(db kvdb.Backend) (*MessageStore, error) {
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("unable to create required buckets: %v",
+		return nil, fmt.Errorf("unable to create required buckets: %w",
 			err)
 	}
 
@@ -83,9 +83,9 @@ func NewMessageStore(db kvdb.Backend) (*MessageStore, error) {
 func msgShortChanID(msg lnwire.Message) (lnwire.ShortChannelID, error) {
 	var shortChanID lnwire.ShortChannelID
 	switch msg := msg.(type) {
-	case *lnwire.AnnounceSignatures:
+	case *lnwire.AnnounceSignatures1:
 		shortChanID = msg.ShortChannelID
-	case *lnwire.ChannelUpdate:
+	case *lnwire.ChannelUpdate1:
 		shortChanID = msg.ShortChannelID
 	default:
 		return shortChanID, ErrUnsupportedMessage
@@ -111,7 +111,11 @@ func messageStoreKey(msg lnwire.Message, peerPubKey [33]byte) ([]byte, error) {
 
 // AddMessage adds a message to the store for this peer.
 func (s *MessageStore) AddMessage(msg lnwire.Message, peerPubKey [33]byte) error {
-	// Construct the key for which we'll find this message with in the store.
+	log.Tracef("Adding message of type %v to store for peer %x",
+		msg.MsgType(), peerPubKey)
+
+	// Construct the key for which we'll find this message with in the
+	// store.
 	msgKey, err := messageStoreKey(msg, peerPubKey)
 	if err != nil {
 		return err
@@ -137,6 +141,9 @@ func (s *MessageStore) AddMessage(msg lnwire.Message, peerPubKey [33]byte) error
 func (s *MessageStore) DeleteMessage(msg lnwire.Message,
 	peerPubKey [33]byte) error {
 
+	log.Tracef("Deleting message of type %v from store for peer %x",
+		msg.MsgType(), peerPubKey)
+
 	// Construct the key for which we'll find this message with in the
 	// store.
 	msgKey, err := messageStoreKey(msg, peerPubKey)
@@ -153,7 +160,7 @@ func (s *MessageStore) DeleteMessage(msg lnwire.Message,
 		// In the event that we're attempting to delete a ChannelUpdate
 		// from the store, we'll make sure that we're actually deleting
 		// the correct one as it can be overwritten.
-		if msg, ok := msg.(*lnwire.ChannelUpdate); ok {
+		if msg, ok := msg.(*lnwire.ChannelUpdate1); ok {
 			// Deleting a value from a bucket that doesn't exist
 			// acts as a NOP, so we'll return if a message doesn't
 			// exist under this key.
@@ -169,7 +176,13 @@ func (s *MessageStore) DeleteMessage(msg lnwire.Message,
 
 			// If the timestamps don't match, then the update stored
 			// should be the latest one, so we'll avoid deleting it.
-			if msg.Timestamp != dbMsg.(*lnwire.ChannelUpdate).Timestamp {
+			m, ok := dbMsg.(*lnwire.ChannelUpdate1)
+			if !ok {
+				return fmt.Errorf("expected "+
+					"*lnwire.ChannelUpdate1, got: %T",
+					dbMsg)
+			}
+			if msg.Timestamp != m.Timestamp {
 				return nil
 			}
 		}

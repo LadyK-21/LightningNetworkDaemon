@@ -1,7 +1,9 @@
 package contractcourt
 
 import (
-	"github.com/lightningnetwork/lnd/channeldb"
+	"context"
+
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -23,8 +25,14 @@ type mockRegistry struct {
 
 func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 	paidAmount lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
-	circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+	circuitKey models.CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
+
+	// Exit early if the notification channel is nil.
+	if hodlChan == nil {
+		return r.notifyResolution, r.notifyErr
+	}
 
 	r.notifyChan <- notifyExitHopData{
 		hodlChan:      hodlChan,
@@ -39,8 +47,8 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 
 func (r *mockRegistry) HodlUnsubscribeAll(subscriber chan<- interface{}) {}
 
-func (r *mockRegistry) LookupInvoice(lntypes.Hash) (channeldb.Invoice,
-	error) {
+func (r *mockRegistry) LookupInvoice(context.Context, lntypes.Hash) (
+	invoices.Invoice, error) {
 
-	return channeldb.Invoice{}, channeldb.ErrInvoiceNotFound
+	return invoices.Invoice{}, invoices.ErrInvoiceNotFound
 }

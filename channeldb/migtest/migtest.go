@@ -84,13 +84,14 @@ func ApplyMigration(t *testing.T,
 	}
 }
 
-// ApplyMigrationWithDb is a helper test function that encapsulates the general
+// ApplyMigrationWithDB is a helper test function that encapsulates the general
 // steps which are needed to properly check the result of applying migration
 // function. This function differs from ApplyMigration as it requires the
 // supplied migration functions to take a db instance and construct their own
 // database transactions.
-func ApplyMigrationWithDb(t testing.TB, beforeMigration, afterMigration,
-	migrationFunc func(db kvdb.Backend) error) {
+func ApplyMigrationWithDB(t testing.TB, beforeMigration,
+	afterMigration func(db kvdb.Backend) error,
+	migrationFunc func(db kvdb.Backend) error, shouldFail bool) {
 
 	t.Helper()
 
@@ -106,8 +107,11 @@ func ApplyMigrationWithDb(t testing.TB, beforeMigration, afterMigration,
 	}
 
 	// Apply migration.
-	if err := migrationFunc(cdb); err != nil {
-		t.Fatalf("migrationFunc error: %v", err)
+	err = migrationFunc(cdb)
+	if shouldFail {
+		require.Error(t, err)
+	} else {
+		require.NoError(t, err)
 	}
 
 	// If there's no afterMigration, exit here.

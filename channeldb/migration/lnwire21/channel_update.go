@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
@@ -14,9 +13,9 @@ import (
 type ChanUpdateMsgFlags uint8
 
 const (
-	// ChanUpdateOptionMaxHtlc is a bit that indicates whether the
+	// ChanUpdateRequiredMaxHtlc is a bit that indicates whether the
 	// optional htlc_maximum_msat field is present in this ChannelUpdate.
-	ChanUpdateOptionMaxHtlc ChanUpdateMsgFlags = 1 << iota
+	ChanUpdateRequiredMaxHtlc ChanUpdateMsgFlags = 1 << iota
 )
 
 // String returns the bitfield flags as a string.
@@ -27,7 +26,7 @@ func (c ChanUpdateMsgFlags) String() string {
 // HasMaxHtlc returns true if the htlc_maximum_msat option bit is set in the
 // message flags.
 func (c ChanUpdateMsgFlags) HasMaxHtlc() bool {
-	return c&ChanUpdateOptionMaxHtlc != 0
+	return c&ChanUpdateRequiredMaxHtlc != 0
 }
 
 // ChanUpdateChanFlags is a bitfield that signals various options concerning a
@@ -160,7 +159,7 @@ func (a *ChannelUpdate) Decode(r io.Reader, pver uint32) error {
 	// we'll collect the remainder into the ExtraOpaqueData field. If there
 	// aren't any bytes, then we'll snip off the slice to avoid carrying
 	// around excess capacity.
-	a.ExtraOpaqueData, err = ioutil.ReadAll(r)
+	a.ExtraOpaqueData, err = io.ReadAll(r)
 	if err != nil {
 		return err
 	}

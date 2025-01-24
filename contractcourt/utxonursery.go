@@ -3,20 +3,26 @@ package contractcourt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 //                          SUMMARY OF OUTPUT STATES
@@ -202,6 +208,9 @@ type NurseryConfig struct {
 
 	// Sweep sweeps an input back to the wallet.
 	SweepInput func(input.Input, sweep.Params) (chan sweep.Result, error)
+
+	// Budget is the configured budget for the nursery.
+	Budget *BudgetConfig
 }
 
 // UtxoNursery is a system dedicated to incubating time-locked outputs created
@@ -317,7 +326,8 @@ func (u *UtxoNursery) Stop() error {
 		return nil
 	}
 
-	utxnLog.Infof("UTXO nursery shutting down")
+	utxnLog.Infof("UTXO nursery shutting down...")
+	defer utxnLog.Debug("UTXO nursery shutdown complete")
 
 	close(u.quit)
 	u.wg.Wait()
@@ -330,9 +340,9 @@ func (u *UtxoNursery) Stop() error {
 // they're CLTV absolute time locked, or if they're CSV relative time locked.
 // Once all outputs reach maturity, they'll be swept back into the wallet.
 func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
-	outgoingHtlcs []lnwallet.OutgoingHtlcResolution,
-	incomingHtlcs []lnwallet.IncomingHtlcResolution,
-	broadcastHeight uint32) error {
+	outgoingHtlc fn.Option[lnwallet.OutgoingHtlcResolution],
+	incomingHtlc fn.Option[lnwallet.IncomingHtlcResolution],
+	broadcastHeight uint32, deadlineHeight fn.Option[int32]) error {
 
 	// Add to wait group because nursery might shut down during execution of
 	// this function. Otherwise it could happen that nursery thinks it is
@@ -349,14 +359,13 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 	default:
 	}
 
-	numHtlcs := len(incomingHtlcs) + len(outgoingHtlcs)
 	var (
 		// Kid outputs can be swept after an initial confirmation
 		// followed by a maturity period.Baby outputs are two stage and
 		// will need to wait for an absolute time out to reach a
 		// confirmation, then require a relative confirmation delay.
-		kidOutputs  = make([]kidOutput, 0, 1+len(incomingHtlcs))
-		babyOutputs = make([]babyOutput, 0, len(outgoingHtlcs))
+		kidOutputs  = make([]kidOutput, 0)
+		babyOutputs = make([]babyOutput, 0)
 	)
 
 	// 1. Build all the spendable outputs that we will try to incubate.
@@ -366,33 +375,63 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 	// For each incoming HTLC, we'll register a kid output marked as a
 	// second-layer HTLC output. We effectively skip the baby stage (as the
 	// timelock is zero), and enter the kid stage.
-	for _, htlcRes := range incomingHtlcs {
+	incomingHtlc.WhenSome(func(htlcRes lnwallet.IncomingHtlcResolution) {
+		// Based on the input pk script of the sign descriptor, we can
+		// determine if this is a taproot output or not. This'll
+		// determine the witness type we try to set below.
+		isTaproot := txscript.IsPayToTaproot(
+			htlcRes.SweepSignDesc.Output.PkScript,
+		)
+
+		var witType input.StandardWitnessType
+		if isTaproot {
+			witType = input.TaprootHtlcAcceptedSuccessSecondLevel
+		} else {
+			witType = input.HtlcAcceptedSuccessSecondLevel
+		}
+
 		htlcOutput := makeKidOutput(
 			&htlcRes.ClaimOutpoint, &chanPoint, htlcRes.CsvDelay,
-			input.HtlcAcceptedSuccessSecondLevel,
-			&htlcRes.SweepSignDesc, 0,
+			witType, &htlcRes.SweepSignDesc, 0, deadlineHeight,
 		)
 
 		if htlcOutput.Amount() > 0 {
 			kidOutputs = append(kidOutputs, htlcOutput)
 		}
-	}
+	})
 
 	// For each outgoing HTLC, we'll create a baby output. If this is our
 	// commitment transaction, then we'll broadcast a second-layer
 	// transaction to transition to a kid output. Otherwise, we'll directly
 	// spend once the CLTV delay us up.
-	for _, htlcRes := range outgoingHtlcs {
+	outgoingHtlc.WhenSome(func(htlcRes lnwallet.OutgoingHtlcResolution) {
 		// If this HTLC is on our commitment transaction, then it'll be
 		// a baby output as we need to go to the second level to sweep
 		// it.
 		if htlcRes.SignedTimeoutTx != nil {
-			htlcOutput := makeBabyOutput(&chanPoint, &htlcRes)
+			htlcOutput := makeBabyOutput(
+				&chanPoint, &htlcRes, deadlineHeight,
+			)
 
 			if htlcOutput.Amount() > 0 {
 				babyOutputs = append(babyOutputs, htlcOutput)
 			}
-			continue
+
+			return
+		}
+
+		// Based on the input pk script of the sign descriptor, we can
+		// determine if this is a taproot output or not. This'll
+		// determine the witness type we try to set below.
+		isTaproot := txscript.IsPayToTaproot(
+			htlcRes.SweepSignDesc.Output.PkScript,
+		)
+
+		var witType input.StandardWitnessType
+		if isTaproot {
+			witType = input.TaprootHtlcOfferedRemoteTimeout
+		} else {
+			witType = input.HtlcOfferedRemoteTimeout
 		}
 
 		// Otherwise, this is actually a kid output as we can sweep it
@@ -402,16 +441,17 @@ func (u *UtxoNursery) IncubateOutputs(chanPoint wire.OutPoint,
 		// accordingly.
 		htlcOutput := makeKidOutput(
 			&htlcRes.ClaimOutpoint, &chanPoint, htlcRes.CsvDelay,
-			input.HtlcOfferedRemoteTimeout,
-			&htlcRes.SweepSignDesc, htlcRes.Expiry,
+			witType, &htlcRes.SweepSignDesc, htlcRes.Expiry,
+			deadlineHeight,
 		)
 		kidOutputs = append(kidOutputs, htlcOutput)
-	}
+	})
 
 	// TODO(roasbeef): if want to handle outgoing on remote commit
 	//  * need ability to cancel in the case that we learn of pre-image or
 	//    remote party pulls
 
+	numHtlcs := len(babyOutputs) + len(kidOutputs)
 	utxnLog.Infof("Incubating Channel(%s) num-htlcs=%d",
 		chanPoint, numHtlcs)
 
@@ -515,13 +555,18 @@ func (u *UtxoNursery) NurseryReport(
 				// confirmation of the commitment transaction.
 				switch kid.WitnessType() {
 
+				//nolint:ll
+				case input.TaprootHtlcAcceptedSuccessSecondLevel:
+					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
-					// An HTLC output on our commitment transaction
-					// where the second-layer transaction hasn't
+					// An HTLC output on our commitment
+					// transaction where the second-layer
+					// transaction hasn't
 					// yet confirmed.
 					report.AddLimboStage1SuccessHtlc(&kid)
 
-				case input.HtlcOfferedRemoteTimeout:
+				case input.HtlcOfferedRemoteTimeout,
+					input.TaprootHtlcOfferedRemoteTimeout:
 					// This is an HTLC output on the
 					// commitment transaction of the remote
 					// party. We are waiting for the CLTV
@@ -536,7 +581,8 @@ func (u *UtxoNursery) NurseryReport(
 				// types.
 				switch kid.WitnessType() {
 
-				case input.HtlcOfferedRemoteTimeout:
+				case input.HtlcOfferedRemoteTimeout,
+					input.TaprootHtlcOfferedRemoteTimeout:
 					// This is an HTLC output on the
 					// commitment transaction of the remote
 					// party. The CLTV timelock has
@@ -544,6 +590,11 @@ func (u *UtxoNursery) NurseryReport(
 					// it.
 					report.AddLimboDirectHtlc(&kid)
 
+				//nolint:ll
+				case input.TaprootHtlcAcceptedSuccessSecondLevel:
+					fallthrough
+				case input.TaprootHtlcOfferedTimeoutSecondLevel:
+					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
 					fallthrough
 				case input.HtlcOfferedTimeoutSecondLevel:
@@ -560,9 +611,16 @@ func (u *UtxoNursery) NurseryReport(
 				// balance.
 				switch kid.WitnessType() {
 
+				//nolint:ll
+				case input.TaprootHtlcAcceptedSuccessSecondLevel:
+					fallthrough
+				case input.TaprootHtlcOfferedTimeoutSecondLevel:
+					fallthrough
 				case input.HtlcAcceptedSuccessSecondLevel:
 					fallthrough
 				case input.HtlcOfferedTimeoutSecondLevel:
+					fallthrough
+				case input.TaprootHtlcOfferedRemoteTimeout:
 					fallthrough
 				case input.HtlcOfferedRemoteTimeout:
 					// This htlc output successfully
@@ -730,12 +788,13 @@ func (u *UtxoNursery) graduateClass(classHeight uint32) error {
 	// Fetch all information about the crib and kindergarten outputs at
 	// this height.
 	kgtnOutputs, cribOutputs, err := u.cfg.Store.FetchClass(
-		classHeight)
+		classHeight,
+	)
 	if err != nil {
 		return err
 	}
 
-	utxnLog.Infof("Attempting to graduate height=%v: num_kids=%v, "+
+	utxnLog.Debugf("Attempting to graduate height=%v: num_kids=%v, "+
 		"num_babies=%v", classHeight, len(kgtnOutputs), len(cribOutputs))
 
 	// Offer the outputs to the sweeper and set up notifications that will
@@ -765,6 +824,32 @@ func (u *UtxoNursery) graduateClass(classHeight uint32) error {
 	return nil
 }
 
+// decideDeadlineAndBudget returns the deadline and budget for a given output.
+func (u *UtxoNursery) decideDeadlineAndBudget(k kidOutput) (fn.Option[int32],
+	btcutil.Amount) {
+
+	// Assume this is a to_local output and use a None deadline.
+	deadline := fn.None[int32]()
+
+	// Exit early if this is not HTLC.
+	if !k.isHtlc {
+		budget := calculateBudget(
+			k.amt, u.cfg.Budget.ToLocalRatio, u.cfg.Budget.ToLocal,
+		)
+
+		return deadline, budget
+	}
+
+	// Otherwise it's the first-level HTLC output, we'll use the
+	// time-sensitive settings for it.
+	budget := calculateBudget(
+		k.amt, u.cfg.Budget.DeadlineHTLCRatio,
+		u.cfg.Budget.DeadlineHTLC,
+	)
+
+	return k.deadlineHeight, budget
+}
+
 // sweepMatureOutputs generates and broadcasts the transaction that transfers
 // control of funds from a prior channel commitment transaction to the user's
 // wallet. The outputs swept were previously time locked (either absolute or
@@ -775,15 +860,18 @@ func (u *UtxoNursery) sweepMatureOutputs(classHeight uint32,
 	utxnLog.Infof("Sweeping %v CSV-delayed outputs with sweep tx for "+
 		"height %v", len(kgtnOutputs), classHeight)
 
-	feePref := sweep.FeePreference{ConfTarget: kgtnOutputConfTarget}
 	for _, output := range kgtnOutputs {
 		// Create local copy to prevent pointer to loop variable to be
 		// passed in with disastrous consequences.
 		local := output
 
-		resultChan, err := u.cfg.SweepInput(
-			&local, sweep.Params{Fee: feePref},
-		)
+		// Calculate the deadline height and budget for this output.
+		deadline, budget := u.decideDeadlineAndBudget(local)
+
+		resultChan, err := u.cfg.SweepInput(&local, sweep.Params{
+			DeadlineHeight: deadline,
+			Budget:         budget,
+		})
 		if err != nil {
 			return err
 		}
@@ -862,16 +950,19 @@ func (u *UtxoNursery) waitForSweepConf(classHeight uint32,
 func (u *UtxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) error {
 	utxnLog.Infof("Publishing CLTV-delayed HTLC output using timeout tx "+
 		"(txid=%v): %v", baby.timeoutTx.TxHash(),
-		newLogClosure(func() string {
-			return spew.Sdump(baby.timeoutTx)
-		}),
-	)
+		lnutils.SpewLogClosure(baby.timeoutTx))
 
 	// We'll now broadcast the HTLC transaction, then wait for it to be
 	// confirmed before transitioning it to kindergarten.
 	label := labels.MakeLabel(labels.LabelTypeSweepTransaction, nil)
 	err := u.cfg.PublishTransaction(baby.timeoutTx, label)
-	if err != nil && err != lnwallet.ErrDoubleSpend {
+
+	// In case the tx does not meet mempool fee requirements we continue
+	// because the tx is rebroadcasted in the background and there is
+	// nothing we can do to bump this transaction anyways.
+	if err != nil && !errors.Is(err, lnwallet.ErrDoubleSpend) &&
+		!errors.Is(err, lnwallet.ErrMempoolFee) {
+
 		utxnLog.Errorf("Unable to broadcast baby tx: "+
 			"%v, %v", err, spew.Sdump(baby.timeoutTx))
 		return err
@@ -1079,7 +1170,7 @@ func (c *ContractMaturityReport) AddLimboStage1TimeoutHtlc(baby *babyOutput) {
 
 	// TODO(roasbeef): bool to indicate stage 1 vs stage 2?
 	c.Htlcs = append(c.Htlcs, HtlcMaturityReport{
-		Outpoint:       *baby.OutPoint(),
+		Outpoint:       baby.OutPoint(),
 		Amount:         baby.Amount(),
 		MaturityHeight: baby.expiry,
 		Stage:          1,
@@ -1093,7 +1184,7 @@ func (c *ContractMaturityReport) AddLimboDirectHtlc(kid *kidOutput) {
 	c.LimboBalance += kid.Amount()
 
 	htlcReport := HtlcMaturityReport{
-		Outpoint:       *kid.OutPoint(),
+		Outpoint:       kid.OutPoint(),
 		Amount:         kid.Amount(),
 		MaturityHeight: kid.absoluteMaturity,
 		Stage:          2,
@@ -1109,7 +1200,7 @@ func (c *ContractMaturityReport) AddLimboStage1SuccessHtlc(kid *kidOutput) {
 	c.LimboBalance += kid.Amount()
 
 	c.Htlcs = append(c.Htlcs, HtlcMaturityReport{
-		Outpoint: *kid.OutPoint(),
+		Outpoint: kid.OutPoint(),
 		Amount:   kid.Amount(),
 		Stage:    1,
 	})
@@ -1121,7 +1212,7 @@ func (c *ContractMaturityReport) AddLimboStage2Htlc(kid *kidOutput) {
 	c.LimboBalance += kid.Amount()
 
 	htlcReport := HtlcMaturityReport{
-		Outpoint: *kid.OutPoint(),
+		Outpoint: kid.OutPoint(),
 		Amount:   kid.Amount(),
 		Stage:    2,
 	}
@@ -1142,7 +1233,7 @@ func (c *ContractMaturityReport) AddRecoveredHtlc(kid *kidOutput) {
 	c.RecoveredBalance += kid.Amount()
 
 	c.Htlcs = append(c.Htlcs, HtlcMaturityReport{
-		Outpoint:       *kid.OutPoint(),
+		Outpoint:       kid.OutPoint(),
 		Amount:         kid.Amount(),
 		MaturityHeight: kid.ConfHeight() + kid.BlocksToMaturity(),
 	})
@@ -1213,15 +1304,26 @@ type babyOutput struct {
 // provided sign descriptors and witness types will be used once the output
 // reaches the delay and claim stage.
 func makeBabyOutput(chanPoint *wire.OutPoint,
-	htlcResolution *lnwallet.OutgoingHtlcResolution) babyOutput {
+	htlcResolution *lnwallet.OutgoingHtlcResolution,
+	deadlineHeight fn.Option[int32]) babyOutput {
 
 	htlcOutpoint := htlcResolution.ClaimOutpoint
 	blocksToMaturity := htlcResolution.CsvDelay
-	witnessType := input.HtlcOfferedTimeoutSecondLevel
+
+	isTaproot := txscript.IsPayToTaproot(
+		htlcResolution.SweepSignDesc.Output.PkScript,
+	)
+
+	var witnessType input.StandardWitnessType
+	if isTaproot {
+		witnessType = input.TaprootHtlcOfferedTimeoutSecondLevel
+	} else {
+		witnessType = input.HtlcOfferedTimeoutSecondLevel
+	}
 
 	kid := makeKidOutput(
 		&htlcOutpoint, chanPoint, blocksToMaturity, witnessType,
-		&htlcResolution.SweepSignDesc, 0,
+		&htlcResolution.SweepSignDesc, 0, deadlineHeight,
 	)
 
 	return babyOutput{
@@ -1294,17 +1396,25 @@ type kidOutput struct {
 	// NOTE: This will only be set for: outgoing HTLC's on the commitment
 	// transaction of the remote party.
 	absoluteMaturity uint32
+
+	// deadlineHeight is the absolute height that this output should be
+	// confirmed at. For an incoming HTLC, this is the CLTV expiry height.
+	// For outgoing HTLC, this is its corresponding incoming HTLC's CLTV
+	// expiry height.
+	deadlineHeight fn.Option[int32]
 }
 
 func makeKidOutput(outpoint, originChanPoint *wire.OutPoint,
 	blocksToMaturity uint32, witnessType input.StandardWitnessType,
-	signDescriptor *input.SignDescriptor,
-	absoluteMaturity uint32) kidOutput {
+	signDescriptor *input.SignDescriptor, absoluteMaturity uint32,
+	deadlineHeight fn.Option[int32]) kidOutput {
 
 	// This is an HTLC either if it's an incoming HTLC on our commitment
 	// transaction, or is an outgoing HTLC on the commitment transaction of
 	// the remote peer.
 	isHtlc := (witnessType == input.HtlcAcceptedSuccessSecondLevel ||
+		witnessType == input.TaprootHtlcAcceptedSuccessSecondLevel ||
+		witnessType == input.TaprootHtlcOfferedRemoteTimeout ||
 		witnessType == input.HtlcOfferedRemoteTimeout)
 
 	// heightHint can be safely set to zero here, because after this
@@ -1315,11 +1425,13 @@ func makeKidOutput(outpoint, originChanPoint *wire.OutPoint,
 	return kidOutput{
 		breachedOutput: makeBreachedOutput(
 			outpoint, witnessType, nil, signDescriptor, heightHint,
+			fn.None[tlv.Blob](),
 		),
 		isHtlc:           isHtlc,
 		originChanPoint:  *originChanPoint,
 		blocksToMaturity: blocksToMaturity,
 		absoluteMaturity: absoluteMaturity,
+		deadlineHeight:   deadlineHeight,
 	}
 }
 
@@ -1339,6 +1451,10 @@ func (k *kidOutput) ConfHeight() uint32 {
 	return k.confHeight
 }
 
+func (k *kidOutput) RequiredLockTime() (uint32, bool) {
+	return k.absoluteMaturity, k.absoluteMaturity > 0
+}
+
 // Encode converts a KidOutput struct into a form suitable for on-disk database
 // storage. Note that the signDescriptor struct field is included so that the
 // output's witness can be generated by createSweepTx() when the output becomes
@@ -1350,10 +1466,11 @@ func (k *kidOutput) Encode(w io.Writer) error {
 		return err
 	}
 
-	if err := writeOutpoint(w, k.OutPoint()); err != nil {
+	op := k.OutPoint()
+	if err := graphdb.WriteOutpoint(w, &op); err != nil {
 		return err
 	}
-	if err := writeOutpoint(w, k.OriginChanPoint()); err != nil {
+	if err := graphdb.WriteOutpoint(w, k.OriginChanPoint()); err != nil {
 		return err
 	}
 
@@ -1381,7 +1498,17 @@ func (k *kidOutput) Encode(w io.Writer) error {
 		return err
 	}
 
-	return input.WriteSignDescriptor(w, k.SignDesc())
+	if err := input.WriteSignDescriptor(w, k.SignDesc()); err != nil {
+		return err
+	}
+
+	if k.SignDesc().ControlBlock == nil {
+		return nil
+	}
+
+	// If this is a taproot output, then it'll also have a control block,
+	// so we'll go ahead and write that now.
+	return wire.WriteVarBytes(w, 1000, k.SignDesc().ControlBlock)
 }
 
 // Decode takes a byte array representation of a kidOutput and converts it to an
@@ -1395,11 +1522,12 @@ func (k *kidOutput) Decode(r io.Reader) error {
 	}
 	k.amt = btcutil.Amount(byteOrder.Uint64(scratch[:]))
 
-	if err := readOutpoint(io.LimitReader(r, 40), &k.outpoint); err != nil {
+	err := graphdb.ReadOutpoint(io.LimitReader(r, 40), &k.outpoint)
+	if err != nil {
 		return err
 	}
 
-	err := readOutpoint(io.LimitReader(r, 40), &k.originChanPoint)
+	err = graphdb.ReadOutpoint(io.LimitReader(r, 40), &k.originChanPoint)
 	if err != nil {
 		return err
 	}
@@ -1428,39 +1556,25 @@ func (k *kidOutput) Decode(r io.Reader) error {
 	}
 	k.witnessType = input.StandardWitnessType(byteOrder.Uint16(scratch[:2]))
 
-	return input.ReadSignDescriptor(r, &k.signDesc)
-}
-
-// TODO(bvu): copied from channeldb, remove repetition
-func writeOutpoint(w io.Writer, o *wire.OutPoint) error {
-	// TODO(roasbeef): make all scratch buffers on the stack
-	scratch := make([]byte, 4)
-
-	// TODO(roasbeef): write raw 32 bytes instead of wasting the extra
-	// byte.
-	if err := wire.WriteVarBytes(w, 0, o.Hash[:]); err != nil {
+	if err := input.ReadSignDescriptor(r, &k.signDesc); err != nil {
 		return err
 	}
 
-	byteOrder.PutUint32(scratch, o.Index)
-	_, err := w.Write(scratch)
-	return err
-}
+	// If there's anything left in the reader, then this is a taproot
+	// output that also wrote a control block.
+	ctrlBlock, err := wire.ReadVarBytes(r, 0, 1000, "control block")
+	switch {
+	// If there're no bytes remaining, then we'll return early.
+	case errors.Is(err, io.EOF):
+		fallthrough
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return nil
 
-// TODO(bvu): copied from channeldb, remove repetition
-func readOutpoint(r io.Reader, o *wire.OutPoint) error {
-	scratch := make([]byte, 4)
-
-	txid, err := wire.ReadVarBytes(r, 0, 32, "prevout")
-	if err != nil {
+	case err != nil:
 		return err
 	}
-	copy(o.Hash[:], txid)
 
-	if _, err := r.Read(scratch); err != nil {
-		return err
-	}
-	o.Index = byteOrder.Uint32(scratch)
+	k.signDesc.ControlBlock = ctrlBlock
 
 	return nil
 }

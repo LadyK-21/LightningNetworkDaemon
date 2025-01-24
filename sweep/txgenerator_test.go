@@ -16,10 +16,12 @@ var (
 		input.HtlcOfferedRemoteTimeout,
 		input.WitnessKeyHash,
 	}
-	expectedWeight  = int64(1460)
-	expectedSummary = "0000000000000000000000000000000000000000000000000000000000000000:10 (CommitmentTimeLock), " +
-		"0000000000000000000000000000000000000000000000000000000000000001:11 (HtlcAcceptedSuccessSecondLevel), " +
-		"0000000000000000000000000000000000000000000000000000000000000002:12 (HtlcOfferedRemoteTimeout), " +
+	expectedWeight = int64(1460)
+
+	//nolint:ll
+	expectedSummary = "0000000000000000000000000000000000000000000000000000000000000000:10 (CommitmentTimeLock)\n" +
+		"0000000000000000000000000000000000000000000000000000000000000001:11 (HtlcAcceptedSuccessSecondLevel)\n" +
+		"0000000000000000000000000000000000000000000000000000000000000002:12 (HtlcOfferedRemoteTimeout)\n" +
 		"0000000000000000000000000000000000000000000000000000000000000003:13 (WitnessKeyHash)"
 )
 
@@ -50,7 +52,9 @@ func TestWeightEstimate(t *testing.T) {
 		0x00, 0x00, 0x00, 0x00,
 	}
 
-	_, estimator, err := getWeightEstimate(inputs, nil, 0, changePkScript)
+	_, estimator, err := getWeightEstimate(
+		inputs, nil, 0, 0, [][]byte{changePkScript},
+	)
 	require.NoError(t, err)
 
 	weight := int64(estimator.weight())
@@ -151,7 +155,7 @@ func testUnknownScriptInner(t *testing.T, pkscript []byte, expectFail bool) {
 		))
 	}
 
-	_, _, err := getWeightEstimate(inputs, nil, 0, pkscript)
+	_, _, err := getWeightEstimate(inputs, nil, 0, 0, [][]byte{pkscript})
 	if expectFail {
 		require.Error(t, err)
 	} else {

@@ -1,7 +1,7 @@
 package wtclientrpc
 
 import (
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
 )
@@ -15,13 +15,9 @@ type Config struct {
 	// Active indicates if the watchtower client is enabled.
 	Active bool
 
-	// Client is the backing watchtower client that we'll interact with
-	// through the watchtower RPC subserver.
-	Client wtclient.Client
-
-	// AnchorClient is the backing watchtower client for anchor channels that
-	// we'll interact through the watchtower RPC subserver.
-	AnchorClient wtclient.Client
+	// ClientMgr is a tower client manager that manages a set of tower
+	// clients.
+	ClientMgr wtclient.ClientManager
 
 	// Resolver is a custom resolver that will be used to resolve watchtower
 	// addresses to ensure we don't leak any information when running over

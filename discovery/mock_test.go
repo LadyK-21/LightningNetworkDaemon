@@ -4,10 +4,10 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -15,9 +15,10 @@ import (
 // mockPeer implements the lnpeer.Peer interface and is used to test the
 // gossiper's interaction with peers.
 type mockPeer struct {
-	pk       *btcec.PublicKey
-	sentMsgs chan lnwire.Message
-	quit     chan struct{}
+	pk           *btcec.PublicKey
+	sentMsgs     chan lnwire.Message
+	quit         chan struct{}
+	disconnected atomic.Bool
 }
 
 var _ lnpeer.Peer = (*mockPeer)(nil)
@@ -42,7 +43,9 @@ func (p *mockPeer) SendMessageLazy(sync bool, msgs ...lnwire.Message) error {
 	return p.SendMessage(sync, msgs...)
 }
 
-func (p *mockPeer) AddNewChannel(_ *channeldb.OpenChannel, _ <-chan struct{}) error {
+func (p *mockPeer) AddNewChannel(_ *lnpeer.NewChannel,
+	_ <-chan struct{}) error {
+
 	return nil
 }
 func (p *mockPeer) WipeChannel(_ *wire.OutPoint)  {}
@@ -61,6 +64,20 @@ func (p *mockPeer) LocalFeatures() *lnwire.FeatureVector {
 }
 func (p *mockPeer) RemoteFeatures() *lnwire.FeatureVector {
 	return nil
+}
+
+func (p *mockPeer) AddPendingChannel(_ lnwire.ChannelID,
+	_ <-chan struct{}) error {
+
+	return nil
+}
+
+func (p *mockPeer) RemovePendingChannel(_ lnwire.ChannelID) error {
+	return nil
+}
+
+func (p *mockPeer) Disconnect(err error) {
+	p.disconnected.Store(true)
 }
 
 // mockMessageStore is an in-memory implementation of the MessageStore interface
@@ -143,4 +160,41 @@ func (s *mockMessageStore) MessagesForPeer(pubKey [33]byte) ([]lnwire.Message, e
 	}
 
 	return msgs, nil
+}
+
+type mockScidCloser struct {
+	m           map[lnwire.ShortChannelID]struct{}
+	channelPeer bool
+
+	sync.Mutex
+}
+
+func newMockScidCloser(channelPeer bool) *mockScidCloser {
+	return &mockScidCloser{
+		m:           make(map[lnwire.ShortChannelID]struct{}),
+		channelPeer: channelPeer,
+	}
+}
+
+func (m *mockScidCloser) PutClosedScid(scid lnwire.ShortChannelID) error {
+	m.Lock()
+	m.m[scid] = struct{}{}
+	m.Unlock()
+
+	return nil
+}
+
+func (m *mockScidCloser) IsClosedScid(scid lnwire.ShortChannelID) (bool,
+	error) {
+
+	m.Lock()
+	defer m.Unlock()
+
+	_, ok := m.m[scid]
+
+	return ok, nil
+}
+
+func (m *mockScidCloser) IsChannelPeer(pubkey *btcec.PublicKey) (bool, error) {
+	return m.channelPeer, nil
 }

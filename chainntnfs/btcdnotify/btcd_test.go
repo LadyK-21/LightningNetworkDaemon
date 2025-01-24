@@ -12,6 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/lntest/unittest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,19 +30,15 @@ var (
 	}
 )
 
-func initHintCache(t *testing.T) *chainntnfs.HeightHintCache {
+func initHintCache(t *testing.T) *channeldb.HeightHintCache {
 	t.Helper()
 
-	db, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err, "unable to create db")
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
-	testCfg := chainntnfs.CacheConfig{
+	testCfg := channeldb.CacheConfig{
 		QueryDisable: false,
 	}
-	hintCache, err := chainntnfs.NewHeightHintCache(testCfg, db.Backend)
+	hintCache, err := channeldb.NewHeightHintCache(testCfg, db.Backend)
 	require.NoError(t, err, "unable to create hint cache")
 
 	return hintCache
@@ -55,7 +52,7 @@ func setUpNotifier(t *testing.T, h *rpctest.Harness) *BtcdNotifier {
 
 	rpcCfg := h.RPCConfig()
 	notifier, err := New(
-		&rpcCfg, chainntnfs.NetParams, hintCache, hintCache, blockCache,
+		&rpcCfg, unittest.NetParams, hintCache, hintCache, blockCache,
 	)
 	require.NoError(t, err, "unable to create notifier")
 	if err := notifier.Start(); err != nil {
@@ -73,8 +70,8 @@ func setUpNotifier(t *testing.T, h *rpctest.Harness) *BtcdNotifier {
 func TestHistoricalConfDetailsTxIndex(t *testing.T) {
 	t.Parallel()
 
-	harness := chainntnfs.NewMiner(
-		t, []string{"--txindex"}, true, 25,
+	harness := unittest.NewMiner(
+		t, unittest.NetParams, []string{"--txindex"}, true, 25,
 	)
 
 	notifier := setUpNotifier(t, harness)
@@ -145,7 +142,7 @@ func TestHistoricalConfDetailsTxIndex(t *testing.T) {
 func TestHistoricalConfDetailsNoTxIndex(t *testing.T) {
 	t.Parallel()
 
-	harness := chainntnfs.NewMiner(t, nil, true, 25)
+	harness := unittest.NewMiner(t, unittest.NetParams, nil, true, 25)
 
 	notifier := setUpNotifier(t, harness)
 

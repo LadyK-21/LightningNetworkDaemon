@@ -23,7 +23,7 @@ var (
 // HealthCheckConfig contains the configuration for the different health checks
 // the lnd runs.
 //
-// nolint:lll
+//nolint:ll
 type HealthCheckConfig struct {
 	ChainCheck *CheckConfig `group:"chainbackend" namespace:"chainbackend"`
 
@@ -34,6 +34,8 @@ type HealthCheckConfig struct {
 	TorConnection *CheckConfig `group:"torconnection" namespace:"torconnection"`
 
 	RemoteSigner *CheckConfig `group:"remotesigner" namespace:"remotesigner"`
+
+	LeaderCheck *CheckConfig `group:"leader" namespace:"leader"`
 }
 
 // Validate checks the values configured for our health checks.

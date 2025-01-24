@@ -10,6 +10,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/go-errors/errors"
 	mig "github.com/lightningnetwork/lnd/channeldb/migration"
 	"github.com/lightningnetwork/lnd/channeldb/migration12"
@@ -24,11 +25,16 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/migration27"
 	"github.com/lightningnetwork/lnd/channeldb/migration29"
 	"github.com/lightningnetwork/lnd/channeldb/migration30"
+	"github.com/lightningnetwork/lnd/channeldb/migration31"
+	"github.com/lightningnetwork/lnd/channeldb/migration32"
+	"github.com/lightningnetwork/lnd/channeldb/migration33"
 	"github.com/lightningnetwork/lnd/channeldb/migration_01_to_11"
 	"github.com/lightningnetwork/lnd/clock"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -63,12 +69,24 @@ type mandatoryVersion struct {
 	migration migration
 }
 
+// MigrationConfig is an interface combines the config interfaces of all
+// optional migrations.
+type MigrationConfig interface {
+	migration30.MigrateRevLogConfig
+}
+
+// MigrationConfigImpl is a super set of all the various migration configs and
+// an implementation of MigrationConfig.
+type MigrationConfigImpl struct {
+	migration30.MigrateRevLogConfigImpl
+}
+
 // optionalMigration defines an optional migration function. When a migration
 // is optional, it usually involves a large scale of changes that might touch
 // millions of keys. Due to OOM concern, the update cannot be safely done
 // within one db transaction. Thus, for optional migrations, they must take the
 // db backend and construct transactions as needed.
-type optionalMigration func(db kvdb.Backend) error
+type optionalMigration func(db kvdb.Backend, cfg MigrationConfig) error
 
 // optionalVersion defines a db version that can be optionally applied. When
 // applying migrations, we must apply all the mandatory migrations first before
@@ -263,6 +281,22 @@ var (
 			number:    29,
 			migration: migration29.MigrateChanID,
 		},
+		{
+			// Removes the "sweeper-last-tx" bucket. Although we
+			// do not have a mandatory version 30 we skip this
+			// version because its naming is already used for the
+			// first optional migration.
+			number:    31,
+			migration: migration31.DeleteLastPublishedTxTLB,
+		},
+		{
+			number:    32,
+			migration: migration32.MigrateMCRouteSerialisation,
+		},
+		{
+			number:    33,
+			migration: migration33.MigrateMCStoreNameSpacedResults,
+		},
 	}
 
 	// optionalVersions stores all optional migrations that are applied
@@ -273,8 +307,12 @@ var (
 	// to determine its state.
 	optionalVersions = []optionalVersion{
 		{
-			name:      "prune revocation log",
-			migration: migration30.MigrateRevocationLog,
+			name: "prune revocation log",
+			migration: func(db kvdb.Backend,
+				cfg MigrationConfig) error {
+
+				return migration30.MigrateRevocationLog(db, cfg)
+			},
 		},
 	}
 
@@ -286,11 +324,6 @@ var (
 	// channelOpeningState for each channel that is currently in the process
 	// of being opened.
 	channelOpeningStateBucket = []byte("channelOpeningState")
-
-	// initialChannelFwdingPolicyBucket is the database bucket used to store
-	// the forwarding policy for each permanent channel that is currently
-	// in the process of being opened.
-	initialChannelFwdingPolicyBucket = []byte("initialChannelFwdingPolicy")
 )
 
 // DB is the primary datastore for the lnd daemon. The database stores
@@ -303,44 +336,47 @@ type DB struct {
 	channelStateDB *ChannelStateDB
 
 	dbPath                    string
-	graph                     *ChannelGraph
 	clock                     clock.Clock
 	dryRun                    bool
 	keepFailedPaymentAttempts bool
+	storeFinalHtlcResolutions bool
+
+	// noRevLogAmtData if true, means that commitment transaction amount
+	// data should not be stored in the revocation log.
+	noRevLogAmtData bool
 }
 
-// Open opens or creates channeldb. Any necessary schemas migrations due
-// to updates will take place as necessary.
-// TODO(bhandras): deprecate this function.
-func Open(dbPath string, modifiers ...OptionModifier) (*DB, error) {
-	opts := DefaultOptions()
-	for _, modifier := range modifiers {
-		modifier(&opts)
-	}
+// OpenForTesting opens or creates a channeldb to be used for tests. Any
+// necessary schemas migrations due to updates will take place as necessary.
+func OpenForTesting(t testing.TB, dbPath string,
+	modifiers ...OptionModifier) *DB {
 
 	backend, err := kvdb.GetBoltBackend(&kvdb.BoltBackendConfig{
 		DBPath:            dbPath,
 		DBFileName:        dbName,
-		NoFreelistSync:    opts.NoFreelistSync,
-		AutoCompact:       opts.AutoCompact,
-		AutoCompactMinAge: opts.AutoCompactMinAge,
-		DBTimeout:         opts.DBTimeout,
+		NoFreelistSync:    true,
+		AutoCompact:       false,
+		AutoCompactMinAge: kvdb.DefaultBoltAutoCompactMinAge,
+		DBTimeout:         kvdb.DefaultDBTimeout,
 	})
-	if err != nil {
-		return nil, err
-	}
+	require.NoError(t, err)
 
 	db, err := CreateWithBackend(backend, modifiers...)
-	if err == nil {
-		db.dbPath = dbPath
-	}
-	return db, err
+	require.NoError(t, err)
+
+	db.dbPath = dbPath
+
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+
+	return db
 }
 
 // CreateWithBackend creates channeldb instance using the passed kvdb.Backend.
 // Any necessary schemas migrations due to updates will take place as necessary.
-func CreateWithBackend(backend kvdb.Backend,
-	modifiers ...OptionModifier) (*DB, error) {
+func CreateWithBackend(backend kvdb.Backend, modifiers ...OptionModifier) (*DB,
+	error) {
 
 	opts := DefaultOptions()
 	for _, modifier := range modifiers {
@@ -364,20 +400,12 @@ func CreateWithBackend(backend kvdb.Backend,
 		clock:                     opts.clock,
 		dryRun:                    opts.dryRun,
 		keepFailedPaymentAttempts: opts.keepFailedPaymentAttempts,
+		storeFinalHtlcResolutions: opts.storeFinalHtlcResolutions,
+		noRevLogAmtData:           opts.NoRevLogAmtData,
 	}
 
 	// Set the parent pointer (only used in tests).
 	chanDB.channelStateDB.parent = chanDB
-
-	var err error
-	chanDB.graph, err = NewChannelGraph(
-		backend, opts.RejectCacheSize, opts.ChannelCacheSize,
-		opts.BatchCommitInterval, opts.PreAllocCacheNumNodes,
-		opts.UseGraphCache, opts.NoMigration,
-	)
-	if err != nil {
-		return nil, err
-	}
 
 	// Synchronize the version of database and apply migrations if needed.
 	if !opts.NoMigration {
@@ -468,7 +496,7 @@ func initChannelDB(db kvdb.Backend) error {
 		return putMeta(meta, tx)
 	}, func() {})
 	if err != nil {
-		return fmt.Errorf("unable to create new channeldb: %v", err)
+		return fmt.Errorf("unable to create new channeldb: %w", err)
 	}
 
 	return nil
@@ -607,14 +635,16 @@ func (c *ChannelStateDB) fetchNodeChannels(chainBucket kvdb.RBucket) (
 		chanBucket := chainBucket.NestedReadBucket(chanPoint)
 
 		var outPoint wire.OutPoint
-		err := readOutpoint(bytes.NewReader(chanPoint), &outPoint)
+		err := graphdb.ReadOutpoint(
+			bytes.NewReader(chanPoint), &outPoint,
+		)
 		if err != nil {
 			return err
 		}
 		oChannel, err := fetchOpenChannel(chanBucket, &outPoint)
 		if err != nil {
 			return fmt.Errorf("unable to read channel data for "+
-				"chan_point=%v: %v", outPoint, err)
+				"chan_point=%v: %w", outPoint, err)
 		}
 		oChannel.Db = c
 
@@ -631,19 +661,95 @@ func (c *ChannelStateDB) fetchNodeChannels(chainBucket kvdb.RBucket) (
 
 // FetchChannel attempts to locate a channel specified by the passed channel
 // point. If the channel cannot be found, then an error will be returned.
-// Optionally an existing db tx can be supplied. Optionally an existing db tx
-// can be supplied.
-func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
-	*OpenChannel, error) {
+func (c *ChannelStateDB) FetchChannel(chanPoint wire.OutPoint) (*OpenChannel,
+	error) {
 
-	var (
-		targetChan      *OpenChannel
-		targetChanPoint bytes.Buffer
-	)
-
-	if err := writeOutpoint(&targetChanPoint, &chanPoint); err != nil {
+	var targetChanPoint bytes.Buffer
+	err := graphdb.WriteOutpoint(&targetChanPoint, &chanPoint)
+	if err != nil {
 		return nil, err
 	}
+
+	targetChanPointBytes := targetChanPoint.Bytes()
+	selector := func(chainBkt walletdb.ReadBucket) ([]byte, *wire.OutPoint,
+		error) {
+
+		return targetChanPointBytes, &chanPoint, nil
+	}
+
+	return c.channelScanner(nil, selector)
+}
+
+// FetchChannelByID attempts to locate a channel specified by the passed channel
+// ID. If the channel cannot be found, then an error will be returned.
+// Optionally an existing db tx can be supplied.
+func (c *ChannelStateDB) FetchChannelByID(tx kvdb.RTx, id lnwire.ChannelID) (
+	*OpenChannel, error) {
+
+	selector := func(chainBkt walletdb.ReadBucket) ([]byte, *wire.OutPoint,
+		error) {
+
+		var (
+			targetChanPointBytes []byte
+			targetChanPoint      *wire.OutPoint
+
+			// errChanFound is used to signal that the channel has
+			// been found so that iteration through the DB buckets
+			// can stop.
+			errChanFound = errors.New("channel found")
+		)
+		err := chainBkt.ForEach(func(k, _ []byte) error {
+			var outPoint wire.OutPoint
+			err := graphdb.ReadOutpoint(
+				bytes.NewReader(k), &outPoint,
+			)
+			if err != nil {
+				return err
+			}
+
+			chanID := lnwire.NewChanIDFromOutPoint(outPoint)
+			if chanID != id {
+				return nil
+			}
+
+			targetChanPoint = &outPoint
+			targetChanPointBytes = k
+
+			return errChanFound
+		})
+		if err != nil && !errors.Is(err, errChanFound) {
+			return nil, nil, err
+		}
+		if targetChanPoint == nil {
+			return nil, nil, ErrChannelNotFound
+		}
+
+		return targetChanPointBytes, targetChanPoint, nil
+	}
+
+	return c.channelScanner(tx, selector)
+}
+
+// channelSelector describes a function that takes a chain-hash bucket from
+// within the open-channel DB and returns the wanted channel point bytes, and
+// channel point. It must return the ErrChannelNotFound error if the wanted
+// channel is not in the given bucket.
+type channelSelector func(chainBkt walletdb.ReadBucket) ([]byte, *wire.OutPoint,
+	error)
+
+// channelScanner will traverse the DB to each chain-hash bucket of each node
+// pub-key bucket in the open-channel-bucket. The chanSelector will then be used
+// to fetch the wanted channel outpoint from the chain bucket.
+func (c *ChannelStateDB) channelScanner(tx kvdb.RTx,
+	chanSelect channelSelector) (*OpenChannel, error) {
+
+	var (
+		targetChan *OpenChannel
+
+		// errChanFound is used to signal that the channel has been
+		// found so that iteration through the DB buckets can stop.
+		errChanFound = errors.New("channel found")
+	)
 
 	// chanScan will traverse the following bucket structure:
 	//  * nodePub => chainHash => chanPoint
@@ -662,8 +768,8 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 		}
 
 		// Within the node channel bucket, are the set of node pubkeys
-		// we have channels with, we don't know the entire set, so
-		// we'll check them all.
+		// we have channels with, we don't know the entire set, so we'll
+		// check them all.
 		return openChanBucket.ForEach(func(nodePub, v []byte) error {
 			// Ensure that this is a key the same size as a pubkey,
 			// and also that it leads directly to a bucket.
@@ -671,7 +777,9 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 				return nil
 			}
 
-			nodeChanBucket := openChanBucket.NestedReadBucket(nodePub)
+			nodeChanBucket := openChanBucket.NestedReadBucket(
+				nodePub,
+			)
 			if nodeChanBucket == nil {
 				return nil
 			}
@@ -692,20 +800,30 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 				)
 				if chainBucket == nil {
 					return fmt.Errorf("unable to read "+
-						"bucket for chain=%x", chainHash[:])
+						"bucket for chain=%x",
+						chainHash)
 				}
 
-				// Finally we reach the leaf bucket that stores
+				// Finally, we reach the leaf bucket that stores
 				// all the chanPoints for this node.
+				targetChanBytes, chanPoint, err := chanSelect(
+					chainBucket,
+				)
+				if errors.Is(err, ErrChannelNotFound) {
+					return nil
+				} else if err != nil {
+					return err
+				}
+
 				chanBucket := chainBucket.NestedReadBucket(
-					targetChanPoint.Bytes(),
+					targetChanBytes,
 				)
 				if chanBucket == nil {
 					return nil
 				}
 
 				channel, err := fetchOpenChannel(
-					chanBucket, &chanPoint,
+					chanBucket, chanPoint,
 				)
 				if err != nil {
 					return err
@@ -714,7 +832,7 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 				targetChan = channel
 				targetChan.Db = c
 
-				return nil
+				return errChanFound
 			})
 		})
 	}
@@ -725,7 +843,7 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 	} else {
 		err = chanScan(tx)
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, errChanFound) {
 		return nil, err
 	}
 
@@ -734,7 +852,7 @@ func (c *ChannelStateDB) FetchChannel(tx kvdb.RTx, chanPoint wire.OutPoint) (
 	}
 
 	// If we can't find the channel, then we return with an error, as we
-	// have nothing to  backup.
+	// have nothing to back up.
 	return nil, ErrChannelNotFound
 }
 
@@ -964,7 +1082,7 @@ func (c *ChannelStateDB) FetchClosedChannel(chanID *wire.OutPoint) (
 
 		var b bytes.Buffer
 		var err error
-		if err = writeOutpoint(&b, chanID); err != nil {
+		if err = graphdb.WriteOutpoint(&b, chanID); err != nil {
 			return err
 		}
 
@@ -1006,7 +1124,9 @@ func (c *ChannelStateDB) FetchClosedChannelForID(cid lnwire.ChannelID) (
 		// We scan over all possible candidates for this channel ID.
 		for ; op != nil && bytes.Compare(cid[:30], op[:30]) <= 0; op, c = cursor.Next() {
 			var outPoint wire.OutPoint
-			err := readOutpoint(bytes.NewReader(op), &outPoint)
+			err := graphdb.ReadOutpoint(
+				bytes.NewReader(op), &outPoint,
+			)
 			if err != nil {
 				return err
 			}
@@ -1048,7 +1168,7 @@ func (c *ChannelStateDB) MarkChanFullyClosed(chanPoint *wire.OutPoint) error {
 	)
 	err := kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
 		var b bytes.Buffer
-		if err := writeOutpoint(&b, chanPoint); err != nil {
+		if err := graphdb.WriteOutpoint(&b, chanPoint); err != nil {
 			return err
 		}
 
@@ -1219,48 +1339,24 @@ func (c *ChannelStateDB) RestoreChannelShells(channelShells ...*ChannelShell) er
 	return nil
 }
 
-// AddrsForNode consults the graph and channel database for all addresses known
-// to the passed node public key.
-func (d *DB) AddrsForNode(nodePub *btcec.PublicKey) ([]net.Addr,
-	error) {
-
+// AddrsForNode consults the channel database for all addresses known to the
+// passed node public key. The returned boolean indicates if the given node is
+// unknown to the channel DB or not.
+//
+// NOTE: this is part of the AddrSource interface.
+func (d *DB) AddrsForNode(nodePub *btcec.PublicKey) (bool, []net.Addr, error) {
 	linkNode, err := d.channelStateDB.linkNodeDB.FetchLinkNode(nodePub)
-	if err != nil {
-		return nil, err
+	// Only if the error is something other than ErrNodeNotFound do we
+	// return it.
+	switch {
+	case err != nil && !errors.Is(err, ErrNodeNotFound):
+		return false, nil, err
+
+	case errors.Is(err, ErrNodeNotFound):
+		return false, nil, nil
 	}
 
-	// We'll also query the graph for this peer to see if they have any
-	// addresses that we don't currently have stored within the link node
-	// database.
-	pubKey, err := route.NewVertexFromBytes(nodePub.SerializeCompressed())
-	if err != nil {
-		return nil, err
-	}
-	graphNode, err := d.graph.FetchLightningNode(pubKey)
-	if err != nil && err != ErrGraphNodeNotFound {
-		return nil, err
-	} else if err == ErrGraphNodeNotFound {
-		// If the node isn't found, then that's OK, as we still have the
-		// link node data. But any other error needs to be returned.
-		graphNode = &LightningNode{}
-	}
-
-	// Now that we have both sources of addrs for this node, we'll use a
-	// map to de-duplicate any addresses between the two sources, and
-	// produce a final list of the combined addrs.
-	addrs := make(map[string]net.Addr)
-	for _, addr := range linkNode.Addresses {
-		addrs[addr.String()] = addr
-	}
-	for _, addr := range graphNode.Addresses {
-		addrs[addr.String()] = addr
-	}
-	dedupedAddrs := make([]net.Addr, 0, len(addrs))
-	for _, addr := range addrs {
-		dedupedAddrs = append(dedupedAddrs, addr)
-	}
-
-	return dedupedAddrs, nil
+	return true, linkNode.Addresses, nil
 }
 
 // AbandonChannel attempts to remove the target channel from the open channel
@@ -1273,7 +1369,7 @@ func (c *ChannelStateDB) AbandonChannel(chanPoint *wire.OutPoint,
 	// With the chanPoint constructed, we'll attempt to find the target
 	// channel in the database. If we can't find the channel, then we'll
 	// return the error back to the caller.
-	dbChan, err := c.FetchChannel(nil, *chanPoint)
+	dbChan, err := c.FetchChannel(*chanPoint)
 	switch {
 	// If the channel wasn't found, then it's possible that it was already
 	// abandoned from the database.
@@ -1312,64 +1408,6 @@ func (c *ChannelStateDB) AbandonChannel(chanPoint *wire.OutPoint,
 	// caller. We set ourselves as the close initiator because we abandoned
 	// the channel.
 	return dbChan.CloseChannel(summary, ChanStatusLocalCloseInitiator)
-}
-
-// SaveInitialFwdingPolicy saves the serialized forwarding policy for the
-// provided permanent channel id to the initialChannelFwdingPolicyBucket.
-func (c *ChannelStateDB) SaveInitialFwdingPolicy(chanID,
-	forwardingPolicy []byte) error {
-
-	return kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
-		bucket, err := tx.CreateTopLevelBucket(
-			initialChannelFwdingPolicyBucket,
-		)
-		if err != nil {
-			return err
-		}
-
-		return bucket.Put(chanID, forwardingPolicy)
-	}, func() {})
-}
-
-// GetInitialFwdingPolicy fetches the serialized forwarding policy for the
-// provided channel id from the database, or returns ErrChannelNotFound if
-// a forwarding policy for this channel id is not found.
-func (c *ChannelStateDB) GetInitialFwdingPolicy(chanID []byte) ([]byte, error) {
-	var serializedState []byte
-	err := kvdb.View(c.backend, func(tx kvdb.RTx) error {
-		bucket := tx.ReadBucket(initialChannelFwdingPolicyBucket)
-		if bucket == nil {
-			// If the bucket does not exist, it means we
-			// never added a channel fees to the db, so
-			// return ErrChannelNotFound.
-			return ErrChannelNotFound
-		}
-
-		stateBytes := bucket.Get(chanID)
-		if stateBytes == nil {
-			return ErrChannelNotFound
-		}
-
-		serializedState = append(serializedState, stateBytes...)
-
-		return nil
-	}, func() {
-		serializedState = nil
-	})
-	return serializedState, err
-}
-
-// DeleteInitialFwdingPolicy removes the forwarding policy for a given channel
-// from the database.
-func (c *ChannelStateDB) DeleteInitialFwdingPolicy(chanID []byte) error {
-	return kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
-		bucket := tx.ReadWriteBucket(initialChannelFwdingPolicyBucket)
-		if bucket == nil {
-			return ErrChannelNotFound
-		}
-
-		return bucket.Delete(chanID)
-	}, func() {})
 }
 
 // SaveChannelOpeningState saves the serialized channel state for the provided
@@ -1543,8 +1581,14 @@ func (d *DB) applyOptionalVersions(cfg OptionalMiragtionConfig) error {
 	version := optionalVersions[0]
 	log.Infof("Performing database optional migration: %s", version.name)
 
+	migrationCfg := &MigrationConfigImpl{
+		migration30.MigrateRevLogConfigImpl{
+			NoAmountData: d.noRevLogAmtData,
+		},
+	}
+
 	// Migrate the data.
-	if err := version.migration(d); err != nil {
+	if err := version.migration(d, migrationCfg); err != nil {
 		log.Errorf("Unable to apply optional migration: %s, error: %v",
 			version.name, err)
 		return err
@@ -1563,11 +1607,6 @@ func (d *DB) applyOptionalVersions(cfg OptionalMiragtionConfig) error {
 	}
 
 	return nil
-}
-
-// ChannelGraph returns the current instance of the directed channel graph.
-func (d *DB) ChannelGraph() *ChannelGraph {
-	return d.graph
 }
 
 // ChannelStateDB returns the sub database that is concerned with the channel
@@ -1620,7 +1659,7 @@ func fetchHistoricalChanBucket(tx kvdb.RTx,
 	// With the bucket for the node and chain fetched, we can now go down
 	// another level, for the channel itself.
 	var chanPointBuf bytes.Buffer
-	if err := writeOutpoint(&chanPointBuf, outPoint); err != nil {
+	if err := graphdb.WriteOutpoint(&chanPointBuf, outPoint); err != nil {
 		return nil, err
 	}
 	chanBucket := historicalChanBucket.NestedReadBucket(
@@ -1741,6 +1780,11 @@ func (c *ChannelStateDB) LookupFinalHtlc(chanID lnwire.ShortChannelID,
 func (c *ChannelStateDB) PutOnchainFinalHtlcOutcome(
 	chanID lnwire.ShortChannelID, htlcID uint64, settled bool) error {
 
+	// Skip if the user did not opt in to storing final resolutions.
+	if !c.parent.storeFinalHtlcResolutions {
+		return nil
+	}
+
 	return kvdb.Update(c.backend, func(tx kvdb.RwTx) error {
 		finalHtlcsBucket, err := fetchFinalHtlcsBucketRw(tx, chanID)
 		if err != nil {
@@ -1755,6 +1799,14 @@ func (c *ChannelStateDB) PutOnchainFinalHtlcOutcome(
 			},
 		)
 	}, func() {})
+}
+
+// MakeTestInvoiceDB is used to create a test invoice database for testing
+// purposes. It simply calls into MakeTestDB so the same modifiers can be used.
+func MakeTestInvoiceDB(t *testing.T, modifiers ...OptionModifier) (
+	invoices.InvoiceDB, error) {
+
+	return MakeTestDB(t, modifiers...)
 }
 
 // MakeTestDB creates a new instance of the ChannelDB for testing purposes.

@@ -1,10 +1,6 @@
-# If you change this value, please change it in the following files as well:
-# /.travis.yml
-# /Dockerfile
-# /make/builder.Dockerfile
-# /.github/workflows/main.yml
-# /.github/workflows/release.yml
-FROM golang:1.19.2-alpine as builder
+# If you change this please also update GO_VERSION in Makefile (then run
+# `make lint` to see where else it needs to be updated as well).
+FROM golang:1.22.6-alpine as builder
 
 LABEL maintainer="Olaoluwa Osuntokun <laolu@lightning.engineering>"
 
@@ -12,17 +8,19 @@ LABEL maintainer="Olaoluwa Osuntokun <laolu@lightning.engineering>"
 # queries required to connect to linked containers succeed.
 ENV GODEBUG netdns=cgo
 
-# Install dependencies and install/build lnd.
+# Install dependencies.
 RUN apk add --no-cache --update alpine-sdk \
+    bash \
     git \
     make 
 
 # Copy in the local repository to build from.
 COPY . /go/src/github.com/lightningnetwork/lnd
 
+#  Install/build lnd.
 RUN cd /go/src/github.com/lightningnetwork/lnd \
 &&  make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc peersrpc"
+&&  make install-all tags="signrpc walletrpc chainrpc invoicesrpc peersrpc"
 
 # Start a new, final image to reduce size.
 FROM alpine as final

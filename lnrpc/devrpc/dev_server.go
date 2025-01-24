@@ -16,9 +16,11 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
@@ -39,6 +41,10 @@ var (
 			Entity: "offchain",
 			Action: "write",
 		}},
+		"/devrpc.Dev/Quiesce": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
 	}
 )
 
@@ -55,6 +61,7 @@ type ServerShell struct {
 type Server struct {
 	started  int32 // To be used atomically.
 	shutdown int32 // To be used atomically.
+	quit     chan struct{}
 
 	// Required by the grpc-gateway/v2 library for forward compatibility.
 	// Must be after the atomically used variables to not break struct
@@ -77,7 +84,8 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 	// We don't create any new macaroons for this subserver, instead reuse
 	// existing onchain/offchain permissions.
 	server := &Server{
-		cfg: cfg,
+		quit: make(chan struct{}),
+		cfg:  cfg,
 	}
 
 	return server, macPermissions, nil
@@ -102,6 +110,8 @@ func (s *Server) Stop() error {
 		return nil
 	}
 
+	close(s.quit)
+
 	return nil
 }
 
@@ -124,7 +134,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterDevServer(grpcServer, r)
 
-	log.Debugf("DEV RPC server successfully register with root the " +
+	log.Debugf("DEV RPC server successfully registered with root the " +
 		"gRPC server")
 
 	return nil
@@ -180,12 +190,12 @@ func parseOutPoint(s string) (*wire.OutPoint, error) {
 
 	index, err := strconv.ParseInt(split[1], 10, 32)
 	if err != nil {
-		return nil, fmt.Errorf("unable to decode output index: %v", err)
+		return nil, fmt.Errorf("unable to decode output index: %w", err)
 	}
 
 	txid, err := chainhash.NewHashFromStr(split[0])
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse hex string: %v", err)
+		return nil, fmt.Errorf("unable to parse hex string: %w", err)
 	}
 
 	return &wire.OutPoint{
@@ -216,7 +226,7 @@ func (s *Server) ImportGraph(ctx context.Context,
 
 	var err error
 	for _, rpcNode := range graph.Nodes {
-		node := &channeldb.LightningNode{
+		node := &models.LightningNode{
 			HaveNodeAnnouncement: true,
 			LastUpdate: time.Unix(
 				int64(rpcNode.LastUpdate), 0,
@@ -251,7 +261,7 @@ func (s *Server) ImportGraph(ctx context.Context,
 		}
 
 		if err := graphDB.AddLightningNode(node); err != nil {
-			return nil, fmt.Errorf("unable to add node %v: %v",
+			return nil, fmt.Errorf("unable to add node %v: %w",
 				rpcNode.PubKey, err)
 		}
 
@@ -261,7 +271,7 @@ func (s *Server) ImportGraph(ctx context.Context,
 	for _, rpcEdge := range graph.Edges {
 		rpcEdge := rpcEdge
 
-		edge := &channeldb.ChannelEdgeInfo{
+		edge := &models.ChannelEdgeInfo{
 			ChannelID: rpcEdge.ChannelId,
 			ChainHash: *s.cfg.ActiveNetParams.GenesisHash,
 			Capacity:  btcutil.Amount(rpcEdge.Capacity),
@@ -284,12 +294,12 @@ func (s *Server) ImportGraph(ctx context.Context,
 		edge.ChannelPoint = *channelPoint
 
 		if err := graphDB.AddChannelEdge(edge); err != nil {
-			return nil, fmt.Errorf("unable to add edge %v: %v",
+			return nil, fmt.Errorf("unable to add edge %v: %w",
 				rpcEdge.ChanPoint, err)
 		}
 
-		makePolicy := func(rpcPolicy *lnrpc.RoutingPolicy) *channeldb.ChannelEdgePolicy {
-			policy := &channeldb.ChannelEdgePolicy{
+		makePolicy := func(rpcPolicy *lnrpc.RoutingPolicy) *models.ChannelEdgePolicy { //nolint:ll
+			policy := &models.ChannelEdgePolicy{
 				ChannelID: rpcEdge.ChannelId,
 				LastUpdate: time.Unix(
 					int64(rpcPolicy.LastUpdate), 0,
@@ -311,7 +321,8 @@ func (s *Server) ImportGraph(ctx context.Context,
 				policy.MaxHTLC = lnwire.MilliSatoshi(
 					rpcPolicy.MaxHtlcMsat,
 				)
-				policy.MessageFlags |= lnwire.ChanUpdateOptionMaxHtlc
+				policy.MessageFlags |=
+					lnwire.ChanUpdateRequiredMaxHtlc
 			}
 
 			return policy
@@ -339,4 +350,34 @@ func (s *Server) ImportGraph(ctx context.Context,
 	}
 
 	return &ImportGraphResponse{}, nil
+}
+
+// Quiesce initiates the quiescence process for the channel with the given
+// channel ID. This method will block until the channel is fully quiesced.
+func (s *Server) Quiesce(_ context.Context, in *QuiescenceRequest) (
+	*QuiescenceResponse, error) {
+
+	txid, err := lnrpc.GetChanPointFundingTxid(in.ChanId)
+	if err != nil {
+		return nil, err
+	}
+
+	op := wire.NewOutPoint(txid, in.ChanId.OutputIndex)
+	cid := lnwire.NewChanIDFromOutPoint(*op)
+	ln, err := s.cfg.Switch.GetLink(cid)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case result := <-ln.InitStfu():
+		mkResp := func(b lntypes.ChannelParty) *QuiescenceResponse {
+			return &QuiescenceResponse{Initiator: b.IsLocal()}
+		}
+
+		return fn.MapOk(mkResp)(result).Unpack()
+
+	case <-s.quit:
+		return nil, fmt.Errorf("server shutting down")
+	}
 }

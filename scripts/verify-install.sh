@@ -21,7 +21,7 @@ MIN_REQUIRED_SIGNATURES=5
 KEYS=()
 KEYS+=("F4FC70F07310028424EFC20A8E4256593F177720 guggero")
 KEYS+=("15E7ECF257098A4EF91655EB4CA7FE54A6213C91 carlaKC")
-KEYS+=("E4D85299674B2D31FAA1892E372CBD7633C61696 roasbeef")
+KEYS+=("A5B61896952D9FDA83BC054CDC42612E89237182 roasbeef")
 KEYS+=("729E9D9D92C75A5FBFEEE057B5DD717BEF7CA5B1 wpaulino")
 KEYS+=("7E81EF6B9989A9CC93884803118759E83439A9B1 Crypt-iQ")
 KEYS+=("9FC6B0BFD597A94DBF09708280E5375C094198D8 bhandras")
@@ -30,6 +30,12 @@ KEYS+=("EB13A98091E8D67CDD7FC5A7E9FE7FE00AD163A4 positiveblue")
 KEYS+=("26984CB69EB8C4A26196F7A4D7D916376026F177 ellemouton")
 KEYS+=("FE5E159A70C436D6AF4D2887B1F8848557AA29D2 ffranr")
 KEYS+=("4DC235556B18694E08518DBB671103D881A5F0E4 sputn1ck")
+KEYS+=("187F6ADD93AE3B0CF335AA6AB984570980684DCC ViktorTigerstrom")
+KEYS+=("E85497D2DBA0EB9ADB0024279BCD95C4FF296868 yyforyongyu")
+KEYS+=("32F7EA1E7A0339F7D37164B9F82D456EA023C9BF hieblmi")
+KEYS+=("5295A477FFC8064D7057B191FA7E65C951F12439 proofofkeags")
+KEYS+=("3E9BD4436C288039CA827A9200C9E2BC2E45666F suheb")
+KEYS+=("5F75437E11695F86D50C11BB1AFF9C4DCED6D666 ziggie1984")
 
 TEMP_DIR=$(mktemp -d /tmp/lnd-sig-verification-XXXXXX)
 
@@ -65,8 +71,8 @@ function import_keys() {
     USERNAME=$(echo $key | cut -d' ' -f2)
     IMPORT_FILE="keys/$USERNAME.asc"
     KEY_FILE="$DIR/$IMPORT_FILE"
-    KEYRING_UNTRUSTED="$TEMP_DIR/$USERNAME.pgp-untrusted"
-    KEYRING_TRUSTED="$TEMP_DIR/$USERNAME.pgp"
+    KEYRING_UNTRUSTED="$USERNAME.pgp-untrusted"
+    KEYRING_TRUSTED="$USERNAME.pgp"
 
     # Because a key file could contain multiple keys, we need to be careful. To
     # make sure we only import and use the key with the hard coded key ID of
@@ -78,14 +84,14 @@ function import_keys() {
     # few lines.
     echo ""
     echo "Importing key(s) from $KEY_FILE into temporary keyring $KEYRING_UNTRUSTED"
-    gpg --no-default-keyring --keyring "$KEYRING_UNTRUSTED" \
+    gpg --homedir "$TEMP_DIR" --no-default-keyring --keyring "$KEYRING_UNTRUSTED" \
       --import < "$KEY_FILE"
 
     echo ""
     echo "Exporting key $KEY_ID from untrusted keyring to trusted keyring $KEYRING_TRUSTED"
-    gpg --no-default-keyring --keyring "$KEYRING_UNTRUSTED" \
+    gpg --homedir "$TEMP_DIR" --no-default-keyring --keyring "$KEYRING_UNTRUSTED" \
       --export "$KEY_ID" | \
-      gpg --no-default-keyring --keyring "$KEYRING_TRUSTED" --import
+      gpg --homedir "$TEMP_DIR" --no-default-keyring --keyring "$KEYRING_TRUSTED" --import
 
   done
 }
@@ -136,8 +142,8 @@ function verify_signatures() {
     USERNAME=${USERNAME##manifest-}
 
     # If the user is known, they should have a key ring file with only their key.
-    KEYRING="$TEMP_DIR/$USERNAME.pgp"
-    if [[ ! -f "$KEYRING" ]]; then
+    KEYRING="$USERNAME.pgp"
+    if [[ ! -f "$TEMP_DIR/$KEYRING" ]]; then
       echo "User $USERNAME does not have a known key, skipping"
       continue
     fi
@@ -155,7 +161,7 @@ function verify_signatures() {
     fi
 
     # Run the actual verification.
-    gpg --no-default-keyring --keyring "$KEYRING" --status-fd=1 \
+    gpg --homedir "$TEMP_DIR" --no-default-keyring --keyring "$KEYRING" --status-fd=1 \
       --verify "$TEMP_DIR/$signature" "$TEMP_DIR/$MANIFEST" \
       > "$STATUS_FILE" 2>&1 || { echo "ERROR: Invalid signature!"; exit 1; } 
 

@@ -1,12 +1,14 @@
 package invoicesrpc
 
 import (
+	"cmp"
 	"encoding/hex"
 	"fmt"
+	"slices"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/zpay32"
@@ -16,7 +18,7 @@ import (
 // because not all information is stored in dedicated invoice fields. If there
 // is no payment request present, a dummy request will be returned. This can
 // happen with just-in-time inserted keysend invoices.
-func decodePayReq(invoice *channeldb.Invoice,
+func decodePayReq(invoice *invoices.Invoice,
 	activeNetParams *chaincfg.Params) (*zpay32.Invoice, error) {
 
 	paymentRequest := string(invoice.PaymentRequest)
@@ -40,8 +42,8 @@ func decodePayReq(invoice *channeldb.Invoice,
 	return decoded, nil
 }
 
-// CreateRPCInvoice creates an *lnrpc.Invoice from the *channeldb.Invoice.
-func CreateRPCInvoice(invoice *channeldb.Invoice,
+// CreateRPCInvoice creates an *lnrpc.Invoice from the *invoices.Invoice.
+func CreateRPCInvoice(invoice *invoices.Invoice,
 	activeNetParams *chaincfg.Params) (*lnrpc.Invoice, error) {
 
 	decoded, err := decodePayReq(invoice, activeNetParams)
@@ -76,18 +78,22 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 	satAmt := invoice.Terms.Value.ToSatoshis()
 	satAmtPaid := invoice.AmtPaid.ToSatoshis()
 
-	isSettled := invoice.State == channeldb.ContractSettled
+	isSettled := invoice.State == invoices.ContractSettled
 
 	var state lnrpc.Invoice_InvoiceState
 	switch invoice.State {
-	case channeldb.ContractOpen:
+	case invoices.ContractOpen:
 		state = lnrpc.Invoice_OPEN
-	case channeldb.ContractSettled:
+
+	case invoices.ContractSettled:
 		state = lnrpc.Invoice_SETTLED
-	case channeldb.ContractCanceled:
+
+	case invoices.ContractCanceled:
 		state = lnrpc.Invoice_CANCELED
-	case channeldb.ContractAccepted:
+
+	case invoices.ContractAccepted:
 		state = lnrpc.Invoice_ACCEPTED
+
 	default:
 		return nil, fmt.Errorf("unknown invoice state %v",
 			invoice.State)
@@ -97,11 +103,11 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 	for key, htlc := range invoice.Htlcs {
 		var state lnrpc.InvoiceHTLCState
 		switch htlc.State {
-		case channeldb.HtlcStateAccepted:
+		case invoices.HtlcStateAccepted:
 			state = lnrpc.InvoiceHTLCState_ACCEPTED
-		case channeldb.HtlcStateSettled:
+		case invoices.HtlcStateSettled:
 			state = lnrpc.InvoiceHTLCState_SETTLED
-		case channeldb.HtlcStateCanceled:
+		case invoices.HtlcStateCanceled:
 			state = lnrpc.InvoiceHTLCState_CANCELED
 		default:
 			return nil, fmt.Errorf("unknown state %v", htlc.State)
@@ -118,6 +124,16 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 			CustomRecords:   htlc.CustomRecords,
 			MppTotalAmtMsat: uint64(htlc.MppTotalAmt),
 		}
+
+		// The custom channel data is currently just the raw bytes of
+		// the encoded custom records.
+		customData, err := lnwire.CustomRecords(
+			htlc.CustomRecords,
+		).Serialize()
+		if err != nil {
+			return nil, err
+		}
+		rpcHtlc.CustomChannelData = customData
 
 		// Populate any fields relevant to AMP payments.
 		if htlc.AMP != nil {
@@ -139,14 +155,17 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 		}
 
 		// Only report resolved times if htlc is resolved.
-		if htlc.State != channeldb.HtlcStateAccepted {
+		if htlc.State != invoices.HtlcStateAccepted {
 			rpcHtlc.ResolveTime = htlc.ResolveTime.Unix()
 		}
 
 		rpcHtlcs = append(rpcHtlcs, &rpcHtlc)
 	}
 
-	isAmp := invoice.Terms.Features.HasFeature(lnwire.AMPOptional)
+	// Perform an inplace sort of the HTLCs to ensure they are ordered.
+	slices.SortFunc(rpcHtlcs, func(i, j *lnrpc.InvoiceHTLC) int {
+		return cmp.Compare(i.HtlcIndex, j.HtlcIndex)
+	})
 
 	rpcInvoice := &lnrpc.Invoice{
 		Memo:            string(invoice.Memo),
@@ -171,9 +190,10 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 		State:           state,
 		Htlcs:           rpcHtlcs,
 		Features:        CreateRPCFeatures(invoice.Terms.Features),
-		IsKeysend:       len(invoice.PaymentRequest) == 0 && !isAmp,
+		IsKeysend:       invoice.IsKeysend(),
 		PaymentAddr:     invoice.Terms.PaymentAddr[:],
-		IsAmp:           isAmp,
+		IsAmp:           invoice.IsAMP(),
+		IsBlinded:       invoice.IsBlinded(),
 	}
 
 	rpcInvoice.AmpInvoiceState = make(map[string]*lnrpc.AMPInvoiceState)
@@ -182,11 +202,11 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 
 		var state lnrpc.InvoiceHTLCState
 		switch ampState.State {
-		case channeldb.HtlcStateAccepted:
+		case invoices.HtlcStateAccepted:
 			state = lnrpc.InvoiceHTLCState_ACCEPTED
-		case channeldb.HtlcStateSettled:
+		case invoices.HtlcStateSettled:
 			state = lnrpc.InvoiceHTLCState_SETTLED
-		case channeldb.HtlcStateCanceled:
+		case invoices.HtlcStateCanceled:
 			state = lnrpc.InvoiceHTLCState_CANCELED
 		default:
 			return nil, fmt.Errorf("unknown state %v", ampState.State)
@@ -202,7 +222,7 @@ func CreateRPCInvoice(invoice *channeldb.Invoice,
 		// If at least one of the present HTLC sets show up as being
 		// settled, then we'll mark the invoice itself as being
 		// settled.
-		if ampState.State == channeldb.HtlcStateSettled {
+		if ampState.State == invoices.HtlcStateSettled {
 			rpcInvoice.Settled = true // nolint:staticcheck
 			rpcInvoice.State = lnrpc.Invoice_SETTLED
 		}
@@ -262,6 +282,60 @@ func CreateRPCRouteHints(routeHints [][]zpay32.HopHint) []*lnrpc.RouteHint {
 	}
 
 	return res
+}
+
+// CreateRPCBlindedPayments takes a set of zpay32.BlindedPaymentPath and
+// converts them into a set of lnrpc.BlindedPaymentPaths.
+func CreateRPCBlindedPayments(blindedPaths []*zpay32.BlindedPaymentPath) (
+	[]*lnrpc.BlindedPaymentPath, error) {
+
+	var res []*lnrpc.BlindedPaymentPath
+	for _, path := range blindedPaths {
+		features := path.Features.Features()
+		var featuresSlice []lnrpc.FeatureBit
+		for feature := range features {
+			featuresSlice = append(
+				featuresSlice, lnrpc.FeatureBit(feature),
+			)
+		}
+
+		if len(path.Hops) == 0 {
+			return nil, fmt.Errorf("each blinded path must " +
+				"contain at least one hop")
+		}
+
+		var hops []*lnrpc.BlindedHop
+		for _, hop := range path.Hops {
+			blindedNodeID := hop.BlindedNodePub.
+				SerializeCompressed()
+			hops = append(hops, &lnrpc.BlindedHop{
+				BlindedNode:   blindedNodeID,
+				EncryptedData: hop.CipherText,
+			})
+		}
+
+		introNode := path.Hops[0].BlindedNodePub
+		firstBlindingPoint := path.FirstEphemeralBlindingPoint
+
+		blindedPath := &lnrpc.BlindedPath{
+			IntroductionNode: introNode.SerializeCompressed(),
+			BlindingPoint: firstBlindingPoint.
+				SerializeCompressed(),
+			BlindedHops: hops,
+		}
+
+		res = append(res, &lnrpc.BlindedPaymentPath{
+			BlindedPath:         blindedPath,
+			BaseFeeMsat:         uint64(path.FeeBaseMsat),
+			ProportionalFeeRate: path.FeeRate,
+			TotalCltvDelta:      uint32(path.CltvExpiryDelta),
+			HtlcMinMsat:         path.HTLCMinMsat,
+			HtlcMaxMsat:         path.HTLCMaxMsat,
+			Features:            featuresSlice,
+		})
+	}
+
+	return res, nil
 }
 
 // CreateZpay32HopHints takes in the lnrpc form of route hints and converts them

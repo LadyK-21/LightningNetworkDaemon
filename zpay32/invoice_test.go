@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,9 +16,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	sphinx "github.com/lightningnetwork/lightning-onion"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwire"
-	litecoinCfg "github.com/ltcsuite/ltcd/chaincfg"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -105,12 +105,8 @@ var (
 	testMessageSigner = MessageSigner{
 		SignCompact: func(msg []byte) ([]byte, error) {
 			hash := chainhash.HashB(msg)
-			sig, err := ecdsa.SignCompact(testPrivKey, hash, true)
-			if err != nil {
-				return nil, fmt.Errorf("can't sign the "+
-					"message: %v", err)
-			}
-			return sig, nil
+
+			return ecdsa.SignCompact(testPrivKey, hash, true), nil
 		},
 	}
 
@@ -119,27 +115,72 @@ var (
 	// Must be initialized in init().
 	testDescriptionHash [32]byte
 
-	ltcTestNetParams chaincfg.Params
-	ltcMainNetParams chaincfg.Params
+	testBlindedPK1Bytes, _ = hex.DecodeString("03f3311e948feb5115242c4e39" +
+		"6c81c448ab7ee5fd24c4e24e66c73533cc4f98b8")
+	testBlindedHopPK1, _   = btcec.ParsePubKey(testBlindedPK1Bytes)
+	testBlindedPK2Bytes, _ = hex.DecodeString("03a8c97ed5cd40d474e4ef18c8" +
+		"99854b25e5070106504cb225e6d2c112d61a805e")
+	testBlindedHopPK2, _   = btcec.ParsePubKey(testBlindedPK2Bytes)
+	testBlindedPK3Bytes, _ = hex.DecodeString("0220293926219d8efe733336e2" +
+		"b674570dd96aa763acb3564e6e367b384d861a0a")
+	testBlindedHopPK3, _   = btcec.ParsePubKey(testBlindedPK3Bytes)
+	testBlindedPK4Bytes, _ = hex.DecodeString("02c75eb336a038294eaaf76015" +
+		"8b2e851c3c0937262e35401ae64a1bee71a2e40c")
+	testBlindedHopPK4, _ = btcec.ParsePubKey(testBlindedPK4Bytes)
+
+	blindedPath1 = &BlindedPaymentPath{
+		FeeBaseMsat:                 40,
+		FeeRate:                     20,
+		CltvExpiryDelta:             130,
+		HTLCMinMsat:                 2,
+		HTLCMaxMsat:                 100,
+		Features:                    lnwire.EmptyFeatureVector(),
+		FirstEphemeralBlindingPoint: testBlindedHopPK1,
+		Hops: []*sphinx.BlindedHopInfo{
+			{
+				BlindedNodePub: testBlindedHopPK2,
+				CipherText:     []byte{1, 2, 3, 4, 5},
+			},
+			{
+				BlindedNodePub: testBlindedHopPK3,
+				CipherText:     []byte{5, 4, 3, 2, 1},
+			},
+			{
+				BlindedNodePub: testBlindedHopPK4,
+				CipherText: []byte{
+					1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+					11, 12, 13, 14,
+				},
+			},
+		},
+	}
+
+	blindedPath2 = &BlindedPaymentPath{
+		FeeBaseMsat:                 4,
+		FeeRate:                     2,
+		CltvExpiryDelta:             10,
+		HTLCMinMsat:                 0,
+		HTLCMaxMsat:                 10,
+		Features:                    lnwire.EmptyFeatureVector(),
+		FirstEphemeralBlindingPoint: testBlindedHopPK4,
+		Hops: []*sphinx.BlindedHopInfo{
+			{
+				BlindedNodePub: testBlindedHopPK3,
+				CipherText:     []byte{1, 2, 3, 4, 5},
+			},
+		},
+	}
 )
 
 func init() {
 	copy(testDescriptionHash[:], testDescriptionHashSlice[:])
-
-	// Initialize litecoin testnet and mainnet params by applying key fields
-	// to copies of bitcoin params.
-	// TODO(sangaman): create an interface for chaincfg.params
-	ltcTestNetParams = chaincfg.TestNet3Params
-	ltcTestNetParams.Net = wire.BitcoinNet(litecoinCfg.TestNet4Params.Net)
-	ltcTestNetParams.Bech32HRPSegwit = litecoinCfg.TestNet4Params.Bech32HRPSegwit
-	ltcMainNetParams = chaincfg.MainNetParams
-	ltcMainNetParams.Net = wire.BitcoinNet(litecoinCfg.MainNetParams.Net)
-	ltcMainNetParams.Bech32HRPSegwit = litecoinCfg.MainNetParams.Bech32HRPSegwit
 }
 
 // TestDecodeEncode tests that an encoded invoice gets decoded into the expected
 // Invoice object, and that reencoding the decoded invoice gets us back to the
 // original encoded string.
+//
+//nolint:ll
 func TestDecodeEncode(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +188,7 @@ func TestDecodeEncode(t *testing.T) {
 		encodedInvoice string
 		valid          bool
 		decodedInvoice func() *Invoice
+		decodeOpts     []DecodeOption
 		skipEncoding   bool
 		beforeEncoding func(*Invoice)
 	}{
@@ -517,7 +559,7 @@ func TestDecodeEncode(t *testing.T) {
 					MilliSat:    &testMillisat25mBTC,
 					Timestamp:   time.Unix(1496314658, 0),
 					PaymentHash: &testPaymentHash,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Description: &testCoffeeBeans,
 					Destination: testPubKey,
 					Features: lnwire.NewFeatureVector(
@@ -544,7 +586,7 @@ func TestDecodeEncode(t *testing.T) {
 					MilliSat:    &testMillisat25mBTC,
 					Timestamp:   time.Unix(1496314658, 0),
 					PaymentHash: &testPaymentHash,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Description: &testCoffeeBeans,
 					Destination: testPubKey,
 					Features: lnwire.NewFeatureVector(
@@ -662,39 +704,6 @@ func TestDecodeEncode(t *testing.T) {
 			skipEncoding: true, // Skip encoding since we were given the wrong net
 		},
 		{
-			// Decode a litecoin testnet invoice
-			encodedInvoice: "lntltc241pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66m2eq2fx9uctzkmj30meaghyskkgsd6geap5qg9j2ae444z24a4p8xg3a6g73p8l7d689vtrlgzj0wyx2h6atq8dfty7wmkt4frx9g9sp730h5a",
-			valid:          true,
-			decodedInvoice: func() *Invoice {
-				return &Invoice{
-					// TODO(sangaman): create an interface for chaincfg.params
-					Net:             &ltcTestNetParams,
-					MilliSat:        &testMillisat24BTC,
-					Timestamp:       time.Unix(1496314658, 0),
-					PaymentHash:     &testPaymentHash,
-					DescriptionHash: &testDescriptionHash,
-					Destination:     testPubKey,
-					Features:        emptyFeatures,
-				}
-			},
-		},
-		{
-			// Decode a litecoin mainnet invoice
-			encodedInvoice: "lnltc241pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66859t2d55efrxdlgqg9hdqskfstdmyssdw4fjc8qdl522ct885pqk7acn2aczh0jeht0xhuhnkmm3h0qsrxedlwm9x86787zzn4qwwwcpjkl3t2",
-			valid:          true,
-			decodedInvoice: func() *Invoice {
-				return &Invoice{
-					Net:             &ltcMainNetParams,
-					MilliSat:        &testMillisat24BTC,
-					Timestamp:       time.Unix(1496314658, 0),
-					PaymentHash:     &testPaymentHash,
-					DescriptionHash: &testDescriptionHash,
-					Destination:     testPubKey,
-					Features:        emptyFeatures,
-				}
-			},
-		},
-		{
 			// Please send 0.01 BTC with payment metadata 0x01fafaf0.
 			encodedInvoice: "lnbc10m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdp9wpshjmt9de6zqmt9w3skgct5vysxjmnnd9jx2mq8q8a04uqsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q2gqqqqqqsgq7hf8he7ecf7n4ffphs6awl9t6676rrclv9ckg3d3ncn7fct63p6s365duk5wrk202cfy3aj5xnnp5gs3vrdvruverwwq7yzhkf5a3xqpd05wjc",
 			valid:          true,
@@ -706,7 +715,7 @@ func TestDecodeEncode(t *testing.T) {
 					PaymentHash: &testPaymentHash,
 					Description: &testPaymentMetadata,
 					Destination: testPubKey,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Features: lnwire.NewFeatureVector(
 						lnwire.NewRawFeatureVector(8, 14, 48),
 						lnwire.Features,
@@ -721,52 +730,143 @@ func TestDecodeEncode(t *testing.T) {
 				i.Destination = nil
 			},
 		},
+		{
+			// Invoice with blinded payment paths.
+			encodedInvoice: "lnbc20m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4js5fdqqqqq2qqqqqpgqyzqqqqqqqqqqqqyqqqqqqqqqqqvsqqqqlnxy0ffrlt2y2jgtzw89kgr3zg4dlwtlfycn3yuek8x5eucnuchqps82xf0m2u6sx5wnjw7xxgnxz5kf09quqsv5zvkgj7d5kpzttp4qz7q5qsyqcyq5pzq2feycsemrh7wvendc4kw3tsmkt25a36ev6kfehrv7ecfkrp5zs9q5zqxqspqtr4avek5quzjn427asptzews5wrczfhychr2sq6ue9phmn35tjqcrspqgpsgpgxquyqjzstpsxsu59zqqqqqpqqqqqqyqq2qqqqqqqqqqqqqqqqqqqqqqqqpgqqqqk8t6endgpc99824amqzk9japgu8synwf3wx4qp4ej2r0h8rghypsqsygpf8ynzr8vwleenxdhzke69wrwed2nk8t9n2e8xudnm8pxcvxs2q5qsyqcyq5y4rdlhtf84f8rgdj34275juwls2ftxtcfh035863q3p9k6s94hpxhdmzfn5gxpsazdznxs56j4vt3fdhe00g9v2l3szher50hp4xlggqkxf77f",
+			valid:          true,
+			decodedInvoice: func() *Invoice {
+				return &Invoice{
+					Net:         &chaincfg.MainNetParams,
+					MilliSat:    &testMillisat20mBTC,
+					Timestamp:   time.Unix(1496314658, 0),
+					PaymentHash: &testPaymentHash,
+					Description: &testCupOfCoffee,
+					Destination: testPubKey,
+					Features:    emptyFeatures,
+					BlindedPaymentPaths: []*BlindedPaymentPath{
+						blindedPath1,
+						blindedPath2,
+					},
+				}
+			},
+			beforeEncoding: func(i *Invoice) {
+				// Since this destination pubkey was recovered
+				// from the signature, we must set it nil before
+				// encoding to get back the same invoice string.
+				i.Destination = nil
+			},
+		},
+		{
+			// Invoice with unknown feature bits but since the
+			// WithErrorOnUnknownFeatureBit option is not provided,
+			// it is not expected to error out.
+			encodedInvoice: "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q4psqqqqqqqqqqqqqqqpqsqq40wa3khl49yue3zsgm26jrepqr2eghqlx86rttutve3ugd05em86nsefzh4pfurpd9ek9w2vp95zxqnfe2u7ckudyahsa52q66tgzcp6t2dyk",
+			valid:          true,
+			skipEncoding:   true,
+			decodedInvoice: func() *Invoice {
+				return &Invoice{
+					Net:         &chaincfg.MainNetParams,
+					MilliSat:    &testMillisat25mBTC,
+					Timestamp:   time.Unix(1496314658, 0),
+					PaymentHash: &testPaymentHash,
+					PaymentAddr: fn.Some(specPaymentAddr),
+					Description: &testCoffeeBeans,
+					Destination: testPubKey,
+					Features: lnwire.NewFeatureVector(
+						lnwire.NewRawFeatureVector(
+							9, 15, 99, 100,
+						),
+						lnwire.Features,
+					),
+				}
+			},
+			decodeOpts: []DecodeOption{
+				WithKnownFeatureBits(map[lnwire.FeatureBit]string{
+					9:  "9",
+					15: "15",
+					99: "99",
+				}),
+			},
+		},
+		{
+			// Invoice with unknown feature bits with option set to
+			// error out on unknown feature bit.
+			encodedInvoice: "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q4psqqqqqqqqqqqqqqqpqsqq40wa3khl49yue3zsgm26jrepqr2eghqlx86rttutve3ugd05em86nsefzh4pfurpd9ek9w2vp95zxqnfe2u7ckudyahsa52q66tgzcp6t2dyk",
+			valid:          false,
+			skipEncoding:   true,
+			decodedInvoice: func() *Invoice {
+				return &Invoice{
+					Net:         &chaincfg.MainNetParams,
+					MilliSat:    &testMillisat25mBTC,
+					Timestamp:   time.Unix(1496314658, 0),
+					PaymentHash: &testPaymentHash,
+					PaymentAddr: fn.Some(specPaymentAddr),
+					Description: &testCoffeeBeans,
+					Destination: testPubKey,
+					Features: lnwire.NewFeatureVector(
+						lnwire.NewRawFeatureVector(
+							9, 15, 99, 100,
+						),
+						lnwire.Features,
+					),
+				}
+			},
+			decodeOpts: []DecodeOption{
+				WithKnownFeatureBits(map[lnwire.FeatureBit]string{
+					9:  "9",
+					15: "15",
+					99: "99",
+				}),
+				WithErrorOnUnknownFeatureBit(),
+			},
+		},
 	}
 
 	for i, test := range tests {
-		var decodedInvoice *Invoice
-		net := &chaincfg.MainNetParams
-		if test.decodedInvoice != nil {
-			decodedInvoice = test.decodedInvoice()
-			net = decodedInvoice.Net
-		}
+		test := test
 
-		invoice, err := Decode(test.encodedInvoice, net)
-		if (err == nil) != test.valid {
-			t.Errorf("Decoding test %d failed: %v", i, err)
-			return
-		}
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			t.Parallel()
 
-		if test.valid {
-			if err := compareInvoices(decodedInvoice, invoice); err != nil {
-				t.Errorf("Invoice decoding result %d not as expected: %v", i, err)
+			var decodedInvoice *Invoice
+			net := &chaincfg.MainNetParams
+			if test.decodedInvoice != nil {
+				decodedInvoice = test.decodedInvoice()
+				net = decodedInvoice.Net
+			}
+
+			invoice, err := Decode(
+				test.encodedInvoice, net, test.decodeOpts...,
+			)
+			if !test.valid {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, decodedInvoice, invoice)
+			}
+
+			if test.skipEncoding {
 				return
 			}
-		}
 
-		if test.skipEncoding {
-			continue
-		}
+			if test.beforeEncoding != nil {
+				test.beforeEncoding(decodedInvoice)
+			}
 
-		if test.beforeEncoding != nil {
-			test.beforeEncoding(decodedInvoice)
-		}
+			if decodedInvoice == nil {
+				return
+			}
 
-		if decodedInvoice != nil {
 			reencoded, err := decodedInvoice.Encode(
 				testMessageSigner,
 			)
-			if (err == nil) != test.valid {
-				t.Errorf("Encoding test %d failed: %v", i, err)
+			if !test.valid {
+				require.Error(t, err)
 				return
 			}
-
-			if test.valid && test.encodedInvoice != reencoded {
-				t.Errorf("Encoding %d failed, expected %v, got %v",
-					i, test.encodedInvoice, reencoded)
-				return
-			}
-		}
+			require.NoError(t, err)
+			require.Equal(t, test.encodedInvoice, reencoded)
+		})
 	}
 }
 
@@ -854,48 +954,41 @@ func TestNewInvoice(t *testing.T) {
 			encodedInvoice: "lnbcrt241pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdqqnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66df5c8pqjjt4z4ymmuaxfx8eh5v7hmzs3wrfas8m2sz5qz56rw2lxy8mmgm4xln0ha26qkw6u3vhu22pss2udugr9g74c3x20slpcqjgq0el4h6",
 		},
 		{
-			// Create a litecoin testnet invoice
+			// Mainnet invoice with two blinded paths.
 			newInvoice: func() (*Invoice, error) {
-				return NewInvoice(&ltcTestNetParams,
-					testPaymentHash, time.Unix(1496314658, 0),
-					Amount(testMillisat24BTC),
-					DescriptionHash(testDescriptionHash),
-					Destination(testPubKey))
+				return NewInvoice(&chaincfg.MainNetParams,
+					testPaymentHash,
+					time.Unix(1496314658, 0),
+					Amount(testMillisat20mBTC),
+					Description(testCupOfCoffee),
+					WithBlindedPaymentPath(blindedPath1),
+					WithBlindedPaymentPath(blindedPath2),
+				)
 			},
-			valid:          true,
-			encodedInvoice: "lntltc241pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66m2eq2fx9uctzkmj30meaghyskkgsd6geap5qg9j2ae444z24a4p8xg3a6g73p8l7d689vtrlgzj0wyx2h6atq8dfty7wmkt4frx9g9sp730h5a",
-		},
-		{
-			// Create a litecoin mainnet invoice
-			newInvoice: func() (*Invoice, error) {
-				return NewInvoice(&ltcMainNetParams,
-					testPaymentHash, time.Unix(1496314658, 0),
-					Amount(testMillisat24BTC),
-					DescriptionHash(testDescriptionHash),
-					Destination(testPubKey))
-			},
-			valid:          true,
-			encodedInvoice: "lnltc241pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsnp4q0n326hr8v9zprg8gsvezcch06gfaqqhde2aj730yg0durunfhv66859t2d55efrxdlgqg9hdqskfstdmyssdw4fjc8qdl522ct885pqk7acn2aczh0jeht0xhuhnkmm3h0qsrxedlwm9x86787zzn4qwwwcpjkl3t2",
+			valid: true,
+			//nolint:ll
+			encodedInvoice: "lnbc20m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4js5fdqqqqq2qqqqqpgqyzqqqqqqqqqqqqyqqqqqqqqqqqvsqqqqlnxy0ffrlt2y2jgtzw89kgr3zg4dlwtlfycn3yuek8x5eucnuchqps82xf0m2u6sx5wnjw7xxgnxz5kf09quqsv5zvkgj7d5kpzttp4qz7q5qsyqcyq5pzq2feycsemrh7wvendc4kw3tsmkt25a36ev6kfehrv7ecfkrp5zs9q5zqxqspqtr4avek5quzjn427asptzews5wrczfhychr2sq6ue9phmn35tjqcrspqgpsgpgxquyqjzstpsxsu59zqqqqqpqqqqqqyqq2qqqqqqqqqqqqqqqqqqqqqqqqpgqqqqk8t6endgpc99824amqzk9japgu8synwf3wx4qp4ej2r0h8rghypsqsygpf8ynzr8vwleenxdhzke69wrwed2nk8t9n2e8xudnm8pxcvxs2q5qsyqcyq5y4rdlhtf84f8rgdj34275juwls2ftxtcfh035863q3p9k6s94hpxhdmzfn5gxpsazdznxs56j4vt3fdhe00g9v2l3szher50hp4xlggqkxf77f",
 		},
 	}
 
 	for i, test := range tests {
+		test := test
 
-		invoice, err := test.newInvoice()
-		if err != nil && !test.valid {
-			continue
-		}
-		encoded, err := invoice.Encode(testMessageSigner)
-		if (err == nil) != test.valid {
-			t.Errorf("NewInvoice test %d failed: %v", i, err)
-			return
-		}
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			t.Parallel()
 
-		if test.valid && test.encodedInvoice != encoded {
-			t.Errorf("Encoding %d failed, expected %v, got %v",
-				i, test.encodedInvoice, encoded)
-			return
-		}
+			invoice, err := test.newInvoice()
+			if !test.valid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			encoded, err := invoice.Encode(testMessageSigner)
+			require.NoError(t, err)
+
+			require.Equal(t, test.encodedInvoice, encoded)
+		})
 	}
 }
 
@@ -946,7 +1039,7 @@ func TestInvoiceChecksumMalleability(t *testing.T) {
 	msgSigner := MessageSigner{
 		SignCompact: func(msg []byte) ([]byte, error) {
 			hash := chainhash.HashB(msg)
-			return ecdsa.SignCompact(privKey, hash, true)
+			return ecdsa.SignCompact(privKey, hash, true), nil
 		},
 	}
 	opts := []func(*Invoice){Description("test")}
@@ -979,73 +1072,6 @@ func TestInvoiceChecksumMalleability(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Did not get expected error when decoding invoice")
 	}
-}
-
-func compareInvoices(expected, actual *Invoice) error {
-	if !reflect.DeepEqual(expected.Net, actual.Net) {
-		return fmt.Errorf("expected net %v, got %v",
-			expected.Net, actual.Net)
-	}
-
-	if !reflect.DeepEqual(expected.MilliSat, actual.MilliSat) {
-		return fmt.Errorf("expected milli sat %d, got %d",
-			*expected.MilliSat, *actual.MilliSat)
-	}
-
-	if expected.Timestamp != actual.Timestamp {
-		return fmt.Errorf("expected timestamp %v, got %v",
-			expected.Timestamp, actual.Timestamp)
-	}
-
-	if !compareHashes(expected.PaymentHash, actual.PaymentHash) {
-		return fmt.Errorf("expected payment hash %x, got %x",
-			*expected.PaymentHash, *actual.PaymentHash)
-	}
-
-	if !reflect.DeepEqual(expected.Description, actual.Description) {
-		return fmt.Errorf("expected description \"%s\", got \"%s\"",
-			*expected.Description, *actual.Description)
-	}
-
-	if !comparePubkeys(expected.Destination, actual.Destination) {
-		return fmt.Errorf("expected destination pubkey %x, got %x",
-			expected.Destination.SerializeCompressed(),
-			actual.Destination.SerializeCompressed())
-	}
-
-	if !compareHashes(expected.DescriptionHash, actual.DescriptionHash) {
-		return fmt.Errorf("expected description hash %x, got %x",
-			*expected.DescriptionHash, *actual.DescriptionHash)
-	}
-
-	if expected.Expiry() != actual.Expiry() {
-		return fmt.Errorf("expected expiry %d, got %d",
-			expected.Expiry(), actual.Expiry())
-	}
-
-	if !reflect.DeepEqual(expected.FallbackAddr, actual.FallbackAddr) {
-		return fmt.Errorf("expected FallbackAddr %v, got %v",
-			expected.FallbackAddr, actual.FallbackAddr)
-	}
-
-	if len(expected.RouteHints) != len(actual.RouteHints) {
-		return fmt.Errorf("expected %d RouteHints, got %d",
-			len(expected.RouteHints), len(actual.RouteHints))
-	}
-
-	for i, routeHint := range expected.RouteHints {
-		err := compareRouteHints(routeHint, actual.RouteHints[i])
-		if err != nil {
-			return err
-		}
-	}
-
-	if !reflect.DeepEqual(expected.Features, actual.Features) {
-		return fmt.Errorf("expected features %v, got %v",
-			expected.Features, actual.Features)
-	}
-
-	return nil
 }
 
 func comparePubkeys(a, b *btcec.PublicKey) bool {

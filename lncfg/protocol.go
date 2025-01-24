@@ -1,13 +1,17 @@
-//go:build !rpctest
-// +build !rpctest
+//go:build !integration
 
 package lncfg
+
+import (
+	"github.com/lightningnetwork/lnd/feature"
+	"github.com/lightningnetwork/lnd/lnwire"
+)
 
 // ProtocolOptions is a struct that we use to be able to test backwards
 // compatibility of protocol additions, while defaulting to the latest within
 // lnd, or to enable experimental protocol changes.
 //
-// nolint:lll
+//nolint:ll
 type ProtocolOptions struct {
 	// LegacyProtocol is a sub-config that houses all the legacy protocol
 	// options.  These are mostly used for integration tests as most modern
@@ -22,6 +26,14 @@ type ProtocolOptions struct {
 	// (channels larger than 0.16 BTC) channels, which is the opposite of
 	// mini.
 	WumboChans bool `long:"wumbo-channels" description:"if set, then lnd will create and accept requests for channels larger chan 0.16 BTC"`
+
+	// TaprootChans should be set if we want to enable support for the
+	// experimental simple taproot chans commitment type.
+	TaprootChans bool `long:"simple-taproot-chans" description:"if set, then lnd will create and accept requests for channels using the simple taproot commitment type"`
+
+	// TaprootOverlayChans should be set if we want to enable support for
+	// the experimental taproot overlay chan type.
+	TaprootOverlayChans bool `long:"simple-taproot-overlay-chans" description:"if set, then lnd will create and accept requests for channels using the taproot overlay commitment type"`
 
 	// NoAnchors should be set if we don't want to support opening or accepting
 	// channels having the anchor commitment type.
@@ -43,7 +55,37 @@ type ProtocolOptions struct {
 
 	// NoOptionAnySegwit should be set to true if we don't want to use any
 	// Taproot (and beyond) addresses for co-op closing.
-	NoOptionAnySegwit bool `long:"no-any-segwit" description:"disallow using any segiwt witness version as a co-op close address"`
+	NoOptionAnySegwit bool `long:"no-any-segwit" description:"disallow using any segwit witness version as a co-op close address"`
+
+	// NoTimestampQueryOption should be set to true if we don't want our
+	// syncing peers to also send us the timestamps of announcement messages
+	// when we send them a channel range query. Setting this to true will
+	// also mean that we won't respond with timestamps if requested by our
+	// peers.
+	NoTimestampQueryOption bool `long:"no-timestamp-query-option" description:"do not query syncing peers for announcement timestamps and do not respond with timestamps if requested"`
+
+	// NoRouteBlindingOption disables forwarding of payments in blinded routes.
+	NoRouteBlindingOption bool `long:"no-route-blinding" description:"do not forward payments that are a part of a blinded route"`
+
+	// NoExperimentalEndorsementOption disables experimental endorsement.
+	NoExperimentalEndorsementOption bool `long:"no-experimental-endorsement" description:"do not forward experimental endorsement signals"`
+
+	// CustomMessage allows the custom message APIs to handle messages with
+	// the provided protocol numbers, which fall outside the custom message
+	// number range.
+	CustomMessage []uint16 `long:"custom-message" description:"allows the custom message apis to send and report messages with the protocol number provided that fall outside of the custom message number range."`
+
+	// CustomInit specifies feature bits to advertise in the node's init
+	// message.
+	CustomInit []uint16 `long:"custom-init" description:"custom feature bits — numbers defined in BOLT 9 — to advertise in the node's init message"`
+
+	// CustomNodeAnn specifies custom feature bits to advertise in the
+	// node's announcement message.
+	CustomNodeAnn []uint16 `long:"custom-nodeann" description:"custom feature bits — numbers defined in BOLT 9 — to advertise in the node's announcement message"`
+
+	// CustomInvoice specifies custom feature bits to advertise in the
+	// node's invoices.
+	CustomInvoice []uint16 `long:"custom-invoice" description:"custom feature bits — numbers defined in BOLT 9 — to advertise in the node's invoices"`
 }
 
 // Wumbo returns true if lnd should permit the creation and acceptance of wumbo
@@ -78,4 +120,54 @@ func (l *ProtocolOptions) ZeroConf() bool {
 // segwit witness versions for co-op close addresses.
 func (l *ProtocolOptions) NoAnySegwit() bool {
 	return l.NoOptionAnySegwit
+}
+
+// NoTimestampsQuery returns true if we should not ask our syncing peers to also
+// send us the timestamps of announcement messages when we send them a channel
+// range query, and it also means that we will not respond with timestamps if
+// requested by our peer.
+func (l *ProtocolOptions) NoTimestampsQuery() bool {
+	return l.NoTimestampQueryOption
+}
+
+// NoRouteBlinding returns true if forwarding of blinded payments is disabled.
+func (l *ProtocolOptions) NoRouteBlinding() bool {
+	return l.NoRouteBlindingOption
+}
+
+// NoExperimentalEndorsement returns true if experimental endorsement should
+// be disabled.
+func (l *ProtocolOptions) NoExperimentalEndorsement() bool {
+	return l.NoExperimentalEndorsementOption
+}
+
+// NoQuiescence returns true if quiescence is disabled.
+func (l *ProtocolOptions) NoQuiescence() bool {
+	return true
+}
+
+// CustomMessageOverrides returns the set of protocol messages that we override
+// to allow custom handling.
+func (p ProtocolOptions) CustomMessageOverrides() []uint16 {
+	return p.CustomMessage
+}
+
+// CustomFeatures returns a custom set of feature bits to advertise.
+func (p ProtocolOptions) CustomFeatures() map[feature.Set][]lnwire.FeatureBit {
+	customFeatures := make(map[feature.Set][]lnwire.FeatureBit)
+
+	setFeatures := func(set feature.Set, bits []uint16) {
+		for _, customFeature := range bits {
+			customFeatures[set] = append(
+				customFeatures[set],
+				lnwire.FeatureBit(customFeature),
+			)
+		}
+	}
+
+	setFeatures(feature.SetInit, p.CustomInit)
+	setFeatures(feature.SetNodeAnn, p.CustomNodeAnn)
+	setFeatures(feature.SetInvoice, p.CustomInvoice)
+
+	return customFeatures
 }

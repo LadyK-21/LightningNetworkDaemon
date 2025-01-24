@@ -123,7 +123,7 @@ invoice.
 
 This example has a few dependencies:
 ```shell
-$  npm install --save async lodash bytebuffer
+$  npm install --save async lodash
 ```
 
 You can run the following in your shell or put it in a program and run it like
@@ -133,10 +133,9 @@ You can run the following in your shell or put it in a program and run it like
 // Load some libraries specific to this example
 const async = require('async');
 const _ = require('lodash');
-const ByteBuffer = require('bytebuffer');
 
 let dest_pubkey = <RECEIVER_ID_PUBKEY>;
-let dest_pubkey_bytes = ByteBuffer.fromHex(dest_pubkey);
+let dest_pubkey_bytes = new Buffer(dest_pubkey, "hex");
 
 // Set a listener on the bidirectional stream
 let call = lightning.sendPayment();
@@ -236,9 +235,9 @@ client.getInfo({}, (err, response) => {
 With the above, you should have all the `lnd` related `gRPC` dependencies
 installed locally in your project. In order to get up to speed with `protofbuf`
 usage from Javascript, see [this official `protobuf` reference for
-Javascript](https://developers.google.com/protocol-buffers/docs/reference/javascript-generated).
+Javascript](https://protobuf.dev/protobuf-javascript/).
 Additionally, [this official gRPC
-resource](http://www.grpc.io/docs/tutorials/basic/node.html) provides more
+resource](https://grpc.io/docs/languages/node/basics/) provides more
 details around how to drive `gRPC` from `node.js`.
 
 ## API documentation

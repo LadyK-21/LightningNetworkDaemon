@@ -1,6 +1,7 @@
 package htlcswitch
 
 import (
+	"context"
 	"crypto/sha256"
 	"testing"
 	"time"
@@ -13,9 +14,10 @@ import (
 type linkTestContext struct {
 	t *testing.T
 
-	aliceLink  ChannelLink
-	bobChannel *lnwallet.LightningChannel
-	aliceMsgs  <-chan lnwire.Message
+	aliceSwitch *Switch
+	aliceLink   ChannelLink
+	bobChannel  *lnwallet.LightningChannel
+	aliceMsgs   <-chan lnwire.Message
 }
 
 // sendHtlcBobToAlice sends an HTLC from Bob to Alice, that pays to a preimage
@@ -39,7 +41,7 @@ func (l *linkTestContext) sendHtlcAliceToBob(htlcID int,
 
 	l.t.Helper()
 
-	circuitMap := l.aliceLink.(*channelLink).cfg.Switch.circuits
+	circuitMap := l.aliceSwitch.circuits
 	fwdActions, err := circuitMap.CommitCircuits(
 		&PaymentCircuit{
 			Incoming: CircuitKey{
@@ -93,14 +95,16 @@ func (l *linkTestContext) receiveHtlcAliceToBob() {
 func (l *linkTestContext) sendCommitSigBobToAlice(expHtlcs int) {
 	l.t.Helper()
 
-	sig, htlcSigs, _, err := l.bobChannel.SignNextCommitment()
+	testQuit, testQuitFunc := context.WithCancel(context.Background())
+	defer testQuitFunc()
+	sigs, err := l.bobChannel.SignNextCommitment(testQuit)
 	if err != nil {
 		l.t.Fatalf("error signing commitment: %v", err)
 	}
 
 	commitSig := &lnwire.CommitSig{
-		CommitSig: sig,
-		HtlcSigs:  htlcSigs,
+		CommitSig: sigs.CommitSig,
+		HtlcSigs:  sigs.HtlcSigs,
 	}
 
 	if len(commitSig.HtlcSigs) != expHtlcs {
@@ -128,7 +132,7 @@ func (l *linkTestContext) receiveRevAndAckAliceToBob() {
 		l.t.Fatalf("expected RevokeAndAck, got %T", msg)
 	}
 
-	_, _, _, _, err := l.bobChannel.ReceiveRevocation(rev)
+	_, _, err := l.bobChannel.ReceiveRevocation(rev)
 	if err != nil {
 		l.t.Fatalf("bob failed receiving revocation: %v", err)
 	}
@@ -141,9 +145,10 @@ func (l *linkTestContext) receiveCommitSigAliceToBob(expHtlcs int) {
 
 	comSig := l.receiveCommitSigAlice(expHtlcs)
 
-	err := l.bobChannel.ReceiveNewCommitment(
-		comSig.CommitSig, comSig.HtlcSigs,
-	)
+	err := l.bobChannel.ReceiveNewCommitment(&lnwallet.CommitSigs{
+		CommitSig: comSig.CommitSig,
+		HtlcSigs:  comSig.HtlcSigs,
+	})
 	if err != nil {
 		l.t.Fatalf("bob failed receiving commitment: %v", err)
 	}

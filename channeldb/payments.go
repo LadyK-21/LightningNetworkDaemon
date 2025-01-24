@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -103,7 +104,7 @@ var (
 )
 
 var (
-	// ErrNoSequenceNumber is returned if we lookup a payment which does
+	// ErrNoSequenceNumber is returned if we look up a payment which does
 	// not have a sequence number.
 	ErrNoSequenceNumber = errors.New("sequence number not found")
 
@@ -146,18 +147,20 @@ const (
 	// balance to complete the payment.
 	FailureReasonInsufficientBalance FailureReason = 4
 
-	// TODO(halseth): cancel state.
+	// FailureReasonCanceled indicates that the payment was canceled by the
+	// user.
+	FailureReasonCanceled FailureReason = 5
 
 	// TODO(joostjager): Add failure reasons for:
 	// LocalLiquidityInsufficient, RemoteCapacityInsufficient.
 )
 
-// Error returns a human readable error string for the FailureReason.
+// Error returns a human-readable error string for the FailureReason.
 func (r FailureReason) Error() string {
 	return r.String()
 }
 
-// String returns a human readable FailureReason.
+// String returns a human-readable FailureReason.
 func (r FailureReason) String() string {
 	switch r {
 	case FailureReasonTimeout:
@@ -170,46 +173,11 @@ func (r FailureReason) String() string {
 		return "incorrect_payment_details"
 	case FailureReasonInsufficientBalance:
 		return "insufficient_balance"
+	case FailureReasonCanceled:
+		return "canceled"
 	}
 
 	return "unknown"
-}
-
-// PaymentStatus represent current status of payment
-type PaymentStatus byte
-
-const (
-	// StatusUnknown is the status where a payment has never been initiated
-	// and hence is unknown.
-	StatusUnknown PaymentStatus = 0
-
-	// StatusInFlight is the status where a payment has been initiated, but
-	// a response has not been received.
-	StatusInFlight PaymentStatus = 1
-
-	// StatusSucceeded is the status where a payment has been initiated and
-	// the payment was completed successfully.
-	StatusSucceeded PaymentStatus = 2
-
-	// StatusFailed is the status where a payment has been initiated and a
-	// failure result has come back.
-	StatusFailed PaymentStatus = 3
-)
-
-// String returns readable representation of payment status.
-func (ps PaymentStatus) String() string {
-	switch ps {
-	case StatusUnknown:
-		return "Unknown"
-	case StatusInFlight:
-		return "In Flight"
-	case StatusSucceeded:
-		return "Succeeded"
-	case StatusFailed:
-		return "Failed"
-	default:
-		return "Unknown"
-	}
 }
 
 // PaymentCreationInfo is the information necessary to have ready when
@@ -227,6 +195,11 @@ type PaymentCreationInfo struct {
 
 	// PaymentRequest is the full payment request, if any.
 	PaymentRequest []byte
+
+	// FirstHopCustomRecords are the TLV records that are to be sent to the
+	// first hop of this payment. These records will be transmitted via the
+	// wire message only and therefore do not affect the onion payload size.
+	FirstHopCustomRecords lnwire.CustomRecords
 }
 
 // htlcBucketKey creates a composite key from prefix and id where the result is
@@ -335,50 +308,20 @@ func fetchPayment(bucket kvdb.RBucket) (*MPPayment, error) {
 		failureReason = &reason
 	}
 
-	// Go through all HTLCs for this payment, noting whether we have any
-	// settled HTLC, and any still in-flight.
-	var inflight, settled bool
-	for _, h := range htlcs {
-		if h.Failure != nil {
-			continue
-		}
-
-		if h.Settle != nil {
-			settled = true
-			continue
-		}
-
-		// If any of the HTLCs are not failed nor settled, we
-		// still have inflight HTLCs.
-		inflight = true
-	}
-
-	// Use the DB state to determine the status of the payment.
-	var paymentStatus PaymentStatus
-
-	switch {
-	// If any of the the HTLCs did succeed and there are no HTLCs in
-	// flight, the payment succeeded.
-	case !inflight && settled:
-		paymentStatus = StatusSucceeded
-
-	// If we have no in-flight HTLCs, and the payment failure is set, the
-	// payment is considered failed.
-	case !inflight && failureReason != nil:
-		paymentStatus = StatusFailed
-
-	// Otherwise it is still in flight.
-	default:
-		paymentStatus = StatusInFlight
-	}
-
-	return &MPPayment{
+	// Create a new payment.
+	payment := &MPPayment{
 		SequenceNum:   sequenceNum,
 		Info:          creationInfo,
 		HTLCs:         htlcs,
 		FailureReason: failureReason,
-		Status:        paymentStatus,
-	}, nil
+	}
+
+	// Set its state and status.
+	if err := payment.setState(); err != nil {
+		return nil, err
+	}
+
+	return payment, nil
 }
 
 // fetchHtlcAttempts retrieves all htlc attempts made for the payment found in
@@ -536,6 +479,14 @@ type PaymentsQuery struct {
 	// CountTotal indicates that all payments currently present in the
 	// payment index (complete and incomplete) should be counted.
 	CountTotal bool
+
+	// CreationDateStart, expressed in Unix seconds, if set, filters out
+	// all payments with a creation date greater than or equal to it.
+	CreationDateStart int64
+
+	// CreationDateEnd, expressed in Unix seconds, if set, filters out all
+	// payments with a creation date less than or equal to it.
+	CreationDateEnd int64
 }
 
 // PaymentsResponse contains the result of a query to the payments database.
@@ -615,6 +566,24 @@ func (d *DB) QueryPayments(query PaymentsQuery) (PaymentsResponse, error) {
 				return false, err
 			}
 
+			// Get the creation time in Unix seconds, this always
+			// rounds down the nanoseconds to full seconds.
+			createTime := payment.Info.CreationTime.Unix()
+
+			// Skip any payments that were created before the
+			// specified time.
+			if createTime < query.CreationDateStart {
+				return false, nil
+			}
+
+			// Skip any payments that were created after the
+			// specified time.
+			if query.CreationDateEnd != 0 &&
+				createTime > query.CreationDateEnd {
+
+				return false, nil
+			}
+
 			// At this point, we've exhausted the offset, so we'll
 			// begin collecting invoices found within the range.
 			resp.Payments = append(resp.Payments, payment)
@@ -655,7 +624,7 @@ func (d *DB) QueryPayments(query PaymentsQuery) (PaymentsResponse, error) {
 				err = indexes.ForEach(countFn)
 			}
 			if err != nil {
-				return fmt.Errorf("error counting payments: %v",
+				return fmt.Errorf("error counting payments: %w",
 					err)
 			}
 
@@ -790,12 +759,12 @@ func (d *DB) DeletePayment(paymentHash lntypes.Hash,
 			return err
 		}
 
-		// If the status is InFlight, we cannot safely delete
+		// If the payment has inflight HTLCs, we cannot safely delete
 		// the payment information, so we return an error.
-		if paymentStatus == StatusInFlight {
-			return fmt.Errorf("payment '%v' has status InFlight "+
-				"and therefore cannot be deleted",
-				paymentHash.String())
+		if err := paymentStatus.removable(); err != nil {
+			return fmt.Errorf("payment '%v' has inflight HTLCs"+
+				"and therefore cannot be deleted: %w",
+				paymentHash.String(), err)
 		}
 
 		// Delete the failed HTLC attempts we found.
@@ -857,10 +826,12 @@ func (d *DB) DeletePayment(paymentHash lntypes.Hash,
 
 // DeletePayments deletes all completed and failed payments from the DB. If
 // failedOnly is set, only failed payments will be considered for deletion. If
-// failedHtlsOnly is set, the payment itself won't be deleted, only failed HTLC
-// attempts.
-func (d *DB) DeletePayments(failedOnly, failedHtlcsOnly bool) error {
-	return kvdb.Update(d, func(tx kvdb.RwTx) error {
+// failedHtlcsOnly is set, the payment itself won't be deleted, only failed HTLC
+// attempts. The method returns the number of deleted payments, which is always
+// 0 if failedHtlcsOnly is set.
+func (d *DB) DeletePayments(failedOnly, failedHtlcsOnly bool) (int, error) {
+	var numPayments int
+	err := kvdb.Update(d, func(tx kvdb.RwTx) error {
 		payments := tx.ReadWriteBucket(paymentsRootBucket)
 		if payments == nil {
 			return nil
@@ -895,9 +866,10 @@ func (d *DB) DeletePayments(failedOnly, failedHtlcsOnly bool) error {
 				return err
 			}
 
-			// If the status is InFlight, we cannot safely delete
-			// the payment information, so we return early.
-			if paymentStatus == StatusInFlight {
+			// If the payment has inflight HTLCs, we cannot safely
+			// delete the payment information, so we return an nil
+			// to skip it.
+			if err := paymentStatus.removable(); err != nil {
 				return nil
 			}
 
@@ -936,6 +908,7 @@ func (d *DB) DeletePayments(failedOnly, failedHtlcsOnly bool) error {
 			}
 
 			deleteIndexes = append(deleteIndexes, seqNrs...)
+			numPayments++
 			return nil
 		})
 		if err != nil {
@@ -986,7 +959,14 @@ func (d *DB) DeletePayments(failedOnly, failedHtlcsOnly bool) error {
 		}
 
 		return nil
-	}, func() {})
+	}, func() {
+		numPayments = 0
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return numPayments, nil
 }
 
 // fetchSequenceNumbers fetches all the sequence numbers associated with a
@@ -1045,10 +1025,21 @@ func serializePaymentCreationInfo(w io.Writer, c *PaymentCreationInfo) error {
 		return err
 	}
 
+	// Any remaining bytes are TLV encoded records. Currently, these are
+	// only the custom records provided by the user to be sent to the first
+	// hop. But this can easily be extended with further records by merging
+	// the records into a single TLV stream.
+	err := c.FirstHopCustomRecords.SerializeTo(w)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo, error) {
+func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo,
+	error) {
+
 	var scratch [8]byte
 
 	c := &PaymentCreationInfo{}
@@ -1081,6 +1072,15 @@ func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo, error) {
 	}
 	c.PaymentRequest = payReq
 
+	// Any remaining bytes are TLV encoded records. Currently, these are
+	// only the custom records provided by the user to be sent to the first
+	// hop. But this can easily be extended with further records by merging
+	// the records into a single TLV stream.
+	c.FirstHopCustomRecords, err = lnwire.ParseCustomRecordsFrom(r)
+	if err != nil {
+		return nil, err
+	}
+
 	return c, nil
 }
 
@@ -1103,6 +1103,25 @@ func serializeHTLCAttemptInfo(w io.Writer, a *HTLCAttemptInfo) error {
 	}
 
 	if _, err := w.Write(a.Hash[:]); err != nil {
+		return err
+	}
+
+	// Merge the fixed/known records together with the custom records to
+	// serialize them as a single blob. We can't do this in SerializeRoute
+	// because we're in the middle of the byte stream there. We can only do
+	// TLV serialization at the end of the stream, since EOF is allowed for
+	// a stream if no more data is expected.
+	producers := []tlv.RecordProducer{
+		&a.Route.FirstHopAmount,
+	}
+	tlvData, err := lnwire.MergeAndEncode(
+		producers, nil, a.Route.FirstHopWireCustomRecords,
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err := w.Write(tlvData); err != nil {
 		return err
 	}
 
@@ -1143,6 +1162,22 @@ func deserializeHTLCAttemptInfo(r io.Reader) (*HTLCAttemptInfo, error) {
 
 	a.Hash = &hash
 
+	// Read any remaining data (if any) and parse it into the known records
+	// and custom records.
+	extraData, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	customRecords, _, _, err := lnwire.ParseAndExtractCustomRecords(
+		extraData, &a.Route.FirstHopAmount,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	a.Route.FirstHopWireCustomRecords = customRecords
+
 	return a, nil
 }
 
@@ -1179,8 +1214,32 @@ func serializeHop(w io.Writer, h *route.Hop) error {
 		records = append(records, h.MPP.Record())
 	}
 
+	// Add blinding point and encrypted data if present.
+	if h.EncryptedData != nil {
+		records = append(records, record.NewEncryptedDataRecord(
+			&h.EncryptedData,
+		))
+	}
+
+	if h.BlindingPoint != nil {
+		records = append(records, record.NewBlindingPointRecord(
+			&h.BlindingPoint,
+		))
+	}
+
+	if h.AMP != nil {
+		records = append(records, h.AMP.Record())
+	}
+
 	if h.Metadata != nil {
 		records = append(records, record.NewMetadataRecord(&h.Metadata))
+	}
+
+	if h.TotalAmtMsat != 0 {
+		totalMsatInt := uint64(h.TotalAmtMsat)
+		records = append(
+			records, record.NewTotalAmtMsatBlinded(&totalMsatInt),
+		)
 	}
 
 	// Final sanity check to absolutely rule out custom records that are not
@@ -1297,11 +1356,68 @@ func deserializeHop(r io.Reader) (*route.Hop, error) {
 		h.MPP = mpp
 	}
 
+	// If encrypted data or blinding key are present, remove them from
+	// the TLV map and parse into proper types.
+	encryptedDataType := uint64(record.EncryptedDataOnionType)
+	if data, ok := tlvMap[encryptedDataType]; ok {
+		delete(tlvMap, encryptedDataType)
+		h.EncryptedData = data
+	}
+
+	blindingType := uint64(record.BlindingPointOnionType)
+	if blindingPoint, ok := tlvMap[blindingType]; ok {
+		delete(tlvMap, blindingType)
+
+		h.BlindingPoint, err = btcec.ParsePubKey(blindingPoint)
+		if err != nil {
+			return nil, fmt.Errorf("invalid blinding point: %w",
+				err)
+		}
+	}
+
+	ampType := uint64(record.AMPOnionType)
+	if ampBytes, ok := tlvMap[ampType]; ok {
+		delete(tlvMap, ampType)
+
+		var (
+			amp    = &record.AMP{}
+			ampRec = amp.Record()
+			r      = bytes.NewReader(ampBytes)
+		)
+		err := ampRec.Decode(r, uint64(len(ampBytes)))
+		if err != nil {
+			return nil, err
+		}
+		h.AMP = amp
+	}
+
+	// If the metadata type is present, remove it from the tlv map and
+	// populate directly on the hop.
 	metadataType := uint64(record.MetadataOnionType)
 	if metadata, ok := tlvMap[metadataType]; ok {
 		delete(tlvMap, metadataType)
 
 		h.Metadata = metadata
+	}
+
+	totalAmtMsatType := uint64(record.TotalAmtMsatBlindedType)
+	if totalAmtMsat, ok := tlvMap[totalAmtMsatType]; ok {
+		delete(tlvMap, totalAmtMsatType)
+
+		var (
+			totalAmtMsatInt uint64
+			buf             [8]byte
+		)
+		if err := tlv.DTUint64(
+			bytes.NewReader(totalAmtMsat),
+			&totalAmtMsatInt,
+			&buf,
+			uint64(len(totalAmtMsat)),
+		); err != nil {
+			return nil, err
+		}
+
+		h.TotalAmtMsat = lnwire.MilliSatoshi(totalAmtMsatInt)
 	}
 
 	h.CustomRecords = tlvMap
@@ -1326,6 +1442,8 @@ func SerializeRoute(w io.Writer, r route.Route) error {
 			return err
 		}
 	}
+
+	// Any new/extra TLV data is encoded in serializeHTLCAttemptInfo!
 
 	return nil
 }
@@ -1359,6 +1477,8 @@ func DeserializeRoute(r io.Reader) (route.Route, error) {
 		hops = append(hops, hop)
 	}
 	rt.Hops = hops
+
+	// Any new/extra TLV data is decoded in deserializeHTLCAttemptInfo!
 
 	return rt, nil
 }

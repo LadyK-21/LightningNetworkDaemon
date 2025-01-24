@@ -29,7 +29,7 @@
 This chapter describes the security/safety mechanisms that are implemented in
 `lnd`. We encourage every person that is planning on putting mainnet funds into
 a Lightning Network channel using `lnd` to read this guide carefully.   
-As of this writing, `lnd` is still in beta and it is considered `#reckless` to
+As of this writing, `lnd` is still in beta, and it is considered `#reckless` to
 put any life altering amounts of BTC into the network.   
 That said, we constantly put in a lot of effort to make `lnd` safer to use and
 more secure. We will update this documentation with each safety mechanism that
@@ -77,7 +77,7 @@ But the node will need to be restored using the
 
 ### TLS
 
-By default the two API connections `lnd` offers (gRPC on port 10009 and REST on
+By default, the two API connections `lnd` offers (gRPC on port 10009 and REST on
 port 8080) use TLS with a self-signed certificate for transport level security.
 Specifying the certificate on the client side (for example `lncli`) is only a
 protection against man-in-the-middle attacks and does not provide any
@@ -88,6 +88,47 @@ If the key/certificate pair (`tls.cert` and `tls.key` in the main `lnd` data
 directory) is missing on startup, a new self-signed key/certificate pair is
 generated. Clients connecting to `lnd` then have to use the new certificate
 to verify they are talking to the correct server.
+
+#### TLS Key Encryption
+
+By default, LND writes the TLS key to disk in plaintext. If you run in an
+untrusted environment you may want to encrypt the TLS key so no one can
+snoop on your API traffic. This can be accomplished with the `--tlsencryptkey`
+flag in LND. When this is set, LND encrypts the TLS key using the wallet's
+seed and writes the encrypted blob to disk.
+
+Because the key is encrypted to the wallet's seed, that means we can only use
+the TLS pair when the wallet is unlocked. This would leave the
+`WalletUnlocker` service without TLS. To circumvent this problem, LND uses a
+temporary TLS pair for the `WalletUnlocker` service. To avoid writing the
+temporary key to disk, it is held in memory until the wallet is unlocked. The
+temporary TLS cert is written to disk using the same value as `tlscertpath`
+with `.tmp` appended to the end. Once the wallet is unlocked, the temporary
+TLS cert is deleted from disk and the TLS key is removed from memory. Then
+LND uses the main TLS cert and key after it's decrypted.
+
+This requires a slight change in behavior when connecting to LND's APIs.
+When `--tlsencryptkey` is set on LND, you will need to access the temporary
+TLS cert for the initialize, unlock, and change password API calls. You can
+do this in `lncli` by simply pointing the `--tlscertpath` flag at the temporary
+TLS cert for the `create`, `unlock`, and `changepassword` commands. If you
+aren't able to run `lncli` on the host `lnd` is running on, then you'll need
+to copy the temporary certificate from the host onto whatever device you're
+using. Ignoring TLS certificate verification is considered insecure and not
+recommended.
+
+_Important Considerations:_
+
+- Once you set `--tlsencryptkey` when starting LND, you'll always need to use
+the flag. If you don't want to encrypt the TLS key anymore you'll have to
+delete the TLS cert and key so LND generates a new one in plaintext.
+
+- The temporary TLS cert still contains the same information as the persistent
+certificates.
+
+- The temporary TLS cert is only valid for 24 hours while the persistent certs
+are valid for more than a year.
+
 
 ### Macaroons
 
@@ -170,14 +211,14 @@ line, it is hashed and only the hash (or to be more exact, the BIP32 extended
 root key) is stored in the `wallet.db` file.   
 There is
 [a tool being worked on](https://github.com/lightningnetwork/lnd/pull/2373)
-that can extract the BIP32 extended root key but currently you cannot restore
+that can extract the BIP32 extended root key, but currently you cannot restore
 lnd with only this root key.
 
 Important to know:
 * Setting a password/passphrase for the aezeed is meant to protect it from
   an attacker that finds the paper/storage device. Writing down the password
   alongside the 24 seed words does not enhance the security in any way.
-  Therefore the password should be stored in a separate place.
+  Therefore, the password should be stored in a separate place.
 
 ### File based backups
 
@@ -190,7 +231,7 @@ those risks.
 The single most important file that needs to be backed up whenever it changes
 is the `<lnddir>/data/chain/bitcoin/mainnet/channel.backup` file which holds
 the Static Channel Backups (SCBs). This file is only updated every time `lnd`
-starts, a channel is opened or a channel is closed.
+starts, a channel is opened, or a channel is closed.
 
 Most consumer Lightning wallet apps upload the file to the cloud automatically.
 
@@ -254,10 +295,9 @@ online.
 
 Funds that are in such channels are at great risk, as is described quite
 dramatically in
-[this article](https://medium.com/@gcomxx/get-rid-of-those-zombie-channels-1267d5a2a708?)
-.
+[this article](https://medium.com/@gcomxx/get-rid-of-those-zombie-channels-1267d5a2a708?).
 
-The TL;DR of the article is that if you have funds in a zombie channel and you
+The TL;DR of the article is that if you have funds in a zombie channel, and you
 need to recover your node after a failure, SCBs won't be able to recover those
 funds. Because SCB restore
 [relies on the remote node cooperating](#static-channel-backups-scbs).
@@ -287,7 +327,7 @@ fallback way to do it.
 This option works very well if the new device runs the same operating system on
 the same (or at least very similar) architecture. If that is the case, the whole
 `/home/<user>/.lnd` directory in Linux (or
-`$HOME/Library/Application Support/lnd` in MacOS, `%LOCALAPPDATA%\lnd` in
+`$HOME/Library/Application Support/lnd` in macOS, `%LOCALAPPDATA%\lnd` in
 Windows) can be moved to the new device and `lnd` started there. It is important
 to shut down `lnd` on the old device before moving the directory!   
 **Not supported/untested** is moving the data directory between different
@@ -358,9 +398,8 @@ provide any privacy benefits.
 The following steps are recommended to cut all links between the old clearnet
 node and the new Tor node:
 1. Close all channels on the old node and wait for them to fully close.
-1. Send all on-chain funds of the old node through a Coin Join service (like
-   Wasabi or Samurai/Whirlpool) until a sufficiently high anonymity set is
-   reached.
+1. If desired, take steps to preserve the on-chain privacy of the funds from the
+   old node before sending them to the new node.
 1. Create a new `lnd` node with a **new seed** that is only connected to Tor
    and generate an on-chain address on the new node.
 1. Send the mixed/coinjoined coins to the address of the new node.
@@ -387,11 +426,11 @@ The following (non-exhaustive) list of things can lead to data corruption:
   architectures.
 
 To avoid most of these factors, it is recommended to store `lnd`'s main data
-directory on an Solid State Drive (SSD) of a reliable manufacturer.
+directory on a Solid State Drive (SSD) of a reliable manufacturer.
 An alternative or extension to that is to use a replicated disk setup. Making
-sure a power failure does not interrupt the node by running a UPS (
-uninterruptible power supply) might also make sense depending on the reliability
-of the local power grid and the amount of funds at stake.
+sure a power failure does not interrupt the node by running a UPS
+(uninterruptible power supply) might also make sense depending on the
+reliability of the local power grid and the amount of funds at stake.
 
 ### Don't interrupt `lncli` commands
 

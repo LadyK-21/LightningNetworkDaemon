@@ -13,7 +13,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/blockcache"
-	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 )
 
 // BitcoindFilteredChainView is an implementation of the FilteredChainView
@@ -125,6 +125,9 @@ func (b *BitcoindFilteredChainView) Start() error {
 //
 // NOTE: This is part of the FilteredChainView interface.
 func (b *BitcoindFilteredChainView) Stop() error {
+	log.Debug("BitcoindFilteredChainView stopping")
+	defer log.Debug("BitcoindFilteredChainView stopped")
+
 	// Already shutting down?
 	if atomic.AddInt32(&b.stopped, 1) != 1 {
 		return nil
@@ -133,10 +136,9 @@ func (b *BitcoindFilteredChainView) Stop() error {
 	// Shutdown the rpc client, this gracefully disconnects from bitcoind's
 	// zmq socket, and cleans up all related resources.
 	b.chainClient.Stop()
+	b.chainClient.WaitForShutdown()
 
 	b.blockQueue.Stop()
-
-	log.Infof("FilteredChainView stopping")
 
 	close(b.quit)
 	b.wg.Wait()
@@ -264,7 +266,7 @@ func (b *BitcoindFilteredChainView) chainFilterer() {
 					continue
 				}
 
-				filteredTxns = append(filteredTxns, tx)
+				filteredTxns = append(filteredTxns, tx.Copy())
 				txAlreadyFiltered = true
 			}
 		}
@@ -446,7 +448,7 @@ func (b *BitcoindFilteredChainView) chainFilterer() {
 // rewound to ensure all relevant notifications are dispatched.
 //
 // NOTE: This is part of the FilteredChainView interface.
-func (b *BitcoindFilteredChainView) UpdateFilter(ops []channeldb.EdgePoint,
+func (b *BitcoindFilteredChainView) UpdateFilter(ops []graphdb.EdgePoint,
 	updateHeight uint32) error {
 
 	newUtxos := make([]wire.OutPoint, len(ops))

@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -19,7 +20,7 @@ var EmptyCircuitKey CircuitKey
 // HTLCs in a circuit. Circuits are identified primarily by the circuit key of
 // the incoming HTLC. However, a circuit may also be referenced by its outgoing
 // circuit key after the HTLC has been forwarded via the outgoing link.
-type CircuitKey = channeldb.CircuitKey
+type CircuitKey = models.CircuitKey
 
 // PaymentCircuit is used by the switch as placeholder between when the
 // switch makes a forwarding decision and the outgoing link determines the
@@ -203,6 +204,12 @@ func (c *PaymentCircuit) Decode(r io.Reader) error {
 	case hop.EncrypterTypeMock:
 		// Test encrypter.
 		c.ErrorEncrypter = NewMockObfuscator()
+
+	case hop.EncrypterTypeIntroduction:
+		c.ErrorEncrypter = hop.NewIntroductionErrorEncrypter()
+
+	case hop.EncrypterTypeRelaying:
+		c.ErrorEncrypter = hop.NewRelayingErrorEncrypter()
 
 	default:
 		return UnknownEncrypterType(encrypterType)

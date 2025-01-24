@@ -31,9 +31,20 @@ var _ = runtime.String
 var _ = utilities.NewDoubleArray
 var _ = metadata.Join
 
+var (
+	filter_Lightning_WalletBalance_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
+)
+
 func request_Lightning_WalletBalance_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq WalletBalanceRequest
 	var metadata runtime.ServerMetadata
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_WalletBalance_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	msg, err := client.WalletBalance(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
 	return msg, metadata, err
@@ -43,6 +54,13 @@ func request_Lightning_WalletBalance_0(ctx context.Context, marshaler runtime.Ma
 func local_request_Lightning_WalletBalance_0(ctx context.Context, marshaler runtime.Marshaler, server LightningServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq WalletBalanceRequest
 	var metadata runtime.ServerMetadata
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_WalletBalance_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	msg, err := server.WalletBalance(ctx, &protoReq)
 	return msg, metadata, err
@@ -532,6 +550,24 @@ func local_request_Lightning_GetInfo_0(ctx context.Context, marshaler runtime.Ma
 
 }
 
+func request_Lightning_GetDebugInfo_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq GetDebugInfoRequest
+	var metadata runtime.ServerMetadata
+
+	msg, err := client.GetDebugInfo(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+
+}
+
+func local_request_Lightning_GetDebugInfo_0(ctx context.Context, marshaler runtime.Marshaler, server LightningServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq GetDebugInfoRequest
+	var metadata runtime.ServerMetadata
+
+	msg, err := server.GetDebugInfo(ctx, &protoReq)
+	return msg, metadata, err
+
+}
+
 func request_Lightning_GetRecoveryInfo_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq GetRecoveryInfoRequest
 	var metadata runtime.ServerMetadata
@@ -550,9 +586,20 @@ func local_request_Lightning_GetRecoveryInfo_0(ctx context.Context, marshaler ru
 
 }
 
+var (
+	filter_Lightning_PendingChannels_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
+)
+
 func request_Lightning_PendingChannels_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq PendingChannelsRequest
 	var metadata runtime.ServerMetadata
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_PendingChannels_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	msg, err := client.PendingChannels(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
 	return msg, metadata, err
@@ -562,6 +609,13 @@ func request_Lightning_PendingChannels_0(ctx context.Context, marshaler runtime.
 func local_request_Lightning_PendingChannels_0(ctx context.Context, marshaler runtime.Marshaler, server LightningServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq PendingChannelsRequest
 	var metadata runtime.ServerMetadata
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_PendingChannels_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	msg, err := server.PendingChannels(ctx, &protoReq)
 	return msg, metadata, err
@@ -1501,6 +1555,10 @@ func local_request_Lightning_GetNodeMetrics_0(ctx context.Context, marshaler run
 
 }
 
+var (
+	filter_Lightning_GetChanInfo_0 = &utilities.DoubleArray{Encoding: map[string]int{"chan_id": 0}, Base: []int{1, 1, 0}, Check: []int{0, 1, 2}}
+)
+
 func request_Lightning_GetChanInfo_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq ChanInfoRequest
 	var metadata runtime.ServerMetadata
@@ -1520,6 +1578,13 @@ func request_Lightning_GetChanInfo_0(ctx context.Context, marshaler runtime.Mars
 	protoReq.ChanId, err = runtime.Uint64(val)
 	if err != nil {
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "chan_id", err)
+	}
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_GetChanInfo_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	msg, err := client.GetChanInfo(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
@@ -1546,6 +1611,13 @@ func local_request_Lightning_GetChanInfo_0(ctx context.Context, marshaler runtim
 	protoReq.ChanId, err = runtime.Uint64(val)
 	if err != nil {
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "chan_id", err)
+	}
+
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_Lightning_GetChanInfo_0); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	msg, err := server.GetChanInfo(ctx, &protoReq)
@@ -2460,8 +2532,8 @@ func local_request_Lightning_ListAliases_0(ctx context.Context, marshaler runtim
 
 }
 
-func request_Lightning_LookupHtlc_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
-	var protoReq LookupHtlcRequest
+func request_Lightning_LookupHtlcResolution_0(ctx context.Context, marshaler runtime.Marshaler, client LightningClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq LookupHtlcResolutionRequest
 	var metadata runtime.ServerMetadata
 
 	var (
@@ -2491,13 +2563,13 @@ func request_Lightning_LookupHtlc_0(ctx context.Context, marshaler runtime.Marsh
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "htlc_index", err)
 	}
 
-	msg, err := client.LookupHtlc(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	msg, err := client.LookupHtlcResolution(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
 	return msg, metadata, err
 
 }
 
-func local_request_Lightning_LookupHtlc_0(ctx context.Context, marshaler runtime.Marshaler, server LightningServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
-	var protoReq LookupHtlcRequest
+func local_request_Lightning_LookupHtlcResolution_0(ctx context.Context, marshaler runtime.Marshaler, server LightningServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq LookupHtlcResolutionRequest
 	var metadata runtime.ServerMetadata
 
 	var (
@@ -2527,7 +2599,7 @@ func local_request_Lightning_LookupHtlc_0(ctx context.Context, marshaler runtime
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", "htlc_index", err)
 	}
 
-	msg, err := server.LookupHtlc(ctx, &protoReq)
+	msg, err := server.LookupHtlcResolution(ctx, &protoReq)
 	return msg, metadata, err
 
 }
@@ -2871,6 +2943,29 @@ func RegisterLightningHandlerServer(ctx context.Context, mux *runtime.ServeMux, 
 		}
 
 		forward_Lightning_GetInfo_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	mux.Handle("GET", pattern_Lightning_GetDebugInfo_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		rctx, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/lnrpc.Lightning/GetDebugInfo", runtime.WithHTTPPathPattern("/v1/getdebuginfo"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Lightning_GetDebugInfo_0(rctx, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		ctx = runtime.NewServerMetadataContext(ctx, md)
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_Lightning_GetDebugInfo_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -3864,18 +3959,18 @@ func RegisterLightningHandlerServer(ctx context.Context, mux *runtime.ServeMux, 
 
 	})
 
-	mux.Handle("GET", pattern_Lightning_LookupHtlc_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+	mux.Handle("GET", pattern_Lightning_LookupHtlcResolution_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
 		var stream runtime.ServerTransportStream
 		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
-		rctx, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/lnrpc.Lightning/LookupHtlc", runtime.WithHTTPPathPattern("/v1/htlc/{chan_id}/{htlc_index}"))
+		rctx, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/lnrpc.Lightning/LookupHtlcResolution", runtime.WithHTTPPathPattern("/v1/htlc-resolution/{chan_id}/{htlc_index}"))
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		resp, md, err := local_request_Lightning_LookupHtlc_0(rctx, inboundMarshaler, server, req, pathParams)
+		resp, md, err := local_request_Lightning_LookupHtlcResolution_0(rctx, inboundMarshaler, server, req, pathParams)
 		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
 		ctx = runtime.NewServerMetadataContext(ctx, md)
 		if err != nil {
@@ -3883,7 +3978,7 @@ func RegisterLightningHandlerServer(ctx context.Context, mux *runtime.ServeMux, 
 			return
 		}
 
-		forward_Lightning_LookupHtlc_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		forward_Lightning_LookupHtlcResolution_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -4245,6 +4340,26 @@ func RegisterLightningHandlerClient(ctx context.Context, mux *runtime.ServeMux, 
 		}
 
 		forward_Lightning_GetInfo_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	mux.Handle("GET", pattern_Lightning_GetDebugInfo_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		rctx, err := runtime.AnnotateContext(ctx, mux, req, "/lnrpc.Lightning/GetDebugInfo", runtime.WithHTTPPathPattern("/v1/getdebuginfo"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Lightning_GetDebugInfo_0(rctx, inboundMarshaler, client, req, pathParams)
+		ctx = runtime.NewServerMetadataContext(ctx, md)
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_Lightning_GetDebugInfo_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -5248,23 +5363,23 @@ func RegisterLightningHandlerClient(ctx context.Context, mux *runtime.ServeMux, 
 
 	})
 
-	mux.Handle("GET", pattern_Lightning_LookupHtlc_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+	mux.Handle("GET", pattern_Lightning_LookupHtlcResolution_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
-		rctx, err := runtime.AnnotateContext(ctx, mux, req, "/lnrpc.Lightning/LookupHtlc", runtime.WithHTTPPathPattern("/v1/htlc/{chan_id}/{htlc_index}"))
+		rctx, err := runtime.AnnotateContext(ctx, mux, req, "/lnrpc.Lightning/LookupHtlcResolution", runtime.WithHTTPPathPattern("/v1/htlc-resolution/{chan_id}/{htlc_index}"))
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		resp, md, err := request_Lightning_LookupHtlc_0(rctx, inboundMarshaler, client, req, pathParams)
+		resp, md, err := request_Lightning_LookupHtlcResolution_0(rctx, inboundMarshaler, client, req, pathParams)
 		ctx = runtime.NewServerMetadataContext(ctx, md)
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
 			return
 		}
 
-		forward_Lightning_LookupHtlc_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		forward_Lightning_LookupHtlcResolution_0(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -5303,6 +5418,8 @@ var (
 	pattern_Lightning_SubscribePeerEvents_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "peers", "subscribe"}, ""))
 
 	pattern_Lightning_GetInfo_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "getinfo"}, ""))
+
+	pattern_Lightning_GetDebugInfo_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "getdebuginfo"}, ""))
 
 	pattern_Lightning_GetRecoveryInfo_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "getrecoveryinfo"}, ""))
 
@@ -5404,7 +5521,7 @@ var (
 
 	pattern_Lightning_ListAliases_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "aliases", "list"}, ""))
 
-	pattern_Lightning_LookupHtlc_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 1, 0, 4, 1, 5, 2, 1, 0, 4, 1, 5, 3}, []string{"v1", "htlc", "chan_id", "htlc_index"}, ""))
+	pattern_Lightning_LookupHtlcResolution_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 1, 0, 4, 1, 5, 2, 1, 0, 4, 1, 5, 3}, []string{"v1", "htlc-resolution", "chan_id", "htlc_index"}, ""))
 )
 
 var (
@@ -5439,6 +5556,8 @@ var (
 	forward_Lightning_SubscribePeerEvents_0 = runtime.ForwardResponseStream
 
 	forward_Lightning_GetInfo_0 = runtime.ForwardResponseMessage
+
+	forward_Lightning_GetDebugInfo_0 = runtime.ForwardResponseMessage
 
 	forward_Lightning_GetRecoveryInfo_0 = runtime.ForwardResponseMessage
 
@@ -5540,5 +5659,5 @@ var (
 
 	forward_Lightning_ListAliases_0 = runtime.ForwardResponseMessage
 
-	forward_Lightning_LookupHtlc_0 = runtime.ForwardResponseMessage
+	forward_Lightning_LookupHtlcResolution_0 = runtime.ForwardResponseMessage
 )

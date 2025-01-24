@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -91,7 +92,9 @@ func (h *HtlcNotifier) Start() error {
 func (h *HtlcNotifier) Stop() error {
 	var err error
 	h.stopped.Do(func() {
-		log.Info("HtlcNotifier shutting down")
+		log.Info("HtlcNotifier shutting down...")
+		defer log.Debug("HtlcNotifier shutdown complete")
+
 		if err = h.ntfnServer.Stop(); err != nil {
 			log.Warnf("error stopping htlc notifier: %v", err)
 		}
@@ -108,10 +111,10 @@ func (h *HtlcNotifier) SubscribeHtlcEvents() (*subscribe.Client, error) {
 // HtlcKey uniquely identifies the htlc.
 type HtlcKey struct {
 	// IncomingCircuit is the channel an htlc id of the incoming htlc.
-	IncomingCircuit channeldb.CircuitKey
+	IncomingCircuit models.CircuitKey
 
 	// OutgoingCircuit is the channel and htlc id of the outgoing htlc.
-	OutgoingCircuit channeldb.CircuitKey
+	OutgoingCircuit models.CircuitKey
 }
 
 // String returns a string representation of a htlc key.
@@ -398,7 +401,7 @@ func (h *HtlcNotifier) NotifySettleEvent(key HtlcKey,
 // htlc has been determined.
 //
 // Note this is part of the htlcNotifier interface.
-func (h *HtlcNotifier) NotifyFinalHtlcEvent(key channeldb.CircuitKey,
+func (h *HtlcNotifier) NotifyFinalHtlcEvent(key models.CircuitKey,
 	info channeldb.FinalHtlcInfo) {
 
 	event := &FinalHtlcEvent{
@@ -423,7 +426,7 @@ func (h *HtlcNotifier) NotifyFinalHtlcEvent(key channeldb.CircuitKey,
 // originate at our node.
 func newHtlcKey(pkt *htlcPacket) HtlcKey {
 	htlcKey := HtlcKey{
-		IncomingCircuit: channeldb.CircuitKey{
+		IncomingCircuit: models.CircuitKey{
 			ChanID: pkt.incomingChanID,
 			HtlcID: pkt.incomingHTLCID,
 		},

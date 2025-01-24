@@ -7,10 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -31,6 +35,10 @@ func (m *mockBandwidthHints) availableChanBandwidth(channelID uint64,
 
 	balance, ok := m.hints[channelID]
 	return balance, ok
+}
+
+func (m *mockBandwidthHints) firstHopCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
 }
 
 // integratedRoutingContext defines the context in which integrated routing
@@ -68,6 +76,15 @@ func newIntegratedRoutingContext(t *testing.T) *integratedRoutingContext {
 	// defaults would break the unit tests. The actual values picked aren't
 	// critical to excite certain behavior, but do need to be aligned with
 	// the test case assertions.
+	aCfg := AprioriConfig{
+		PenaltyHalfLife:       30 * time.Minute,
+		AprioriHopProbability: 0.6,
+		AprioriWeight:         0.5,
+		CapacityFraction:      testCapacityFraction,
+	}
+	estimator, err := NewAprioriEstimator(aCfg)
+	require.NoError(t, err)
+
 	ctx := integratedRoutingContext{
 		t:           t,
 		graph:       graph,
@@ -75,11 +92,7 @@ func newIntegratedRoutingContext(t *testing.T) *integratedRoutingContext {
 		finalExpiry: 40,
 
 		mcCfg: MissionControlConfig{
-			ProbabilityEstimatorCfg: ProbabilityEstimatorCfg{
-				PenaltyHalfLife:       30 * time.Minute,
-				AprioriHopProbability: 0.6,
-				AprioriWeight:         0.5,
-			},
+			Estimator: estimator,
 		},
 
 		pathFindingCfg: PathFindingConfig{
@@ -150,14 +163,17 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		}
 	})
 
-	// Instantiate a new mission control with the current configuration
+	// Instantiate a new mission controller with the current configuration
 	// values.
-	mc, err := NewMissionControl(db, c.source.pubkey, &c.mcCfg)
-	if err != nil {
-		c.t.Fatal(err)
-	}
+	mcController, err := NewMissionController(db, c.source.pubkey, &c.mcCfg)
+	require.NoError(c.t, err)
 
-	getBandwidthHints := func(_ routingGraph) (bandwidthHints, error) {
+	mc, err := mcController.GetNamespacedStore(
+		DefaultMissionControlNamespace,
+	)
+	require.NoError(c.t, err)
+
+	getBandwidthHints := func(_ Graph) (bandwidthHints, error) {
 		// Create bandwidth hints based on local channel balances.
 		bandwidthHints := map[uint64]lnwire.MilliSatoshi{}
 		for _, ch := range c.graph.nodes[c.source.pubkey].channels {
@@ -174,12 +190,14 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		FinalCLTVDelta: uint16(c.finalExpiry),
 		FeeLimit:       lnwire.MaxMilliSatoshi,
 		Target:         c.target.pubkey,
-		PaymentAddr:    &paymentAddr,
-		DestFeatures:   lnwire.NewFeatureVector(baseFeatureBits, nil),
-		Amount:         c.amt,
-		CltvLimit:      math.MaxUint32,
-		MaxParts:       maxParts,
-		RouteHints:     c.routeHints,
+		PaymentAddr:    fn.Some(paymentAddr),
+		DestFeatures: lnwire.NewFeatureVector(
+			baseFeatureBits, lnwire.Features,
+		),
+		Amount:     c.amt,
+		CltvLimit:  math.MaxUint32,
+		MaxParts:   maxParts,
+		RouteHints: c.routeHints,
 	}
 
 	var paymentHash [32]byte
@@ -192,11 +210,8 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 	}
 
 	session, err := newPaymentSession(
-		&payment, getBandwidthHints,
-		func() (routingGraph, func(), error) {
-			return c.graph, func() {}, nil
-		},
-		mc, c.pathFindingCfg,
+		&payment, c.graph.source.pubkey, getBandwidthHints,
+		newMockGraphSessionFactory(c.graph), mc, c.pathFindingCfg,
 	)
 	if err != nil {
 		c.t.Fatal(err)
@@ -221,6 +236,9 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		// Find a route.
 		route, err := session.RequestRoute(
 			amtRemaining, lnwire.MaxMilliSatoshi, inFlightHtlcs, 0,
+			lnwire.CustomRecords{
+				lnwire.MinCustomRecordsTlvType: []byte{1, 2, 3},
+			},
 		)
 		if err != nil {
 			return attempts, err
@@ -298,4 +316,89 @@ func getNodeIndex(route *route.Route, failureSource route.Vertex) *int {
 		}
 	}
 	return nil
+}
+
+type mockGraphSessionFactory struct {
+	Graph
+}
+
+func newMockGraphSessionFactory(graph Graph) GraphSessionFactory {
+	return &mockGraphSessionFactory{Graph: graph}
+}
+
+func (m *mockGraphSessionFactory) NewGraphSession() (Graph, func() error,
+	error) {
+
+	return m, func() error {
+		return nil
+	}, nil
+}
+
+var _ GraphSessionFactory = (*mockGraphSessionFactory)(nil)
+var _ Graph = (*mockGraphSessionFactory)(nil)
+
+type mockGraphSessionFactoryChanDB struct {
+	graph *graphdb.ChannelGraph
+}
+
+func newMockGraphSessionFactoryFromChanDB(
+	graph *graphdb.ChannelGraph) *mockGraphSessionFactoryChanDB {
+
+	return &mockGraphSessionFactoryChanDB{
+		graph: graph,
+	}
+}
+
+func (g *mockGraphSessionFactoryChanDB) NewGraphSession() (Graph, func() error,
+	error) {
+
+	tx, err := g.graph.NewPathFindTx()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	session := &mockGraphSessionChanDB{
+		graph: g.graph,
+		tx:    tx,
+	}
+
+	return session, session.close, nil
+}
+
+var _ GraphSessionFactory = (*mockGraphSessionFactoryChanDB)(nil)
+
+type mockGraphSessionChanDB struct {
+	graph *graphdb.ChannelGraph
+	tx    kvdb.RTx
+}
+
+func newMockGraphSessionChanDB(graph *graphdb.ChannelGraph) Graph {
+	return &mockGraphSessionChanDB{
+		graph: graph,
+	}
+}
+
+func (g *mockGraphSessionChanDB) close() error {
+	if g.tx == nil {
+		return nil
+	}
+
+	err := g.tx.Rollback()
+	if err != nil {
+		return fmt.Errorf("error closing db tx: %w", err)
+	}
+
+	return nil
+}
+
+func (g *mockGraphSessionChanDB) ForEachNodeChannel(nodePub route.Vertex,
+	cb func(channel *graphdb.DirectedChannel) error) error {
+
+	return g.graph.ForEachNodeDirectedChannel(g.tx, nodePub, cb)
+}
+
+func (g *mockGraphSessionChanDB) FetchNodeFeatures(nodePub route.Vertex) (
+	*lnwire.FeatureVector, error) {
+
+	return g.graph.FetchNodeFeatures(nodePub)
 }

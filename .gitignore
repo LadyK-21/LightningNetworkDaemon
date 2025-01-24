@@ -32,16 +32,20 @@ _testmain.go
 /lncli-itest
 
 # Integration test log files
-lntest/itest/*.log
-lntest/itest/.backendlogs
-lntest/itest/.minerlogs
-lntest/itest/lnd-itest
-lntest/itest/btcd-itest
-lntest/itest/.logs-*
+itest/*.log
+itest/.backendlogs
+itest/.minerlogs
+itest/lnd-itest
+itest/btcd-itest
+itest/.logs-*
+itest/cover
 
 cmd/cmd
 *.key
 *.hex
+
+# Ignore the custom linter binary if it is built.
+custom-gcl
 
 cmd/lncli/lncli
 
@@ -65,6 +69,7 @@ profile.tmp
 .DS_Store
 
 .vscode
+*.code-workspace
 
 # Coverage test
 coverage.txt

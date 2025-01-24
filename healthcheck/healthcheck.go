@@ -1,4 +1,4 @@
-// Package healthcheck contains a monitor which takes a set of liveliness checks
+// Package healthcheck contains a monitor which takes a set of liveness checks
 // which it periodically checks. If a check fails after its configured number
 // of allowed call attempts, the monitor will send a request to shutdown using
 // the function is is provided in its config. Checks are dispatched in their own
@@ -15,6 +15,8 @@ import (
 	"github.com/lightningnetwork/lnd/ticker"
 )
 
+var noOpCallback = func() {}
+
 // Config contains configuration settings for our monitor.
 type Config struct {
 	// Checks is a set of health checks that assert that lnd has access to
@@ -30,7 +32,7 @@ type Config struct {
 // to print our reason for shutdown.
 type shutdownFunc func(format string, params ...interface{})
 
-// Monitor periodically checks a series of configured liveliness checks to
+// Monitor periodically checks a series of configured liveness checks to
 // ensure that lnd has access to all critical resources.
 type Monitor struct {
 	started int32 // To be used atomically.
@@ -71,10 +73,11 @@ func (m *Monitor) Start() error {
 		}
 
 		m.wg.Add(1)
-		go func() {
+		go func(check *Observation) {
 			defer m.wg.Done()
+
 			check.monitor(m.cfg.Shutdown, m.quit)
-		}()
+		}(check)
 	}
 
 	return nil
@@ -86,10 +89,24 @@ func (m *Monitor) Stop() error {
 		return fmt.Errorf("monitor already stopped")
 	}
 
-	log.Info("Health monitor shutting down")
+	log.Info("Health monitor shutting down...")
+	defer log.Debug("Health monitor shutdown complete")
 
 	close(m.quit)
 	m.wg.Wait()
+
+	return nil
+}
+
+// AddCheck adds a new healthcheck to our monitor.
+func (m *Monitor) AddCheck(check *Observation) error {
+
+	m.wg.Add(1)
+	go func(check *Observation) {
+		defer m.wg.Done()
+
+		check.monitor(m.cfg.Shutdown, m.quit)
+	}(check)
 
 	return nil
 }
@@ -111,7 +128,7 @@ func CreateCheck(checkFunc func() error) func() chan error {
 	}
 }
 
-// Observation represents a liveliness check that we periodically check.
+// Observation represents a liveness check that we periodically check.
 type Observation struct {
 	// Name describes the health check.
 	Name string
@@ -135,13 +152,42 @@ type Observation struct {
 	// Backoff is the amount of time we back off between retries for failed
 	// checks.
 	Backoff time.Duration
+
+	// OnSuccess is a callback which will be executed when the healthcheck
+	// succeeds. This is optional.
+	OnSuccess func()
+
+	// OnFailure is a callback which will be executed when the healthcheck
+	// fails. This is optional.
+	OnFailure func()
+}
+
+// ObservationOption describes the signature of a functional option that can be
+// used to modify the behaviour of an Observation.
+type ObservationOption func(*Observation)
+
+// WithSuccessCallback configures an observation with a callback to be fired
+// whenever the health check succeeds.
+func WithSuccessCallback(callback func()) ObservationOption {
+	return func(o *Observation) {
+		o.OnSuccess = callback
+	}
+}
+
+// WithFailureCallback configures an observation with a callback to be fired
+// whenever the health check reaches its failure threshold.
+func WithFailureCallback(callback func()) ObservationOption {
+	return func(o *Observation) {
+		o.OnFailure = callback
+	}
 }
 
 // NewObservation creates an observation.
-func NewObservation(name string, check func() error, interval,
-	timeout, backoff time.Duration, attempts int) *Observation {
+func NewObservation(name string, check func() error, interval, timeout,
+	backoff time.Duration, attempts int,
+	opts ...ObservationOption) *Observation {
 
-	return &Observation{
+	observation := &Observation{
 		Name:     name,
 		Check:    CreateCheck(check),
 		Interval: ticker.New(interval),
@@ -149,6 +195,22 @@ func NewObservation(name string, check func() error, interval,
 		Timeout:  timeout,
 		Backoff:  backoff,
 	}
+
+	// Apply each option to the observation.
+	for _, opt := range opts {
+		opt(observation)
+	}
+
+	// Ensure that we default to NO-OP callbacks.
+	if observation.OnSuccess == nil {
+		observation.OnSuccess = noOpCallback
+	}
+
+	if observation.OnFailure == nil {
+		observation.OnFailure = noOpCallback
+	}
+
+	return observation
 }
 
 // String returns a string representation of an observation.
@@ -172,14 +234,13 @@ func (o *Observation) monitor(shutdown shutdownFunc, quit chan struct{}) {
 			// the max attempts are reached. In that case we will
 			// stop the ticker and quit.
 			if o.retryCheck(quit, shutdown) {
-				log.Debugf("Health check: max attempts " +
-					"failed, monitor exiting")
+				o.Debugf("max attempts failed, monitor exiting")
 				return
 			}
 
 		// Exit if we receive the instruction to shutdown.
 		case <-quit:
-			log.Debug("Health check: monitor quit")
+			o.Debugf("monitor quit")
 			return
 		}
 	}
@@ -204,32 +265,43 @@ func (o *Observation) retryCheck(quit chan struct{},
 		var err error
 		select {
 		case err = <-o.Check():
+			// If our error is nil, we have passed our health check,
+			// so we'll invoke our success callback if defined and
+			// then exit.
+			if err == nil {
+				o.Debugf("invoking success callback")
+
+				// Invoke the success callback.
+				o.OnSuccess()
+
+				return false
+			}
 
 		case <-time.After(o.Timeout):
 			err = fmt.Errorf("health check: %v timed out after: "+
 				"%v", o, o.Timeout)
 
 		case <-quit:
-			log.Debug("Health check: monitor quit")
-			return false
-		}
-
-		// If our error is nil, we have passed our health check, so we
-		// can exit.
-		if err == nil {
+			o.Debugf("monitor quit")
 			return false
 		}
 
 		// If we have reached our allowed number of attempts, this
-		// check has failed so we request shutdown.
+		// check has failed so we'll fire the on failure callback
+		// and request shutdown.
 		if count == o.Attempts {
-			shutdown("Health check: %v failed after %v "+
-				"calls", o, o.Attempts)
+			o.Debugf("invoking failure callback")
+
+			o.OnFailure()
+
+			shutdown("Health check: %v failed after %v calls", o,
+				o.Attempts)
+
 			return true
 		}
 
-		log.Infof("Health check: %v, call: %v failed with: %v, "+
-			"backing off for: %v", o, count, err, o.Backoff)
+		o.Infof("failed with: %v, attempts: %v backing off for: %v",
+			err, count, o.Backoff)
 
 		// If we are still within the number of calls allowed for this
 		// check, we wait for our back off period to elapse, or exit if
@@ -238,10 +310,22 @@ func (o *Observation) retryCheck(quit chan struct{},
 		case <-time.After(o.Backoff):
 
 		case <-quit:
-			log.Debug("Health check: monitor quit")
+			o.Debugf("monitor quit")
 			return false
 		}
 	}
 
 	return false
+}
+
+// Infof logs an info message for an observation prefixed with the health check
+// name.
+func (o *Observation) Infof(format string, params ...interface{}) {
+	log.Debugf(fmt.Sprintf("Health check: %v ", o)+format, params...)
+}
+
+// Debugf logs a debug message for an observation prefixed with the health check
+// name.
+func (o *Observation) Debugf(format string, params ...interface{}) {
+	log.Debugf(fmt.Sprintf("Health check: %v ", o)+format, params...)
 }
