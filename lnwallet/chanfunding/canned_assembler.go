@@ -4,11 +4,30 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 )
+
+// NewShimIntent creates a new ShimIntent. This is only used for testing.
+func NewShimIntent(localAmt, remoteAmt btcutil.Amount,
+	localKey *keychain.KeyDescriptor, remoteKey *btcec.PublicKey,
+	chanPoint *wire.OutPoint, thawHeight uint32, musig2 bool) *ShimIntent {
+
+	return &ShimIntent{
+		localFundingAmt:  localAmt,
+		remoteFundingAmt: remoteAmt,
+		localKey:         localKey,
+		remoteKey:        remoteKey,
+		chanPoint:        chanPoint,
+		thawHeight:       thawHeight,
+		musig2:           musig2,
+	}
+}
 
 // ShimIntent is an intent created by the CannedAssembler which represents a
 // funding output to be created that was constructed outside the wallet. This
@@ -35,6 +54,19 @@ type ShimIntent struct {
 	// a normal channel. Until this height, it's considered frozen, so it
 	// can only be cooperatively closed by the responding party.
 	thawHeight uint32
+
+	// musig2 determines if the funding output should use musig2 to
+	// generate an aggregate key to use as the taproot-native multi-sig
+	// output.
+	musig2 bool
+
+	// tapscriptRoot is the root of the tapscript tree that will be used to
+	// create the funding output. This field will only be utilized if the
+	// MuSig2 flag above is set to true.
+	//
+	// TODO(roasbeef): fold above into new chan type? sum type like thing,
+	// includes the tapscript root, etc
+	tapscriptRoot fn.Option[chainhash.Hash]
 }
 
 // FundingOutput returns the witness script, and the output that creates the
@@ -48,11 +80,43 @@ func (s *ShimIntent) FundingOutput() ([]byte, *wire.TxOut, error) {
 	}
 
 	totalAmt := s.localFundingAmt + s.remoteFundingAmt
+
+	// If musig2 is active, then we'll return a single aggregated key
+	// rather than using the "existing" funding script.
+	if s.musig2 {
+		// Similar to the existing p2wsh script, we'll always ensure
+		// the keys are sorted before use.
+		return input.GenTaprootFundingScript(
+			s.localKey.PubKey, s.remoteKey, int64(totalAmt),
+			s.tapscriptRoot,
+		)
+	}
+
 	return input.GenFundingPkScript(
 		s.localKey.PubKey.SerializeCompressed(),
 		s.remoteKey.SerializeCompressed(),
 		int64(totalAmt),
 	)
+}
+
+// TaprootInternalKey may return the internal key for a MuSig2 funding output,
+// but only if this is actually a MuSig2 channel.
+func (s *ShimIntent) TaprootInternalKey() fn.Option[*btcec.PublicKey] {
+	if !s.musig2 {
+		return fn.None[*btcec.PublicKey]()
+	}
+
+	// Similar to the existing p2wsh script, we'll always ensure the keys
+	// are sorted before use. Since we're only interested in the internal
+	// key, we don't need to take into account any tapscript root.
+	//
+	// We ignore the error here as this is only called after FundingOutput
+	// is called.
+	combinedKey, _, _, _ := musig2.AggregateKeys(
+		[]*btcec.PublicKey{s.localKey.PubKey, s.remoteKey}, true,
+	)
+
+	return fn.Some(combinedKey.PreTweakedKey)
 }
 
 // Cancel allows the caller to cancel a funding Intent at any time.  This will
@@ -171,13 +235,20 @@ type CannedAssembler struct {
 	// a normal channel. Until this height, it's considered frozen, so it
 	// can only be cooperatively closed by the responding party.
 	thawHeight uint32
+
+	// musig2 determines if the funding output should use musig2 to
+	// generate an aggregate key to use as the taproot-native multi-sig
+	// output.
+	musig2 bool
 }
 
 // NewCannedAssembler creates a new CannedAssembler from the material required
 // to construct a funding output and channel point.
+//
+// TODO(roasbeef): pass in chan type instead?
 func NewCannedAssembler(thawHeight uint32, chanPoint wire.OutPoint,
 	fundingAmt btcutil.Amount, localKey *keychain.KeyDescriptor,
-	remoteKey *btcec.PublicKey, initiator bool) *CannedAssembler {
+	remoteKey *btcec.PublicKey, initiator, musig2 bool) *CannedAssembler {
 
 	return &CannedAssembler{
 		initiator:  initiator,
@@ -186,6 +257,7 @@ func NewCannedAssembler(thawHeight uint32, chanPoint wire.OutPoint,
 		fundingAmt: fundingAmt,
 		chanPoint:  chanPoint,
 		thawHeight: thawHeight,
+		musig2:     musig2,
 	}
 }
 
@@ -195,11 +267,19 @@ func NewCannedAssembler(thawHeight uint32, chanPoint wire.OutPoint,
 //
 // NOTE: This method satisfies the chanfunding.Assembler interface.
 func (c *CannedAssembler) ProvisionChannel(req *Request) (Intent, error) {
-	// We'll exit out if this field is set as the funding transaction has
-	// already been assembled, so we don't influence coin selection..
+	// We'll exit out if SubtractFees is set as the funding transaction has
+	// already been assembled, so we don't influence coin selection.
 	if req.SubtractFees {
 		return nil, fmt.Errorf("SubtractFees ignored, funding " +
 			"transaction is frozen")
+	}
+
+	// We'll exit out if FundUpToMaxAmt or MinFundAmt is set as the funding
+	// transaction has already been assembled, so we don't influence coin
+	// selection.
+	if req.FundUpToMaxAmt != 0 || req.MinFundAmt != 0 {
+		return nil, fmt.Errorf("FundUpToMaxAmt and MinFundAmt " +
+			"ignored, funding transaction is frozen")
 	}
 
 	intent := &ShimIntent{
@@ -207,6 +287,7 @@ func (c *CannedAssembler) ProvisionChannel(req *Request) (Intent, error) {
 		remoteKey:  c.remoteKey,
 		chanPoint:  &c.chanPoint,
 		thawHeight: c.thawHeight,
+		musig2:     c.musig2,
 	}
 
 	if c.initiator {

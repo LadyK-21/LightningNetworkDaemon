@@ -22,6 +22,9 @@ const (
 	// force a historical sync to ensure we have as much of the public
 	// network as possible.
 	DefaultHistoricalSyncInterval = time.Hour
+
+	// filterSemaSize is the capacity of gossipFilterSema.
+	filterSemaSize = 5
 )
 
 var (
@@ -73,6 +76,11 @@ type SyncManagerCfg struct {
 	// gossip syncers will be passive.
 	NumActiveSyncers int
 
+	// NoTimestampQueries will prevent the GossipSyncer from querying
+	// timestamps of announcement messages from the peer and from responding
+	// to timestamp queries
+	NoTimestampQueries bool
+
 	// RotateTicker is a ticker responsible for notifying the SyncManager
 	// when it should rotate its active syncers. A single active syncer with
 	// a chansSynced state will be exchanged for a passive syncer in order
@@ -97,6 +105,11 @@ type SyncManagerCfg struct {
 	// ActiveSync upon connection. These peers will never transition to
 	// PassiveSync.
 	PinnedSyncers PinnedSyncers
+
+	// IsStillZombieChannel takes the timestamps of the latest channel
+	// updates for a channel and returns true if the channel should be
+	// considered a zombie based on these timestamps.
+	IsStillZombieChannel func(time.Time, time.Time) bool
 }
 
 // SyncManager is a subsystem of the gossiper that manages the gossip syncers
@@ -151,12 +164,22 @@ type SyncManager struct {
 	// duration of the connection.
 	pinnedActiveSyncers map[route.Vertex]*GossipSyncer
 
+	// gossipFilterSema contains semaphores for the gossip timestamp
+	// queries.
+	gossipFilterSema chan struct{}
+
 	wg   sync.WaitGroup
 	quit chan struct{}
 }
 
 // newSyncManager constructs a new SyncManager backed by the given config.
 func newSyncManager(cfg *SyncManagerCfg) *SyncManager {
+
+	filterSema := make(chan struct{}, filterSemaSize)
+	for i := 0; i < filterSemaSize; i++ {
+		filterSema <- struct{}{}
+	}
+
 	return &SyncManager{
 		cfg:          *cfg,
 		newSyncers:   make(chan *newSyncer),
@@ -168,7 +191,8 @@ func newSyncManager(cfg *SyncManagerCfg) *SyncManager {
 		pinnedActiveSyncers: make(
 			map[route.Vertex]*GossipSyncer, len(cfg.PinnedSyncers),
 		),
-		quit: make(chan struct{}),
+		gossipFilterSema: filterSema,
+		quit:             make(chan struct{}),
 	}
 }
 
@@ -183,6 +207,9 @@ func (m *SyncManager) Start() {
 // Stop stops the SyncManager from performing its duties.
 func (m *SyncManager) Stop() {
 	m.stop.Do(func() {
+		log.Debugf("SyncManager is stopping")
+		defer log.Debugf("SyncManager stopped")
+
 		close(m.quit)
 		m.wg.Wait()
 
@@ -492,7 +519,9 @@ func (m *SyncManager) createGossipSyncer(peer lnpeer.Peer) *GossipSyncer {
 		bestHeight:                m.cfg.BestHeight,
 		markGraphSynced:           m.markGraphSynced,
 		maxQueryChanRangeReplies:  maxQueryChanRangeReplies,
-	})
+		noTimestampQueryOption:    m.cfg.NoTimestampQueries,
+		isStillZombieChannel:      m.cfg.IsStillZombieChannel,
+	}, m.gossipFilterSema)
 
 	// Gossip syncers are initialized by default in a PassiveSync type
 	// and chansSynced state so that they can reply to any peer queries or
@@ -500,8 +529,8 @@ func (m *SyncManager) createGossipSyncer(peer lnpeer.Peer) *GossipSyncer {
 	s.setSyncState(chansSynced)
 	s.setSyncType(PassiveSync)
 
-	log.Debugf("Created new GossipSyncer[state=%s type=%s] for peer=%v",
-		s.syncState(), s.SyncType(), peer)
+	log.Debugf("Created new GossipSyncer[state=%s type=%s] for peer=%x",
+		s.syncState(), s.SyncType(), peer.PubKey())
 
 	return s
 }
@@ -546,7 +575,7 @@ func (m *SyncManager) removeGossipSyncer(peer route.Vertex) {
 		return
 	}
 
-	log.Debugf("Replaced active GossipSyncer(%x) with GossipSyncer(%x)",
+	log.Debugf("Replaced active GossipSyncer(%v) with GossipSyncer(%x)",
 		peer, newActiveSyncer.cfg.peerPub)
 }
 

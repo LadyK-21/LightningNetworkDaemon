@@ -38,7 +38,6 @@ func TestNetworkResultSerialization(t *testing.T) {
 		ChanID:          chanID,
 		ID:              2,
 		PaymentPreimage: preimage,
-		ExtraData:       make([]byte, 0),
 	}
 
 	fail := &lnwire.UpdateFailHTLC{
@@ -102,11 +101,7 @@ func TestNetworkResultStore(t *testing.T) {
 
 	const numResults = 4
 
-	db, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := channeldb.OpenForTesting(t, t.TempDir())
 
 	store := newNetworkResultStore(db)
 

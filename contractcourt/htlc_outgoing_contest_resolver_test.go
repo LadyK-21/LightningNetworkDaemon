@@ -7,12 +7,15 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -151,6 +154,13 @@ func newOutgoingResolverTestContext(t *testing.T) *outgoingResolverTestContext {
 				return nil
 			},
 			OnionProcessor: onionProcessor,
+			Budget:         *DefaultBudgetConfig(),
+			QueryIncomingCircuit: func(
+				circuit models.CircuitKey) *models.CircuitKey {
+
+				return nil
+			},
+			ChainIO: &mock.ChainIO{},
 		},
 		PutResolverReport: func(_ kvdb.RwTx,
 			_ *channeldb.ResolverReport) error {
@@ -183,10 +193,11 @@ func newOutgoingResolverTestContext(t *testing.T) *outgoingResolverTestContext {
 			htlc: channeldb.HTLC{
 				Amt:       lnwire.MilliSatoshi(testHtlcAmount),
 				RHash:     testResHash,
-				OnionBlob: testOnionBlob,
+				OnionBlob: lnmock.MockOnion(),
 			},
 		},
 	}
+	resolver.initLogger("htlcOutgoingContestResolver")
 
 	return &outgoingResolverTestContext{
 		resolver:       resolver,
@@ -201,6 +212,9 @@ func (i *outgoingResolverTestContext) resolve() {
 	// Start resolver.
 	i.resolverResultChan = make(chan resolveResult, 1)
 	go func() {
+		err := i.resolver.Launch()
+		require.NoError(i.t, err)
+
 		nextResolver, err := i.resolver.Resolve()
 		i.resolverResultChan <- resolveResult{
 			nextResolver: nextResolver,

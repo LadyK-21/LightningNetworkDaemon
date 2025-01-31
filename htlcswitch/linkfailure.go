@@ -51,6 +51,30 @@ const (
 	// circuit map. This is non-fatal and will resolve itself (usually
 	// within several minutes).
 	ErrCircuitError
+
+	// ErrStfuViolation indicates that the quiescence protocol has been
+	// violated, either because Stfu has been sent/received at an invalid
+	// time, or that an update has been sent/received while the channel is
+	// quiesced.
+	ErrStfuViolation
+)
+
+// LinkFailureAction is an enum-like type that describes the action that should
+// be taken in response to a link failure.
+type LinkFailureAction uint8
+
+const (
+	// LinkFailureForceNone indicates no action is to be taken.
+	LinkFailureForceNone LinkFailureAction = iota
+
+	// LinkFailureForceClose indicates that the channel should be force
+	// closed.
+	LinkFailureForceClose
+
+	// LinkFailureDisconnect indicates that we should disconnect in an
+	// attempt to recycle the connection. This can be useful if we think a
+	// TCP connection or state machine is stalled.
+	LinkFailureDisconnect
 )
 
 // LinkFailureError encapsulates an error that will make us fail the current
@@ -61,13 +85,16 @@ type LinkFailureError struct {
 	// code is the type of error this LinkFailureError encapsulates.
 	code errorCode
 
-	// ForceClose indicates whether we should force close the channel
-	// because of this error.
-	ForceClose bool
+	// FailureAction describes what we should do to fail the channel.
+	FailureAction LinkFailureAction
 
 	// PermanentFailure indicates whether this failure is permanent, and
 	// the channel should not be attempted loaded again.
 	PermanentFailure bool
+
+	// Warning denotes if this is a non-terminal error that doesn't warrant
+	// failing the channel all together.
+	Warning bool
 
 	// SendData is a byte slice that will be sent to the peer. If nil a
 	// generic error will be sent.
@@ -101,6 +128,8 @@ func (e LinkFailureError) Error() string {
 		return "unable to resume channel, recovery required"
 	case ErrCircuitError:
 		return "non-fatal circuit map error"
+	case ErrStfuViolation:
+		return "quiescence protocol executed improperly"
 	default:
 		return "unknown error"
 	}

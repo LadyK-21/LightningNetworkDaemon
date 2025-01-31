@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
@@ -57,31 +58,33 @@ func (c *chanDBRestorer) openChannelShell(backup chanbackup.Single) (
 		backup.LocalChanCfg.MultiSigKey.KeyLocator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to derive multi sig key: %v", err)
+		return nil, fmt.Errorf("unable to derive multi sig key: %w",
+			err)
 	}
 	backup.LocalChanCfg.RevocationBasePoint, err = c.secretKeys.DeriveKey(
 		backup.LocalChanCfg.RevocationBasePoint.KeyLocator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to derive revocation key: %v", err)
+		return nil, fmt.Errorf("unable to derive revocation key: %w",
+			err)
 	}
 	backup.LocalChanCfg.PaymentBasePoint, err = c.secretKeys.DeriveKey(
 		backup.LocalChanCfg.PaymentBasePoint.KeyLocator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to derive payment key: %v", err)
+		return nil, fmt.Errorf("unable to derive payment key: %w", err)
 	}
 	backup.LocalChanCfg.DelayBasePoint, err = c.secretKeys.DeriveKey(
 		backup.LocalChanCfg.DelayBasePoint.KeyLocator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to derive delay key: %v", err)
+		return nil, fmt.Errorf("unable to derive delay key: %w", err)
 	}
 	backup.LocalChanCfg.HtlcBasePoint, err = c.secretKeys.DeriveKey(
 		backup.LocalChanCfg.HtlcBasePoint.KeyLocator,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to derive htlc key: %v", err)
+		return nil, fmt.Errorf("unable to derive htlc key: %w", err)
 	}
 
 	// The shachain root that seeds RevocationProducer for this channel.
@@ -154,8 +157,21 @@ func (c *chanDBRestorer) openChannelShell(backup chanbackup.Single) (
 		chanType |= channeldb.AnchorOutputsBit
 		chanType |= channeldb.SingleFunderTweaklessBit
 
+	case chanbackup.SimpleTaprootVersion:
+		chanType = channeldb.ZeroHtlcTxFeeBit
+		chanType |= channeldb.AnchorOutputsBit
+		chanType |= channeldb.SingleFunderTweaklessBit
+		chanType |= channeldb.SimpleTaprootFeatureBit
+
+	case chanbackup.TapscriptRootVersion:
+		chanType = channeldb.ZeroHtlcTxFeeBit
+		chanType |= channeldb.AnchorOutputsBit
+		chanType |= channeldb.SingleFunderTweaklessBit
+		chanType |= channeldb.SimpleTaprootFeatureBit
+		chanType |= channeldb.TapscriptRootBit
+
 	default:
-		return nil, fmt.Errorf("unknown Single version: %v", err)
+		return nil, fmt.Errorf("unknown Single version: %w", err)
 	}
 
 	ltndLog.Infof("SCB Recovery: created channel shell for ChannelPoint"+
@@ -221,8 +237,8 @@ func (c *chanDBRestorer) RestoreChansFromSingles(backups ...chanbackup.Single) e
 
 		default:
 			// Worst case: We have no height hint and start at
-			// block 1. Should only happen for SCBs in regtest,
-			// simnet and litecoin.
+			// block 1. Should only happen for SCBs in regtest
+			// and simnet.
 			firstChanHeight = 1
 		}
 	}
@@ -271,6 +287,9 @@ func (c *chanDBRestorer) RestoreChansFromSingles(backups ...chanbackup.Single) e
 
 	ltndLog.Infof("Informing chain watchers of new restored channels")
 
+	// Create a slice of channel points.
+	chanPoints := make([]wire.OutPoint, 0, len(channelShells))
+
 	// Finally, we'll need to inform the chain arbitrator of these new
 	// channels so we'll properly watch for their ultimate closure on chain
 	// and sweep them via the DLP.
@@ -279,7 +298,14 @@ func (c *chanDBRestorer) RestoreChansFromSingles(backups ...chanbackup.Single) e
 		if err != nil {
 			return err
 		}
+
+		chanPoints = append(
+			chanPoints, restoredChannel.Chan.FundingOutpoint,
+		)
 	}
+
+	// With all the channels restored, we'll now re-send the blockbeat.
+	c.chainArb.RedispatchBlockbeat(chanPoints)
 
 	return nil
 }
@@ -299,7 +325,7 @@ func (s *server) ConnectPeer(nodePub *btcec.PublicKey, addrs []net.Addr) error {
 	// to ensure the new connection is created after this new link/channel
 	// is known.
 	if err := s.DisconnectPeer(nodePub); err != nil {
-		ltndLog.Infof("Peer(%v) is already connected, proceeding "+
+		ltndLog.Infof("Peer(%x) is already connected, proceeding "+
 			"with chan restore", nodePub.SerializeCompressed())
 	}
 

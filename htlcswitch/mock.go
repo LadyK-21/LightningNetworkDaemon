@@ -2,13 +2,12 @@ package htlcswitch
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -25,6 +24,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -33,6 +34,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 func isAlias(scid lnwire.ShortChannelID) bool {
@@ -79,6 +81,7 @@ func (m *mockPreimageCache) SubscribeUpdates(
 	return nil, nil
 }
 
+// TODO(yy): replace it with chainfee.MockEstimator.
 type mockFeeEstimator struct {
 	byteFeeIn chan chainfee.SatPerKWeight
 	relayFee  chan chainfee.SatPerKWeight
@@ -149,8 +152,10 @@ type mockServer struct {
 
 	t testing.TB
 
-	name     string
-	messages chan lnwire.Message
+	name             string
+	messages         chan lnwire.Message
+	protocolTraceMtx sync.Mutex
+	protocolTrace    []lnwire.Message
 
 	id         [33]byte
 	htlcSwitch *Switch
@@ -163,7 +168,7 @@ type mockServer struct {
 var _ lnpeer.Peer = (*mockServer)(nil)
 
 func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) {
-	signAliasUpdate := func(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+	signAliasUpdate := func(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 		error) {
 
 		return testSig, nil
@@ -179,9 +184,9 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 			events: make(map[time.Time]channeldb.ForwardingEvent),
 		},
 		FetchLastChannelUpdate: func(scid lnwire.ShortChannelID) (
-			*lnwire.ChannelUpdate, error) {
+			*lnwire.ChannelUpdate1, error) {
 
-			return &lnwire.ChannelUpdate{
+			return &lnwire.ChannelUpdate1{
 				ShortChannelID: scid,
 			}, nil
 		},
@@ -198,7 +203,7 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		HtlcNotifier:           &mockHTLCNotifier{},
 		Clock:                  clock.NewDefaultClock(),
 		MailboxDeliveryTimeout: time.Hour,
-		DustThreshold:          DefaultDustThreshold,
+		MaxFeeExposure:         DefaultMaxFeeExposure,
 		SignAliasUpdate:        signAliasUpdate,
 		IsAlias:                isAlias,
 	}
@@ -210,11 +215,7 @@ func initSwitchWithTempDB(t testing.TB, startingHeight uint32) (*Switch,
 	error) {
 
 	tempPath := filepath.Join(t.TempDir(), "switchdb")
-	db, err := channeldb.Open(tempPath)
-	if err != nil {
-		return nil, err
-	}
-	t.Cleanup(func() { db.Close() })
+	db := channeldb.OpenForTesting(t, tempPath)
 
 	s, err := initSwitchWithDB(startingHeight, db)
 	if err != nil {
@@ -248,9 +249,7 @@ func newMockServer(t testing.TB, name string, startingHeight uint32,
 
 	t.Cleanup(func() { _ = htlcSwitch.Stop() })
 
-	registry := newMockRegistry(defaultDelta)
-
-	t.Cleanup(func() { registry.cleanup() })
+	registry := newMockRegistry(t)
 
 	return &mockServer{
 		t:                t,
@@ -285,6 +284,10 @@ func (s *mockServer) Start() error {
 		for {
 			select {
 			case msg := <-s.messages:
+				s.protocolTraceMtx.Lock()
+				s.protocolTrace = append(s.protocolTrace, msg)
+				s.protocolTraceMtx.Unlock()
+
 				var shouldSkip bool
 
 				for _, interceptor := range s.interceptorFuncs {
@@ -328,10 +331,10 @@ func newMockHopIterator(hops ...*hop.Payload) hop.Iterator {
 	return &mockHopIterator{hops: hops}
 }
 
-func (r *mockHopIterator) HopPayload() (*hop.Payload, error) {
+func (r *mockHopIterator) HopPayload() (*hop.Payload, hop.RouteRole, error) {
 	h := r.hops[0]
 	r.hops = r.hops[1:]
-	return h, nil
+	return h, hop.RouteRoleCleartext, nil
 }
 
 func (r *mockHopIterator) ExtraOnionBlob() []byte {
@@ -339,7 +342,7 @@ func (r *mockHopIterator) ExtraOnionBlob() []byte {
 }
 
 func (r *mockHopIterator) ExtractErrorEncrypter(
-	extracter hop.ErrorEncrypterExtracter) (hop.ErrorEncrypter,
+	extracter hop.ErrorEncrypterExtracter, _ bool) (hop.ErrorEncrypter,
 	lnwire.FailCode) {
 
 	return extracter(nil)
@@ -364,10 +367,6 @@ func (r *mockHopIterator) EncodeNextHop(w io.Writer) error {
 }
 
 func encodeFwdInfo(w io.Writer, f *hop.ForwardingInfo) error {
-	if _, err := w.Write([]byte{byte(f.Network)}); err != nil {
-		return err
-	}
-
 	if err := binary.Write(w, binary.BigEndian, f.NextHop); err != nil {
 		return err
 	}
@@ -419,12 +418,16 @@ func (o *mockObfuscator) Reextract(
 	return nil
 }
 
+var fakeHmac = []byte("hmachmachmachmachmachmachmachmac")
+
 func (o *mockObfuscator) EncryptFirstHop(failure lnwire.FailureMessage) (
 	lnwire.OpaqueReason, error) {
 
 	o.failure = failure
 
 	var b bytes.Buffer
+	b.Write(fakeHmac)
+
 	if err := lnwire.EncodeFailure(&b, failure, 0); err != nil {
 		return nil, err
 	}
@@ -436,7 +439,12 @@ func (o *mockObfuscator) IntermediateEncrypt(reason lnwire.OpaqueReason) lnwire.
 }
 
 func (o *mockObfuscator) EncryptMalformedError(reason lnwire.OpaqueReason) lnwire.OpaqueReason {
-	return reason
+	var b bytes.Buffer
+	b.Write(fakeHmac)
+
+	b.Write(reason)
+
+	return b.Bytes()
 }
 
 // mockDeobfuscator mock implementation of the failure deobfuscator which
@@ -447,7 +455,13 @@ func newMockDeobfuscator() ErrorDecrypter {
 	return &mockDeobfuscator{}
 }
 
-func (o *mockDeobfuscator) DecryptError(reason lnwire.OpaqueReason) (*ForwardingError, error) {
+func (o *mockDeobfuscator) DecryptError(reason lnwire.OpaqueReason) (
+	*ForwardingError, error) {
+
+	if !bytes.Equal(reason[:32], fakeHmac) {
+		return nil, errors.New("fake decryption error")
+	}
+	reason = reason[32:]
 
 	r := bytes.NewReader(reason)
 	failure, err := lnwire.DecodeFailure(r, 0)
@@ -547,12 +561,6 @@ func (p *mockIteratorDecoder) DecodeHopIterators(id []byte,
 }
 
 func decodeFwdInfo(r io.Reader, f *hop.ForwardingInfo) error {
-	var net [1]byte
-	if _, err := r.Read(net[:]); err != nil {
-		return err
-	}
-	f.Network = hop.Network(net[0])
-
 	if err := binary.Read(r, binary.BigEndian, &f.NextHop); err != nil {
 		return err
 	}
@@ -611,12 +619,14 @@ func (s *mockServer) readHandler(message lnwire.Message) error {
 		targetChan = msg.ChanID
 	case *lnwire.CommitSig:
 		targetChan = msg.ChanID
-	case *lnwire.FundingLocked:
+	case *lnwire.ChannelReady:
 		// Ignore
 		return nil
 	case *lnwire.ChannelReestablish:
 		targetChan = msg.ChanID
 	case *lnwire.UpdateFee:
+		targetChan = msg.ChanID
+	case *lnwire.Stfu:
 		targetChan = msg.ChanID
 	default:
 		return fmt.Errorf("unknown message type: %T", msg)
@@ -650,9 +660,19 @@ func (s *mockServer) Address() net.Addr {
 	return nil
 }
 
-func (s *mockServer) AddNewChannel(channel *channeldb.OpenChannel,
+func (s *mockServer) AddNewChannel(channel *lnpeer.NewChannel,
 	cancel <-chan struct{}) error {
 
+	return nil
+}
+
+func (s *mockServer) AddPendingChannel(_ lnwire.ChannelID,
+	cancel <-chan struct{}) error {
+
+	return nil
+}
+
+func (s *mockServer) RemovePendingChannel(_ lnwire.ChannelID) error {
 	return nil
 }
 
@@ -665,6 +685,8 @@ func (s *mockServer) LocalFeatures() *lnwire.FeatureVector {
 func (s *mockServer) RemoteFeatures() *lnwire.FeatureVector {
 	return nil
 }
+
+func (s *mockServer) Disconnect(err error) {}
 
 func (s *mockServer) Stop() error {
 	if !atomic.CompareAndSwapInt32(&s.shutdown, 0, 1) {
@@ -714,7 +736,7 @@ type mockChannelLink struct {
 	checkHtlcForwardResult *LinkError
 
 	failAliasUpdate func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate
+		incoming bool) *lnwire.ChannelUpdate1
 
 	confirmedZC bool
 }
@@ -796,7 +818,9 @@ func (f *mockChannelLink) handleSwitchPacket(pkt *htlcPacket) error {
 	return nil
 }
 
-func (f *mockChannelLink) getDustSum(remote bool) lnwire.MilliSatoshi {
+func (f *mockChannelLink) getDustSum(whoseCommit lntypes.ChannelParty,
+	dryRunFee fn.Option[chainfee.SatPerKWeight]) lnwire.MilliSatoshi {
+
 	return 0
 }
 
@@ -811,26 +835,32 @@ func (f *mockChannelLink) getDustClosure() dustClosure {
 	)
 }
 
+func (f *mockChannelLink) getCommitFee(remote bool) btcutil.Amount {
+	return 0
+}
+
 func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
 }
 
-func (f *mockChannelLink) UpdateForwardingPolicy(_ ForwardingPolicy) {
+func (f *mockChannelLink) UpdateForwardingPolicy(_ models.ForwardingPolicy) {
 }
 func (f *mockChannelLink) CheckHtlcForward([32]byte, lnwire.MilliSatoshi,
-	lnwire.MilliSatoshi, uint32, uint32, uint32,
-	lnwire.ShortChannelID) *LinkError {
+	lnwire.MilliSatoshi, uint32, uint32, models.InboundFee, uint32,
+	lnwire.ShortChannelID, lnwire.CustomRecords) *LinkError {
 
 	return f.checkHtlcForwardResult
 }
 
 func (f *mockChannelLink) CheckHtlcTransit(payHash [32]byte,
 	amt lnwire.MilliSatoshi, timeout uint32,
-	heightNow uint32) *LinkError {
+	heightNow uint32, _ lnwire.CustomRecords) *LinkError {
 
 	return f.checkHtlcTransitResult
 }
 
-func (f *mockChannelLink) Stats() (uint64, lnwire.MilliSatoshi, lnwire.MilliSatoshi) {
+func (f *mockChannelLink) Stats() (
+	uint64, lnwire.MilliSatoshi, lnwire.MilliSatoshi) {
+
 	return 0, 0, 0
 }
 
@@ -841,7 +871,7 @@ func (f *mockChannelLink) AttachMailBox(mailBox MailBox) {
 }
 
 func (f *mockChannelLink) attachFailAliasUpdate(closure func(
-	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate) {
+	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate1) {
 
 	f.failAliasUpdate = closure
 }
@@ -872,15 +902,29 @@ func (f *mockChannelLink) Start() error {
 	return nil
 }
 
-func (f *mockChannelLink) ChanID() lnwire.ChannelID                     { return f.chanID }
-func (f *mockChannelLink) ShortChanID() lnwire.ShortChannelID           { return f.shortChanID }
-func (f *mockChannelLink) Bandwidth() lnwire.MilliSatoshi               { return 99999999 }
-func (f *mockChannelLink) Peer() lnpeer.Peer                            { return f.peer }
-func (f *mockChannelLink) ChannelPoint() *wire.OutPoint                 { return &wire.OutPoint{} }
+func (f *mockChannelLink) ChanID() lnwire.ChannelID {
+	return f.chanID
+}
+
+func (f *mockChannelLink) ShortChanID() lnwire.ShortChannelID {
+	return f.shortChanID
+}
+
+func (f *mockChannelLink) Bandwidth() lnwire.MilliSatoshi {
+	return 99999999
+}
+
+func (f *mockChannelLink) PeerPubKey() [33]byte {
+	return f.peer.PubKey()
+}
+
+func (f *mockChannelLink) ChannelPoint() wire.OutPoint {
+	return wire.OutPoint{}
+}
+
 func (f *mockChannelLink) Stop()                                        {}
 func (f *mockChannelLink) EligibleToForward() bool                      { return f.eligible }
 func (f *mockChannelLink) MayAddOutgoingHtlc(lnwire.MilliSatoshi) error { return nil }
-func (f *mockChannelLink) ShutdownIfChannelClean() error                { return nil }
 func (f *mockChannelLink) setLiveShortChanID(sid lnwire.ShortChannelID) { f.shortChanID = sid }
 func (f *mockChannelLink) IsUnadvertised() bool                         { return f.unadvertised }
 func (f *mockChannelLink) UpdateShortChanID() (lnwire.ShortChannelID, error) {
@@ -888,30 +932,54 @@ func (f *mockChannelLink) UpdateShortChanID() (lnwire.ShortChannelID, error) {
 	return f.shortChanID, nil
 }
 
-var _ ChannelLink = (*mockChannelLink)(nil)
-
-func newDB() (*channeldb.DB, func(), error) {
-	// First, create a temporary directory to be used for the duration of
-	// this test.
-	tempDirName, err := ioutil.TempDir("", "channeldb")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Next, create channeldb for the first time.
-	cdb, err := channeldb.Open(tempDirName)
-	if err != nil {
-		os.RemoveAll(tempDirName)
-		return nil, nil, err
-	}
-
-	cleanUp := func() {
-		cdb.Close()
-		os.RemoveAll(tempDirName)
-	}
-
-	return cdb, cleanUp, nil
+func (f *mockChannelLink) EnableAdds(linkDirection LinkDirection) bool {
+	// TODO(proofofkeags): Implement
+	return true
 }
+
+func (f *mockChannelLink) DisableAdds(linkDirection LinkDirection) bool {
+	// TODO(proofofkeags): Implement
+	return true
+}
+func (f *mockChannelLink) IsFlushing(linkDirection LinkDirection) bool {
+	// TODO(proofofkeags): Implement
+	return false
+}
+func (f *mockChannelLink) OnFlushedOnce(func()) {
+	// TODO(proofofkeags): Implement
+}
+func (f *mockChannelLink) OnCommitOnce(LinkDirection, func()) {
+	// TODO(proofofkeags): Implement
+}
+func (f *mockChannelLink) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
+	// TODO(proofofkeags): Implement
+	c := make(chan fn.Result[lntypes.ChannelParty], 1)
+
+	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not implemented")
+
+	return c
+}
+
+func (f *mockChannelLink) FundingCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (f *mockChannelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+// AuxBandwidth returns the bandwidth that can be used for a channel,
+// expressed in milli-satoshi. This might be different from the regular
+// BTC bandwidth for custom channels. This will always return fn.None()
+// for a regular (non-custom) channel.
+func (f *mockChannelLink) AuxBandwidth(lnwire.MilliSatoshi,
+	lnwire.ShortChannelID,
+	fn.Option[tlv.Blob], AuxTrafficShaper) fn.Result[OptionalBandwidth] {
+
+	return fn.Ok(fn.None[lnwire.MilliSatoshi]())
+}
+
+var _ ChannelLink = (*mockChannelLink)(nil)
 
 const testInvoiceCltvExpiry = 6
 
@@ -919,8 +987,6 @@ type mockInvoiceRegistry struct {
 	settleChan chan lntypes.Hash
 
 	registry *invoices.InvoiceRegistry
-
-	cleanup func()
 }
 
 type mockChainNotifier struct {
@@ -937,12 +1003,10 @@ func (m *mockChainNotifier) RegisterBlockEpochNtfn(*chainntnfs.BlockEpoch) (
 	}, nil
 }
 
-func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
-	cdb, cleanup, err := newDB()
-	if err != nil {
-		panic(err)
-	}
+func newMockRegistry(t testing.TB) *mockInvoiceRegistry {
+	cdb := channeldb.OpenForTesting(t, t.TempDir())
 
+	modifierMock := &invoices.MockHtlcModifier{}
 	registry := invoices.NewRegistry(
 		cdb,
 		invoices.NewInvoiceExpiryWatcher(
@@ -951,34 +1015,37 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		),
 		&invoices.RegistryConfig{
 			FinalCltvRejectDelta: 5,
+			HtlcInterceptor:      modifierMock,
 		},
 	)
 	registry.Start()
 
 	return &mockInvoiceRegistry{
 		registry: registry,
-		cleanup:  cleanup,
 	}
 }
 
-func (i *mockInvoiceRegistry) LookupInvoice(rHash lntypes.Hash) (
-	channeldb.Invoice, error) {
+func (i *mockInvoiceRegistry) LookupInvoice(ctx context.Context,
+	rHash lntypes.Hash) (invoices.Invoice, error) {
 
-	return i.registry.LookupInvoice(rHash)
+	return i.registry.LookupInvoice(ctx, rHash)
 }
 
-func (i *mockInvoiceRegistry) SettleHodlInvoice(preimage lntypes.Preimage) error {
-	return i.registry.SettleHodlInvoice(preimage)
+func (i *mockInvoiceRegistry) SettleHodlInvoice(
+	ctx context.Context, preimage lntypes.Preimage) error {
+
+	return i.registry.SettleHodlInvoice(ctx, preimage)
 }
 
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
-	circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+	circuitKey models.CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
 	event, err := i.registry.NotifyExitHopHtlc(
-		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
-		payload,
+		rhash, amt, expiry, currentHeight, circuitKey,
+		hodlChan, wireCustomRecords, payload,
 	)
 	if err != nil {
 		return nil, err
@@ -990,18 +1057,22 @@ func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	return event, nil
 }
 
-func (i *mockInvoiceRegistry) CancelInvoice(payHash lntypes.Hash) error {
-	return i.registry.CancelInvoice(payHash)
+func (i *mockInvoiceRegistry) CancelInvoice(ctx context.Context,
+	payHash lntypes.Hash) error {
+
+	return i.registry.CancelInvoice(ctx, payHash)
 }
 
-func (i *mockInvoiceRegistry) AddInvoice(invoice channeldb.Invoice,
-	paymentHash lntypes.Hash) error {
+func (i *mockInvoiceRegistry) AddInvoice(ctx context.Context,
+	invoice invoices.Invoice, paymentHash lntypes.Hash) error {
 
-	_, err := i.registry.AddInvoice(&invoice, paymentHash)
+	_, err := i.registry.AddInvoice(ctx, &invoice, paymentHash)
 	return err
 }
 
-func (i *mockInvoiceRegistry) HodlUnsubscribeAll(subscriber chan<- interface{}) {
+func (i *mockInvoiceRegistry) HodlUnsubscribeAll(
+	subscriber chan<- interface{}) {
+
 	i.registry.HodlUnsubscribeAll(subscriber)
 }
 
@@ -1080,26 +1151,31 @@ func (m *mockOnionErrorDecryptor) DecryptError(encryptedData []byte) (
 var _ htlcNotifier = (*mockHTLCNotifier)(nil)
 
 type mockHTLCNotifier struct {
-	htlcNotifier
+	htlcNotifier //nolint:unused
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
-	eventType HtlcEventType) { // nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
 	eventType HtlcEventType, linkErr *LinkError,
-	incoming bool) { // nolint:whitespace
+	incoming bool) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
-	eventType HtlcEventType) { // nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey,
-	preimage lntypes.Preimage, eventType HtlcEventType) { // nolint:whitespace
+	preimage lntypes.Preimage, eventType HtlcEventType) {
+
 }
 
-func (h *mockHTLCNotifier) NotifyFinalHtlcEvent(key channeldb.CircuitKey,
-	info channeldb.FinalHtlcInfo) { // nolint:whitespace
+func (h *mockHTLCNotifier) NotifyFinalHtlcEvent(key models.CircuitKey,
+	info channeldb.FinalHtlcInfo) {
+
 }

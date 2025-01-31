@@ -19,9 +19,14 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DevClient interface {
+	// lncli: `importgraph`
 	// ImportGraph imports a ChannelGraph into the graph database. Should only be
 	// used for development.
 	ImportGraph(ctx context.Context, in *lnrpc.ChannelGraph, opts ...grpc.CallOption) (*ImportGraphResponse, error)
+	// Quiesce instructs a channel to initiate the quiescence (stfu) protocol. This
+	// RPC is for testing purposes only. The commit that adds it will be removed
+	// once interop is confirmed.
+	Quiesce(ctx context.Context, in *QuiescenceRequest, opts ...grpc.CallOption) (*QuiescenceResponse, error)
 }
 
 type devClient struct {
@@ -41,13 +46,27 @@ func (c *devClient) ImportGraph(ctx context.Context, in *lnrpc.ChannelGraph, opt
 	return out, nil
 }
 
+func (c *devClient) Quiesce(ctx context.Context, in *QuiescenceRequest, opts ...grpc.CallOption) (*QuiescenceResponse, error) {
+	out := new(QuiescenceResponse)
+	err := c.cc.Invoke(ctx, "/devrpc.Dev/Quiesce", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DevServer is the server API for Dev service.
 // All implementations must embed UnimplementedDevServer
 // for forward compatibility
 type DevServer interface {
+	// lncli: `importgraph`
 	// ImportGraph imports a ChannelGraph into the graph database. Should only be
 	// used for development.
 	ImportGraph(context.Context, *lnrpc.ChannelGraph) (*ImportGraphResponse, error)
+	// Quiesce instructs a channel to initiate the quiescence (stfu) protocol. This
+	// RPC is for testing purposes only. The commit that adds it will be removed
+	// once interop is confirmed.
+	Quiesce(context.Context, *QuiescenceRequest) (*QuiescenceResponse, error)
 	mustEmbedUnimplementedDevServer()
 }
 
@@ -57,6 +76,9 @@ type UnimplementedDevServer struct {
 
 func (UnimplementedDevServer) ImportGraph(context.Context, *lnrpc.ChannelGraph) (*ImportGraphResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ImportGraph not implemented")
+}
+func (UnimplementedDevServer) Quiesce(context.Context, *QuiescenceRequest) (*QuiescenceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Quiesce not implemented")
 }
 func (UnimplementedDevServer) mustEmbedUnimplementedDevServer() {}
 
@@ -89,6 +111,24 @@ func _Dev_ImportGraph_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Dev_Quiesce_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(QuiescenceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DevServer).Quiesce(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/devrpc.Dev/Quiesce",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DevServer).Quiesce(ctx, req.(*QuiescenceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Dev_ServiceDesc is the grpc.ServiceDesc for Dev service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -99,6 +139,10 @@ var Dev_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ImportGraph",
 			Handler:    _Dev_ImportGraph_Handler,
+		},
+		{
+			MethodName: "Quiesce",
+			Handler:    _Dev_Quiesce_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -138,7 +138,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterNeutrinoKitServer(grpcServer, r)
 
-	log.Debugf("Neutrino RPC server successfully register with root " +
+	log.Debugf("Neutrino RPC server successfully registered with root " +
 		"gRPC server")
 
 	return nil
@@ -198,7 +198,7 @@ func (s *Server) Status(ctx context.Context,
 
 	bestBlock, err := s.cfg.NeutrinoCS.BestBlock()
 	if err != nil {
-		return nil, fmt.Errorf("could not get best block: %v", err)
+		return nil, fmt.Errorf("could not get best block: %w", err)
 	}
 
 	peers := s.cfg.NeutrinoCS.Peers()

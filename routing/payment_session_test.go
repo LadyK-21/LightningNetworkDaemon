@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -88,7 +88,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 
 	// Create a minimal test node using the private key priv1.
 	pub := priv1.PubKey().SerializeCompressed()
-	testNode := &channeldb.LightningNode{}
+	testNode := &models.LightningNode{}
 	copy(testNode.PubKeyBytes[:], pub)
 
 	nodeID, err := testNode.PubKey()
@@ -114,13 +114,11 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 
 	// Create the paymentsession.
 	session, err := newPaymentSession(
-		payment,
-		func(routingGraph) (bandwidthHints, error) {
+		payment, route.Vertex{},
+		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		func() (routingGraph, func(), error) {
-			return &sessionGraph{}, func() {}, nil
-		},
+		newMockGraphSessionFactory(&sessionGraph{}),
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -137,7 +135,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 	require.Equal(t, 1, len(policies), "should have 1 edge policy")
 
 	// Check that the policy has been created as expected.
-	policy := policies[0]
+	policy := policies[0].EdgePolicy()
 	require.Equal(t, testChannelID, policy.ChannelID, "channel ID mismatch")
 	require.Equal(t,
 		oldExpiryDelta, policy.TimeLockDelta, "timelock delta mismatch",
@@ -148,7 +146,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 	)
 
 	// Create the channel update message and sign.
-	msg := &lnwire.ChannelUpdate{
+	msg := &lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(testChannelID),
 		Timestamp:      uint32(time.Now().Unix()),
 		BaseFee:        newFeeBaseMSat,
@@ -194,13 +192,11 @@ func TestRequestRoute(t *testing.T) {
 	}
 
 	session, err := newPaymentSession(
-		payment,
-		func(routingGraph) (bandwidthHints, error) {
+		payment, route.Vertex{},
+		func(Graph) (bandwidthHints, error) {
 			return &mockBandwidthHints{}, nil
 		},
-		func() (routingGraph, func(), error) {
-			return &sessionGraph{}, func() {}, nil
-		},
+		newMockGraphSessionFactory(&sessionGraph{}),
 		&MissionControl{},
 		PathFindingConfig{},
 	)
@@ -209,11 +205,10 @@ func TestRequestRoute(t *testing.T) {
 	}
 
 	// Override pathfinder with a mock.
-	session.pathFinder = func(
-		g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
-		source, target route.Vertex, amt lnwire.MilliSatoshi,
-		timePref float64,
-		finalHtlcExpiry int32) ([]*channeldb.CachedEdgePolicy, error) {
+	session.pathFinder = func(_ *graphParams, r *RestrictParams,
+		_ *PathFindingConfig, _, _, _ route.Vertex,
+		_ lnwire.MilliSatoshi, _ float64, _ int32) ([]*unifiedEdge,
+		float64, error) {
 
 		// We expect find path to receive a cltv limit excluding the
 		// final cltv delta (including the block padding).
@@ -221,22 +216,27 @@ func TestRequestRoute(t *testing.T) {
 			t.Fatal("wrong cltv limit")
 		}
 
-		path := []*channeldb.CachedEdgePolicy{
+		path := []*unifiedEdge{
 			{
-				ToNodePubKey: func() route.Vertex {
-					return route.Vertex{}
+				policy: &models.CachedEdgePolicy{
+					ToNodePubKey: func() route.Vertex {
+						return route.Vertex{}
+					},
+					ToNodeFeatures: lnwire.NewFeatureVector(
+						nil, nil,
+					),
 				},
-				ToNodeFeatures: lnwire.NewFeatureVector(
-					nil, nil,
-				),
 			},
 		}
 
-		return path, nil
+		return path, 1.0, nil
 	}
 
 	route, err := session.RequestRoute(
 		payment.Amount, payment.FeeLimit, 0, height,
+		lnwire.CustomRecords{
+			lnwire.MinCustomRecordsTlvType + 123: []byte{1, 2, 3},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestRequestRoute(t *testing.T) {
 }
 
 type sessionGraph struct {
-	routingGraph
+	Graph
 }
 
 func (g *sessionGraph) sourceNode() route.Vertex {

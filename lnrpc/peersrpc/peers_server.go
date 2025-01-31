@@ -116,7 +116,7 @@ func (r *ServerShell) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	// all our methods are routed properly.
 	RegisterPeersServer(grpcServer, r)
 
-	log.Debugf("Peers RPC server successfully register with root " +
+	log.Debugf("Peers RPC server successfully registered with root " +
 		"gRPC server")
 
 	return nil
@@ -313,32 +313,29 @@ func (s *Server) UpdateNodeAnnouncement(_ context.Context,
 	resp := &NodeAnnouncementUpdateResponse{}
 	nodeModifiers := make([]netann.NodeAnnModifier, 0)
 
-	currentNodeAnn, err := s.cfg.GetNodeAnnouncement()
-	if err != nil {
-		return nil, fmt.Errorf("unable to get current node "+
-			"announcement: %v", err)
-	}
+	currentNodeAnn := s.cfg.GetNodeAnnouncement()
 
-	if len(req.FeatureUpdates) > 0 {
-		features, ops, err := s.updateFeatures(
-			currentNodeAnn.Features,
-			req.FeatureUpdates,
+	nodeAnnFeatures := currentNodeAnn.Features
+	featureUpdates := len(req.FeatureUpdates) > 0
+	if featureUpdates {
+		var (
+			ops *lnrpc.Op
+			err error
+		)
+		nodeAnnFeatures, ops, err = s.updateFeatures(
+			nodeAnnFeatures, req.FeatureUpdates,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error trying to update node "+
 				"features: %w", err)
 		}
 		resp.Ops = append(resp.Ops, ops)
-		nodeModifiers = append(
-			nodeModifiers,
-			netann.NodeAnnSetFeatures(features),
-		)
 	}
 
 	if req.Color != "" {
 		color, err := lncfg.ParseHexColor(req.Color)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse color: %v", err)
+			return nil, fmt.Errorf("unable to parse color: %w", err)
 		}
 
 		if color != currentNodeAnn.RGBColor {
@@ -358,7 +355,7 @@ func (s *Server) UpdateNodeAnnouncement(_ context.Context,
 	if req.Alias != "" {
 		alias, err := lnwire.NewNodeAlias(req.Alias)
 		if err != nil {
-			return nil, fmt.Errorf("invalid alias value: %v", err)
+			return nil, fmt.Errorf("invalid alias value: %w", err)
 		}
 		if alias != currentNodeAnn.Alias {
 			resp.Ops = append(resp.Ops, &lnrpc.Op{
@@ -390,12 +387,14 @@ func (s *Server) UpdateNodeAnnouncement(_ context.Context,
 		)
 	}
 
-	if len(nodeModifiers) == 0 {
-		return nil, fmt.Errorf("unable detect any new values to " +
+	if len(nodeModifiers) == 0 && !featureUpdates {
+		return nil, fmt.Errorf("unable to detect any new values to " +
 			"update the node announcement")
 	}
 
-	if err := s.cfg.UpdateNodeAnnouncement(nodeModifiers...); err != nil {
+	if err := s.cfg.UpdateNodeAnnouncement(
+		nodeAnnFeatures, nodeModifiers...,
+	); err != nil {
 		return nil, err
 	}
 

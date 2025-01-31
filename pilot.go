@@ -17,7 +17,7 @@ import (
 	"github.com/lightningnetwork/lnd/tor"
 )
 
-// validateAtplConfig is a helper method that makes sure the passed
+// validateAtplCfg is a helper method that makes sure the passed
 // configuration is sane. Currently it checks that the heuristic configuration
 // makes sense. In case the config is valid, it will return a list of
 // WeightedHeuristics that can be combined for use with the autopilot agent.
@@ -282,7 +282,7 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 		ChannelInfo: func(chanPoint wire.OutPoint) (
 			*autopilot.LocalChannel, error) {
 
-			channel, err := svr.chanStateDB.FetchChannel(nil, chanPoint)
+			channel, err := svr.chanStateDB.FetchChannel(chanPoint)
 			if err != nil {
 				return nil, err
 			}
@@ -295,6 +295,6 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 			}, nil
 		},
 		SubscribeTransactions: svr.cc.Wallet.SubscribeTransactions,
-		SubscribeTopology:     svr.chanRouter.SubscribeTopology,
+		SubscribeTopology:     svr.graphBuilder.SubscribeTopology,
 	}, nil
 }

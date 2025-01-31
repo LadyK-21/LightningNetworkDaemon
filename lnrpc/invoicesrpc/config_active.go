@@ -6,10 +6,12 @@ package invoicesrpc
 import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/netann"
+	"google.golang.org/protobuf/proto"
 )
 
 // Config is the primary configuration struct for the invoices RPC server. It
@@ -30,6 +32,11 @@ type Config struct {
 	// created by the daemon.
 	InvoiceRegistry *invoices.InvoiceRegistry
 
+	// HtlcModifier is a service which intercepts invoice HTLCs during the
+	// settlement phase, enabling a subscribed client to modify certain
+	// aspects of those HTLCs.
+	HtlcModifier invoices.HtlcModifier
+
 	// IsChannelActive is used to generate valid hop hints.
 	IsChannelActive func(chanID lnwire.ChannelID) bool
 
@@ -47,7 +54,7 @@ type Config struct {
 
 	// GraphDB is a global database instance which is needed to access the
 	// channel graph.
-	GraphDB *channeldb.ChannelGraph
+	GraphDB *graphdb.ChannelGraph
 
 	// ChanStateDB is a possibly replicated db instance which contains the
 	// channel state
@@ -64,4 +71,8 @@ type Config struct {
 	// GetAlias returns the peer's alias SCID if it exists given the
 	// 32-byte ChannelID.
 	GetAlias func(lnwire.ChannelID) (lnwire.ShortChannelID, error)
+
+	// ParseAuxData is a function that can be used to parse the auxiliary
+	// data from the invoice.
+	ParseAuxData func(message proto.Message) error
 }

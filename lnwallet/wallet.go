@@ -12,6 +12,7 @@ import (
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/btcutil/txsort"
@@ -19,15 +20,19 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 const (
@@ -61,6 +66,14 @@ var (
 	ErrReservedValueInvalidated = errors.New("reserved wallet balance " +
 		"invalidated: transaction would leave insufficient funds for " +
 		"fee bumping anchor channel closings (see debug log for details)")
+
+	// ErrEmptyPendingChanID is returned when an empty value is used for
+	// the pending channel ID.
+	ErrEmptyPendingChanID = errors.New("pending channel ID is empty")
+
+	// ErrDuplicatePendingChanID is returned when an existing pending
+	// channel ID is registered again.
+	ErrDuplicatePendingChanID = errors.New("duplicate pending channel ID")
 )
 
 // PsbtFundingRequired is a type that implements the error interface and
@@ -76,6 +89,33 @@ type PsbtFundingRequired struct {
 // NOTE: This method is part of the error interface.
 func (p *PsbtFundingRequired) Error() string {
 	return ErrPsbtFundingRequired.Error()
+}
+
+// AuxFundingDesc stores a series of attributes that may be used to modify the
+// way the channel funding occurs. This struct contains information that can
+// only be derived once both sides have received and sent their contributions
+// to the channel (keys, etc.).
+type AuxFundingDesc struct {
+	// CustomFundingBlob is a custom blob that'll be stored in the database
+	// within the OpenChannel struct. This should represent information
+	// static to the channel lifetime.
+	CustomFundingBlob tlv.Blob
+
+	// CustomLocalCommitBlob is a custom blob that'll be stored in the
+	// first commitment entry for the local party.
+	CustomLocalCommitBlob tlv.Blob
+
+	// CustomRemoteCommitBlob is a custom blob that'll be stored in the
+	// first commitment entry for the remote party.
+	CustomRemoteCommitBlob tlv.Blob
+
+	// LocalInitAuxLeaves is the set of aux leaves that'll be used for our
+	// very first commitment state.
+	LocalInitAuxLeaves CommitAuxLeaves
+
+	// RemoteInitAuxLeaves is the set of aux leaves that'll be used for the
+	// very first commitment state for the remote party.
+	RemoteInitAuxLeaves CommitAuxLeaves
 }
 
 // InitFundingReserveMsg is the first message sent to initiate the workflow
@@ -121,6 +161,27 @@ type InitFundingReserveMsg struct {
 	// to this channel.
 	RemoteFundingAmt btcutil.Amount
 
+	// FundUpToMaxAmt defines if channel funding should try to add as many
+	// funds to the channel opening as possible up to this amount. If used,
+	// then MinFundAmt is treated as the minimum amount of funds that must
+	// be available to open the channel. If set to zero it is ignored.
+	FundUpToMaxAmt btcutil.Amount
+
+	// MinFundAmt denotes the minimum channel capacity that has to be
+	// allocated iff the FundUpToMaxAmt is set.
+	MinFundAmt btcutil.Amount
+
+	// Outpoints is a list of client-selected outpoints that should be used
+	// for funding a channel. If LocalFundingAmt is specified then this
+	// amount is allocated from the sum of outpoints towards funding. If the
+	// FundUpToMaxAmt is specified the entirety of selected funds is
+	// allocated towards channel funding.
+	Outpoints []wire.OutPoint
+
+	// RemoteChanReserve is the channel reserve we required for the remote
+	// peer.
+	RemoteChanReserve btcutil.Amount
+
 	// CommitFeePerKw is the starting accepted satoshis/Kw fee for the set
 	// of initial commitment transactions. In order to ensure timely
 	// confirmation, it is recommended that this fee should be generous,
@@ -153,6 +214,15 @@ type InitFundingReserveMsg struct {
 	// used.
 	ChanFunder chanfunding.Assembler
 
+	// AllowUtxoForFunding enables the channel funding workflow to restrict
+	// the selection of utxos when selecting the inputs for the channel
+	// opening. This does ONLY apply for the internal wallet backed channel
+	// opening case.
+	//
+	// NOTE: This is very useful when opening channels with unconfirmed
+	// inputs to make sure stable non-replaceable inputs are used.
+	AllowUtxoForFunding func(Utxo) bool
+
 	// ZeroConf is a boolean that is true if a zero-conf channel was
 	// negotiated.
 	ZeroConf bool
@@ -164,6 +234,14 @@ type InitFundingReserveMsg struct {
 	// ScidAliasFeature is true if the option-scid-alias feature bit was
 	// negotiated.
 	ScidAliasFeature bool
+
+	// Memo is any arbitrary information we wish to store locally about the
+	// channel that will be useful to our future selves.
+	Memo []byte
+
+	// TapscriptRoot is an optional tapscript root that if provided, will
+	// be used to create the combined key for musig2 based channels.
+	TapscriptRoot fn.Option[chainhash.Hash]
 
 	// err is a channel in which all errors will be sent across. Will be
 	// nil if this initial set is successful.
@@ -200,7 +278,6 @@ type fundingReserveCancelMsg struct {
 type addContributionMsg struct {
 	pendingFundingID uint64
 
-	// TODO(roasbeef): Should also carry SPV proofs in we're in SPV mode
 	contribution *ChannelContribution
 
 	// NOTE: In order to avoid deadlocks, this channel MUST be buffered.
@@ -212,6 +289,10 @@ type addContributionMsg struct {
 // finalized transaction is now available.
 type continueContributionMsg struct {
 	pendingFundingID uint64
+
+	// auxFundingDesc is an optional descriptor that contains information
+	// about the custom channel funding flow.
+	auxFundingDesc fn.Option[AuxFundingDesc]
 
 	// NOTE: In order to avoid deadlocks, this channel MUST be buffered.
 	err chan error
@@ -267,6 +348,10 @@ type addCounterPartySigsMsg struct {
 // transactions, signing the remote party's version.
 type addSingleFunderSigsMsg struct {
 	pendingFundingID uint64
+
+	// auxFundingDesc is an optional descriptor that contains information
+	// about the custom channel funding flow.
+	auxFundingDesc fn.Option[AuxFundingDesc]
 
 	// fundingOutpoint is the outpoint of the completed funding
 	// transaction as assembled by the workflow initiator.
@@ -371,8 +456,6 @@ type LightningWallet struct {
 	quit chan struct{}
 
 	wg sync.WaitGroup
-
-	// TODO(roasbeef): handle wallet lock/unlock
 }
 
 // NewLightningWallet creates/opens and initializes a LightningWallet instance.
@@ -407,8 +490,16 @@ func (l *LightningWallet) Startup() error {
 		return err
 	}
 
+	if l.Cfg.Rebroadcaster != nil {
+		go func() {
+			if err := l.Cfg.Rebroadcaster.Start(); err != nil {
+				walletLog.Errorf("unable to start "+
+					"rebroadcaster: %v", err)
+			}
+		}()
+	}
+
 	l.wg.Add(1)
-	// TODO(roasbeef): multiple request handlers?
 	go l.requestHandler()
 
 	return nil
@@ -426,8 +517,72 @@ func (l *LightningWallet) Shutdown() error {
 		return err
 	}
 
+	if l.Cfg.Rebroadcaster != nil && l.Cfg.Rebroadcaster.Started() {
+		l.Cfg.Rebroadcaster.Stop()
+	}
+
 	close(l.quit)
 	l.wg.Wait()
+	return nil
+}
+
+// PublishTransaction wraps the wallet controller tx publish method with an
+// extra rebroadcaster layer if the sub-system is configured.
+func (l *LightningWallet) PublishTransaction(tx *wire.MsgTx,
+	label string) error {
+
+	sendTxToWallet := func() error {
+		return l.WalletController.PublishTransaction(tx, label)
+	}
+
+	// If we don't have rebroadcaster then we can exit early (and send only
+	// to the wallet).
+	if l.Cfg.Rebroadcaster == nil || !l.Cfg.Rebroadcaster.Started() {
+		return sendTxToWallet()
+	}
+
+	// We pass this into the rebroadcaster first, so the initial attempt
+	// will succeed if the transaction isn't yet in the mempool. However we
+	// ignore the error here as this might be resent on start up and the
+	// transaction already exists.
+	_ = l.Cfg.Rebroadcaster.Broadcast(tx)
+
+	// Then we pass things into the wallet as normal, which'll add the
+	// transaction label on disk.
+	if err := sendTxToWallet(); err != nil {
+		return err
+	}
+
+	// TODO(roasbeef): want diff height actually? no context though
+	_, bestHeight, err := l.Cfg.ChainIO.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	txHash := tx.TxHash()
+	go func() {
+		const numConfs = 6
+
+		txConf, err := l.Cfg.Notifier.RegisterConfirmationsNtfn(
+			&txHash, tx.TxOut[0].PkScript, numConfs,
+			uint32(bestHeight),
+		)
+		if err != nil {
+			return
+		}
+
+		select {
+		case <-txConf.Confirmed:
+			// TODO(roasbeef): also want to remove from
+			// rebroadcaster if conflict happens...deeper wallet
+			// integration?
+			l.Cfg.Rebroadcaster.MarkAsConfirmed(tx.TxHash())
+
+		case <-l.quit:
+			return
+		}
+	}()
+
 	return nil
 }
 
@@ -480,7 +635,7 @@ func (l *LightningWallet) ResetReservations() {
 	l.reservationIDs = make(map[[32]byte]uint64)
 
 	for outpoint := range l.lockedOutPoints {
-		l.UnlockOutpoint(outpoint)
+		_ = l.ReleaseOutput(chanfunding.LndInternalLockID, outpoint)
 	}
 	l.lockedOutPoints = make(map[wire.OutPoint]struct{})
 }
@@ -571,9 +726,15 @@ func (l *LightningWallet) RegisterFundingIntent(expectedID [32]byte,
 	l.intentMtx.Lock()
 	defer l.intentMtx.Unlock()
 
+	// Sanity check the pending channel ID is not empty.
+	var zeroID [32]byte
+	if expectedID == zeroID {
+		return ErrEmptyPendingChanID
+	}
+
 	if _, ok := l.fundingIntents[expectedID]; ok {
-		return fmt.Errorf("pendingChanID(%x) already has intent "+
-			"registered", expectedID[:])
+		return fmt.Errorf("%w: already has intent registered: %x",
+			ErrDuplicatePendingChanID, expectedID[:])
 	}
 
 	l.fundingIntents[expectedID] = shimIntent
@@ -607,7 +768,7 @@ func (l *LightningWallet) PsbtFundingVerify(pendingChanID [32]byte,
 
 	err := psbtIntent.Verify(packet, skipFinalize)
 	if err != nil {
-		return fmt.Errorf("error verifying PSBT: %v", err)
+		return fmt.Errorf("error verifying PSBT: %w", err)
 	}
 
 	// Get the channel reservation for that corresponds to this pending
@@ -628,7 +789,7 @@ func (l *LightningWallet) PsbtFundingVerify(pendingChanID [32]byte,
 			"reservation ID %v", pid)
 	}
 
-	// Now the the PSBT has been populated and verified, we can again check
+	// Now the PSBT has been populated and verified, we can again check
 	// whether the value reserved for anchor fee bumping is respected.
 	isPublic := pendingReservation.partialState.ChannelFlags&lnwire.FFAnnounceChannel != 0
 	hasAnchors := pendingReservation.partialState.ChanType.HasAnchors()
@@ -659,13 +820,13 @@ func (l *LightningWallet) PsbtFundingFinalize(pid [32]byte, packet *psbt.Packet,
 	case packet != nil && rawTx == nil:
 		err := psbtIntent.Finalize(packet)
 		if err != nil {
-			return fmt.Errorf("error finalizing PSBT: %v", err)
+			return fmt.Errorf("error finalizing PSBT: %w", err)
 		}
 
 	case rawTx != nil && packet == nil:
 		err := psbtIntent.FinalizeRawTX(rawTx)
 		if err != nil {
-			return fmt.Errorf("error finalizing raw TX: %v", err)
+			return fmt.Errorf("error finalizing raw TX: %w", err)
 		}
 
 	default:
@@ -699,8 +860,12 @@ func (l *LightningWallet) CancelFundingIntent(pid [32]byte) error {
 // handleFundingReserveRequest processes a message intending to create, and
 // validate a funding reservation request.
 func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg) {
+
+	noFundsCommitted := req.LocalFundingAmt == 0 &&
+		req.RemoteFundingAmt == 0 && req.FundUpToMaxAmt == 0
+
 	// It isn't possible to create a channel with zero funds committed.
-	if req.LocalFundingAmt+req.RemoteFundingAmt == 0 {
+	if noFundsCommitted {
 		err := ErrZeroCapacity()
 		req.err <- err
 		req.resp <- nil
@@ -731,11 +896,16 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 		// P2WPKH dust limit and to avoid threading through two
 		// different dust limits.
 		cfg := chanfunding.WalletConfig{
-			CoinSource:       &CoinSource{l},
+			CoinSource: NewCoinSource(
+				l, req.AllowUtxoForFunding,
+			),
 			CoinSelectLocker: l,
-			CoinLocker:       l,
+			CoinLeaser:       l,
 			Signer:           l.Cfg.Signer,
-			DustLimit:        DustLimitForSize(input.P2WSHSize),
+			DustLimit: DustLimitForSize(
+				input.P2WSHSize,
+			),
+			CoinSelectionStrategy: l.Cfg.CoinSelectionStrategy,
 		}
 		req.ChanFunder = chanfunding.NewWalletAssembler(cfg)
 	} else {
@@ -745,6 +915,7 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 
 	localFundingAmt := req.LocalFundingAmt
 	remoteFundingAmt := req.RemoteFundingAmt
+	hasAnchors := req.CommitType.HasAnchors()
 
 	var (
 		fundingIntent chanfunding.Intent
@@ -764,12 +935,46 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 	// funder in the attached request to provision the inputs/outputs
 	// that'll ultimately be used to construct the funding transaction.
 	if !ok {
+		var err error
+		var numAnchorChans int
+
+		// Get the number of anchor channels to determine if there is a
+		// reserved value that must be respected when funding up to the
+		// maximum amount. Since private channels (most likely) won't be
+		// used for routing other than the last hop, they bear a smaller
+		// risk that we must force close them in order to resolve a HTLC
+		// up/downstream. Hence we exclude them from the count of anchor
+		// channels in order to attribute the respective anchor amount
+		// to the channel capacity.
+		if req.FundUpToMaxAmt > 0 && req.MinFundAmt > 0 {
+			numAnchorChans, err = l.CurrentNumAnchorChans()
+			if err != nil {
+				req.err <- err
+				req.resp <- nil
+				return
+			}
+
+			isPublic := req.Flags&lnwire.FFAnnounceChannel != 0
+			if hasAnchors && isPublic {
+				numAnchorChans++
+			}
+		}
+
 		// Coin selection is done on the basis of sat/kw, so we'll use
 		// the fee rate passed in to perform coin selection.
-		var err error
 		fundingReq := &chanfunding.Request{
-			RemoteAmt:    req.RemoteFundingAmt,
-			LocalAmt:     req.LocalFundingAmt,
+			RemoteAmt:         req.RemoteFundingAmt,
+			LocalAmt:          req.LocalFundingAmt,
+			FundUpToMaxAmt:    req.FundUpToMaxAmt,
+			MinFundAmt:        req.MinFundAmt,
+			RemoteChanReserve: req.RemoteChanReserve,
+			PushAmt: lnwire.MilliSatoshi.ToSatoshis(
+				req.PushMSat,
+			),
+			WalletReserve: l.RequiredReserve(
+				uint32(numAnchorChans),
+			),
+			Outpoints:    req.Outpoints,
 			MinConfs:     req.MinConfs,
 			SubtractFees: req.SubtractFees,
 			FeeRate:      req.FundingFeePerKw,
@@ -778,6 +983,7 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 					TaprootPubkey, true, DefaultAccountName,
 				)
 			},
+			Musig2: req.CommitType.IsTaproot(),
 		}
 		fundingIntent, err = req.ChanFunder.ProvisionChannel(
 			fundingReq,
@@ -797,6 +1003,9 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 			req.resp <- nil
 			return
 		}
+
+		walletLog.Debugf("Registered funding intent for "+
+			"PendingChanID: %x", req.PendingChanID)
 
 		localFundingAmt = fundingIntent.LocalFundingAmt()
 		remoteFundingAmt = fundingIntent.RemoteFundingAmt()
@@ -839,7 +1048,6 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 	// funding tx ready, so this will always pass.  We'll do another check
 	// when the PSBT has been verified.
 	isPublic := req.Flags&lnwire.FFAnnounceChannel != 0
-	hasAnchors := req.CommitType.HasAnchors()
 	if enforceNewReservedValue {
 		err = l.enforceNewReservedValue(fundingIntent, isPublic, hasAnchors)
 		if err != nil {
@@ -891,6 +1099,10 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 	// completed, or canceled.
 	req.resp <- reservation
 	req.err <- nil
+
+	walletLog.Debugf("Successfully handled funding reservation with "+
+		"pendingChanID: %x, reservationID: %v",
+		reservation.pendingChanID, reservation.reservationID)
 }
 
 // enforceReservedValue enforces that the wallet, upon a new channel being
@@ -986,7 +1198,7 @@ func (l *LightningWallet) CurrentNumAnchorChans() (int, error) {
 // CheckReservedValue checks whether publishing a transaction with the given
 // inputs and outputs would violate the value we reserve in the wallet for
 // bumping the fee of anchor channels. The numAnchorChans argument should be
-// set the the number of open anchor channels controlled by the wallet after
+// set the number of open anchor channels controlled by the wallet after
 // the transaction has been published.
 //
 // If the reserved value is violated, the returned error will be
@@ -1056,10 +1268,7 @@ func (l *LightningWallet) CheckReservedValue(in []wire.OutPoint,
 	}
 
 	// We reserve a given amount for each anchor channel.
-	reserved := btcutil.Amount(numAnchorChans) * AnchorChanReservedValue
-	if reserved > MaxAnchorChanReservedValue {
-		reserved = MaxAnchorChanReservedValue
-	}
+	reserved := l.RequiredReserve(uint32(numAnchorChans))
 
 	if walletBalance < reserved {
 		walletLog.Debugf("Reserved value=%v above final "+
@@ -1189,8 +1398,11 @@ func (l *LightningWallet) initOurContribution(reservation *ChannelReservation,
 	}
 
 	// With the above keys created, we'll also need to initialize our
-	// revocation tree state, and from that generate the per-commitment point.
-	producer, err := l.nextRevocationProducer(reservation, keyRing)
+	// revocation tree state, and from that generate the per-commitment
+	// point.
+	producer, taprootNonceProducer, err := l.nextRevocationProducer(
+		reservation, keyRing,
+	)
 	if err != nil {
 		return err
 	}
@@ -1204,7 +1416,36 @@ func (l *LightningWallet) initOurContribution(reservation *ChannelReservation,
 	)
 
 	reservation.partialState.RevocationProducer = producer
-	reservation.ourContribution.ChannelConstraints = l.Cfg.DefaultConstraints
+	reservation.ourContribution.CommitmentParams.DustLimit =
+		DustLimitUnknownWitness()
+
+	// If taproot channels are active, then we'll generate our verification
+	// nonce here. We'll use this nonce to verify the signature for our
+	// local commitment transaction. If we need to force close, then this
+	// is also what'll be used to sign that transaction.
+	if reservation.partialState.ChanType.IsTaproot() {
+		firstNoncePreimage, err := taprootNonceProducer.AtIndex(0)
+		if err != nil {
+			return err
+		}
+
+		// As we'd like the local nonce we send over to be generated
+		// deterministically, we'll provide a custom reader that
+		// actually just uses our sha-chain pre-image as the primary
+		// randomness source.
+		shaChainRand := musig2.WithCustomRand(
+			bytes.NewBuffer(firstNoncePreimage[:]),
+		)
+		pubKeyOpt := musig2.WithPublicKey(
+			reservation.ourContribution.MultiSigKey.PubKey,
+		)
+		reservation.ourContribution.LocalNonce, err = musig2.GenNonces(
+			pubKeyOpt, shaChainRand,
+		)
+		if err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -1214,7 +1455,6 @@ func (l *LightningWallet) initOurContribution(reservation *ChannelReservation,
 // transaction via coin selection are freed allowing future reservations to
 // include them.
 func (l *LightningWallet) handleFundingCancelRequest(req *fundingReserveCancelMsg) {
-	// TODO(roasbeef): holding lock too long
 	l.limboMtx.Lock()
 	defer l.limboMtx.Unlock()
 
@@ -1233,13 +1473,11 @@ func (l *LightningWallet) handleFundingCancelRequest(req *fundingReserveCancelMs
 	// requests.
 	for _, unusedInput := range pendingReservation.ourContribution.Inputs {
 		delete(l.lockedOutPoints, unusedInput.PreviousOutPoint)
-		l.UnlockOutpoint(unusedInput.PreviousOutPoint)
+		_ = l.ReleaseOutput(
+			chanfunding.LndInternalLockID,
+			unusedInput.PreviousOutPoint,
+		)
 	}
-
-	// TODO(roasbeef): is it even worth it to keep track of unused keys?
-
-	// TODO(roasbeef): Is it possible to mark the unused change also as
-	// available?
 
 	delete(l.fundingLimbo, req.pendingFundingID)
 
@@ -1257,6 +1495,33 @@ func (l *LightningWallet) handleFundingCancelRequest(req *fundingReserveCancelMs
 	req.err <- nil
 }
 
+// createCommitOpts is a struct that holds the options for creating a new
+// commitment transaction.
+type createCommitOpts struct {
+	localAuxLeaves  fn.Option[CommitAuxLeaves]
+	remoteAuxLeaves fn.Option[CommitAuxLeaves]
+}
+
+// defaultCommitOpts returns a new createCommitOpts with default values.
+func defaultCommitOpts() createCommitOpts {
+	return createCommitOpts{}
+}
+
+// WithAuxLeaves is a functional option that can be used to set the aux leaves
+// for a new commitment transaction.
+func WithAuxLeaves(localLeaves,
+	remoteLeaves fn.Option[CommitAuxLeaves]) CreateCommitOpt {
+
+	return func(o *createCommitOpts) {
+		o.localAuxLeaves = localLeaves
+		o.remoteAuxLeaves = remoteLeaves
+	}
+}
+
+// CreateCommitOpt is a functional option that can be used to modify the way a
+// new commitment transaction is created.
+type CreateCommitOpt func(*createCommitOpts)
+
 // CreateCommitmentTxns is a helper function that creates the initial
 // commitment transaction for both parties. This function is used during the
 // initial funding workflow as both sides must generate a signature for the
@@ -1266,19 +1531,27 @@ func CreateCommitmentTxns(localBalance, remoteBalance btcutil.Amount,
 	ourChanCfg, theirChanCfg *channeldb.ChannelConfig,
 	localCommitPoint, remoteCommitPoint *btcec.PublicKey,
 	fundingTxIn wire.TxIn, chanType channeldb.ChannelType, initiator bool,
-	leaseExpiry uint32) (*wire.MsgTx, *wire.MsgTx, error) {
+	leaseExpiry uint32, opts ...CreateCommitOpt) (*wire.MsgTx, *wire.MsgTx,
+	error) {
+
+	options := defaultCommitOpts()
+	for _, optFunc := range opts {
+		optFunc(&options)
+	}
 
 	localCommitmentKeys := DeriveCommitmentKeys(
-		localCommitPoint, true, chanType, ourChanCfg, theirChanCfg,
+		localCommitPoint, lntypes.Local, chanType, ourChanCfg,
+		theirChanCfg,
 	)
 	remoteCommitmentKeys := DeriveCommitmentKeys(
-		remoteCommitPoint, false, chanType, ourChanCfg, theirChanCfg,
+		remoteCommitPoint, lntypes.Remote, chanType, ourChanCfg,
+		theirChanCfg,
 	)
 
 	ourCommitTx, err := CreateCommitTx(
 		chanType, fundingTxIn, localCommitmentKeys, ourChanCfg,
 		theirChanCfg, localBalance, remoteBalance, 0, initiator,
-		leaseExpiry,
+		leaseExpiry, options.localAuxLeaves,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -1292,7 +1565,7 @@ func CreateCommitmentTxns(localBalance, remoteBalance btcutil.Amount,
 	theirCommitTx, err := CreateCommitTx(
 		chanType, fundingTxIn, remoteCommitmentKeys, theirChanCfg,
 		ourChanCfg, remoteBalance, localBalance, 0, !initiator,
-		leaseExpiry,
+		leaseExpiry, options.remoteAuxLeaves,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -1362,7 +1635,8 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 	case *chanfunding.ShimIntent:
 		chanPoint, err = fundingIntent.ChanPoint()
 		if err != nil {
-			req.err <- fmt.Errorf("unable to obtain chan point: %v", err)
+			req.err <- fmt.Errorf("unable to obtain chan point: %w",
+				err)
 			return
 		}
 
@@ -1384,14 +1658,22 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 		// and remote key which will be needed to calculate the multisig
 		// funding output in a next step.
 		pendingChanID := pendingReservation.pendingChanID
+
 		walletLog.Debugf("Advancing PSBT funding flow for "+
 			"pending_id(%x), binding keys local_key=%v, "+
 			"remote_key=%x", pendingChanID,
 			&ourContribution.MultiSigKey,
 			theirContribution.MultiSigKey.PubKey.SerializeCompressed())
+
 		fundingIntent.BindKeys(
 			&ourContribution.MultiSigKey,
 			theirContribution.MultiSigKey.PubKey,
+		)
+
+		// We might have a tapscript root, so we'll bind that now to
+		// ensure we make the proper funding output.
+		fundingIntent.BindTapscriptRoot(
+			pendingReservation.partialState.TapscriptRoot,
 		)
 
 		// Exit early because we can't continue the funding flow yet.
@@ -1436,7 +1718,7 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 			[]*input.Script, 0, len(ourContribution.Inputs),
 		)
 		for _, txIn := range fundingTx.TxIn {
-			_, err := l.FetchInputInfo(&txIn.PreviousOutPoint)
+			_, err := l.FetchOutpointInfo(&txIn.PreviousOutPoint)
 			if err != nil {
 				continue
 			}
@@ -1462,8 +1744,96 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 	})
 }
 
-// handleChanPointReady continues the funding process once the channel point
-// is known and the funding transaction can be completed.
+// genMusigSession generates a new musig2 pair session that we can use to sign
+// the commitment transaction for the remote party, and verify their incoming
+// partial signature.
+func genMusigSession(ourContribution, theirContribution *ChannelContribution,
+	signer input.MuSig2Signer, fundingOutput *wire.TxOut,
+	tapscriptRoot fn.Option[chainhash.Hash]) *MusigPairSession {
+
+	return NewMusigPairSession(&MusigSessionCfg{
+		LocalKey:       ourContribution.MultiSigKey,
+		RemoteKey:      theirContribution.MultiSigKey,
+		LocalNonce:     *ourContribution.LocalNonce,
+		RemoteNonce:    *theirContribution.LocalNonce,
+		Signer:         signer,
+		InputTxOut:     fundingOutput,
+		TapscriptTweak: tapscriptRoot,
+	})
+}
+
+// signCommitTx generates a valid input.Signature to send to the remote party
+// for their version of the commitment transaction. For regular channels, this
+// will be a normal ECDSA signature. For taproot channels, this will instead be
+// a musig2 partial signature that also includes the nonce used to generate it.
+func (l *LightningWallet) signCommitTx(pendingReservation *ChannelReservation,
+	commitTx *wire.MsgTx, fundingOutput *wire.TxOut,
+	fundingWitnessScript []byte) (input.Signature, error) {
+
+	ourContribution := pendingReservation.ourContribution
+	theirContribution := pendingReservation.theirContribution
+
+	var (
+		sigTheirCommit input.Signature
+		err            error
+	)
+	switch {
+	// For regular channels, we can just send over a normal ECDSA signature
+	// w/o any extra steps.
+	case !pendingReservation.partialState.ChanType.IsTaproot():
+		ourKey := ourContribution.MultiSigKey
+		signDesc := input.SignDescriptor{
+			WitnessScript: fundingWitnessScript,
+			KeyDesc:       ourKey,
+			Output:        fundingOutput,
+			HashType:      txscript.SigHashAll,
+			SigHashes: input.NewTxSigHashesV0Only(
+				commitTx,
+			),
+			InputIndex: 0,
+		}
+		sigTheirCommit, err = l.Cfg.Signer.SignOutputRaw(
+			commitTx, &signDesc,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+	// If this is a taproot channel, then we'll need to create an initial
+	// musig2 session here as we'll be sending over a _partial_ signature.
+	default:
+		// We're now ready to sign the first commitment. However, we'll
+		// only create the session if that hasn't been done already.
+		if pendingReservation.musigSessions == nil {
+			musigSessions := genMusigSession(
+				ourContribution, theirContribution,
+				l.Cfg.Signer, fundingOutput,
+				pendingReservation.partialState.TapscriptRoot,
+			)
+			pendingReservation.musigSessions = musigSessions
+		}
+
+		// Now that we have the funding outpoint, we'll generate a
+		// musig2 signature for their version of the commitment
+		// transaction. We use the remote session as this is for the
+		// remote commitment transaction.
+		musigSessions := pendingReservation.musigSessions
+		partialSig, err := musigSessions.RemoteSession.SignCommit(
+			commitTx,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to sign "+
+				"commitment: %w", err)
+		}
+
+		sigTheirCommit = partialSig
+	}
+
+	return sigTheirCommit, nil
+}
+
+// handleChanPointReady continues the funding process once the channel point is
+// known and the funding transaction can be completed.
 func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 	l.limboMtx.Lock()
 	pendingReservation, ok := l.fundingLimbo[req.pendingFundingID]
@@ -1473,6 +1843,27 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 			"funding state")
 		return
 	}
+
+	chanState := pendingReservation.partialState
+
+	// If we have an aux funding desc, then we can use it to populate some
+	// of the optional, but opaque TLV blobs we'll carry for the channel.
+	chanState.CustomBlob = fn.MapOption(func(desc AuxFundingDesc) tlv.Blob {
+		return desc.CustomFundingBlob
+	})(req.auxFundingDesc)
+
+	chanState.LocalCommitment.CustomBlob = fn.MapOption(
+		func(desc AuxFundingDesc) tlv.Blob {
+			return desc.CustomLocalCommitBlob
+		},
+	)(req.auxFundingDesc)
+
+	chanState.RemoteCommitment.CustomBlob = fn.MapOption(
+		func(desc AuxFundingDesc) tlv.Blob {
+			return desc.CustomRemoteCommitBlob
+		},
+	)(req.auxFundingDesc)
+
 	ourContribution := pendingReservation.ourContribution
 	theirContribution := pendingReservation.theirContribution
 	chanPoint := pendingReservation.partialState.FundingOutpoint
@@ -1531,7 +1922,6 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 	// Store their current commitment point. We'll need this after the
 	// first state transition in order to verify the authenticity of the
 	// revocation.
-	chanState := pendingReservation.partialState
 	chanState.RemoteCurrentRevocation = theirContribution.FirstCommitmentPoint
 
 	// Create the txin to our commitment transaction; required to construct
@@ -1547,6 +1937,18 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 	if pendingReservation.partialState.ChanType.HasLeaseExpiration() {
 		leaseExpiry = pendingReservation.partialState.ThawHeight
 	}
+
+	localAuxLeaves := fn.MapOption(
+		func(desc AuxFundingDesc) CommitAuxLeaves {
+			return desc.LocalInitAuxLeaves
+		},
+	)(req.auxFundingDesc)
+	remoteAuxLeaves := fn.MapOption(
+		func(desc AuxFundingDesc) CommitAuxLeaves {
+			return desc.RemoteInitAuxLeaves
+		},
+	)(req.auxFundingDesc)
+
 	ourCommitTx, theirCommitTx, err := CreateCommitmentTxns(
 		localBalance, remoteBalance, ourContribution.ChannelConfig,
 		theirContribution.ChannelConfig,
@@ -1554,6 +1956,7 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 		theirContribution.FirstCommitmentPoint, fundingTxIn,
 		pendingReservation.partialState.ChanType,
 		pendingReservation.partialState.IsInitiator, leaseExpiry,
+		WithAuxLeaves(localAuxLeaves, remoteAuxLeaves),
 	)
 	if err != nil {
 		req.err <- err
@@ -1613,26 +2016,22 @@ func (l *LightningWallet) handleChanPointReady(req *continueContributionMsg) {
 	fundingIntent := pendingReservation.fundingIntent
 	fundingWitnessScript, fundingOutput, err := fundingIntent.FundingOutput()
 	if err != nil {
-		req.err <- fmt.Errorf("unable to obtain funding output")
+		req.err <- fmt.Errorf("unable to obtain funding "+
+			"output: %w", err)
 		return
 	}
 
 	// Generate a signature for their version of the initial commitment
 	// transaction.
-	ourKey := ourContribution.MultiSigKey
-	signDesc := input.SignDescriptor{
-		WitnessScript: fundingWitnessScript,
-		KeyDesc:       ourKey,
-		Output:        fundingOutput,
-		HashType:      txscript.SigHashAll,
-		SigHashes:     input.NewTxSigHashesV0Only(theirCommitTx),
-		InputIndex:    0,
-	}
-	sigTheirCommit, err := l.Cfg.Signer.SignOutputRaw(theirCommitTx, &signDesc)
+	sigTheirCommit, err := l.signCommitTx(
+		pendingReservation, theirCommitTx, fundingOutput,
+		fundingWitnessScript,
+	)
 	if err != nil {
 		req.err <- err
 		return
 	}
+
 	pendingReservation.ourCommitmentSig = sigTheirCommit
 
 	req.err <- nil
@@ -1721,7 +2120,8 @@ func (l *LightningWallet) verifyFundingInputs(fundingTx *wire.MsgTx,
 				txin.SignatureScript, txin.Witness,
 			)
 			if err != nil {
-				return fmt.Errorf("cannot create script: %v", err)
+				return fmt.Errorf("cannot create script: %w",
+					err)
 			}
 			output, err := l.Cfg.ChainIO.GetUtxo(
 				&txin.PreviousOutPoint,
@@ -1755,6 +2155,91 @@ func (l *LightningWallet) verifyFundingInputs(fundingTx *wire.MsgTx,
 	}
 
 	return nil
+}
+
+// verifyCommitSig verifies an incoming signature for our version of the
+// commitment transaction. For normal channels, this will verify that the ECDSA
+// signature is valid. For taproot channels, we'll verify that their partial
+// signature is valid, so it can properly be combined with our eventual
+// signature when we need to broadcast.
+func (l *LightningWallet) verifyCommitSig(res *ChannelReservation,
+	commitSig input.Signature, commitTx *wire.MsgTx) error {
+
+	localKey := res.ourContribution.MultiSigKey.PubKey
+	remoteKey := res.theirContribution.MultiSigKey.PubKey
+	channelValue := int64(res.partialState.Capacity)
+
+	switch {
+	// If this isn't a taproot channel, then we'll construct a segwit v0
+	// p2wsh sighash.
+	case !res.partialState.ChanType.IsTaproot():
+		hashCache := input.NewTxSigHashesV0Only(commitTx)
+		witnessScript, _, err := input.GenFundingPkScript(
+			localKey.SerializeCompressed(),
+			remoteKey.SerializeCompressed(), channelValue,
+		)
+		if err != nil {
+			return err
+		}
+
+		sigHash, err := txscript.CalcWitnessSigHash(
+			witnessScript, hashCache, txscript.SigHashAll,
+			commitTx, 0, channelValue,
+		)
+		if err != nil {
+			return err
+		}
+
+		// Verify that we've received a valid signature from the remote
+		// party for our version of the commitment transaction.
+		if !commitSig.Verify(sigHash, remoteKey) {
+			return fmt.Errorf("counterparty's commitment " +
+				"signature is invalid")
+		}
+
+		return nil
+
+	// Otherwise for taproot channels, we'll compute the segwit v1 sighash,
+	// which is slightly different.
+	default:
+		// First, check to see if we've generated the musig session
+		// already. If we're the responder in the funding flow, we may
+		// not have generated it already.
+		if res.musigSessions == nil {
+			_, fundingOutput, err := input.GenTaprootFundingScript(
+				localKey, remoteKey, channelValue,
+				res.partialState.TapscriptRoot,
+			)
+			if err != nil {
+				return err
+			}
+
+			res.musigSessions = genMusigSession(
+				res.ourContribution, res.theirContribution,
+				l.Cfg.Signer, fundingOutput,
+				res.partialState.TapscriptRoot,
+			)
+		}
+
+		// For the musig2 based channels, we'll use the generated local
+		// musig2 session to verify the signature.
+		localSession := res.musigSessions.LocalSession
+
+		// At this point, the commitment signature passed in should
+		// actually be a wrapped musig2 signature, so we'll do a type
+		// asset to the get the signature we actually need.
+		partialSig, ok := commitSig.(*MusigPartialSig)
+		if !ok {
+			return fmt.Errorf("expected *musig2.PartialSignature, "+
+				"got: %T", commitSig)
+		}
+
+		_, err := localSession.VerifyCommitSig(
+			commitTx, partialSig.ToWireSig(),
+		)
+
+		return err
+	}
 }
 
 // handleFundingCounterPartySigs is the final step in the channel reservation
@@ -1799,44 +2284,15 @@ func (l *LightningWallet) handleFundingCounterPartySigs(msg *addCounterPartySigs
 	// commitment transaction.
 	res.theirCommitmentSig = msg.theirCommitmentSig
 	commitTx := res.partialState.LocalCommitment.CommitTx
-	ourKey := res.ourContribution.MultiSigKey
-	theirKey := res.theirContribution.MultiSigKey
 
-	// Re-generate both the witnessScript and p2sh output. We sign the
-	// witnessScript script, but include the p2sh output as the subscript
-	// for verification.
-	witnessScript, _, err := input.GenFundingPkScript(
-		ourKey.PubKey.SerializeCompressed(),
-		theirKey.PubKey.SerializeCompressed(),
-		int64(res.partialState.Capacity),
-	)
+	err := l.verifyCommitSig(res, msg.theirCommitmentSig, commitTx)
 	if err != nil {
-		msg.err <- err
+		msg.err <- fmt.Errorf("counterparty's commitment signature is "+
+			"invalid: %w", err)
 		msg.completeChan <- nil
 		return
 	}
 
-	// Next, create the spending scriptSig, and then verify that the script
-	// is complete, allowing us to spend from the funding transaction.
-	channelValue := int64(res.partialState.Capacity)
-	hashCache := input.NewTxSigHashesV0Only(commitTx)
-	sigHash, err := txscript.CalcWitnessSigHash(
-		witnessScript, hashCache, txscript.SigHashAll, commitTx,
-		0, channelValue,
-	)
-	if err != nil {
-		msg.err <- err
-		msg.completeChan <- nil
-		return
-	}
-
-	// Verify that we've received a valid signature from the remote party
-	// for our version of the commitment transaction.
-	if !msg.theirCommitmentSig.Verify(sigHash, theirKey.PubKey) {
-		msg.err <- fmt.Errorf("counterparty's commitment signature is invalid")
-		msg.completeChan <- nil
-		return
-	}
 	theirCommitSigBytes := msg.theirCommitmentSig.Serialize()
 	res.partialState.LocalCommitment.CommitSig = theirCommitSigBytes
 
@@ -1852,9 +2308,6 @@ func (l *LightningWallet) handleFundingCounterPartySigs(msg *addCounterPartySigs
 
 	// As we're about to broadcast the funding transaction, we'll take note
 	// of the current height for record keeping purposes.
-	//
-	// TODO(roasbeef): this info can also be piped into light client's
-	// basic fee estimation?
 	_, bestHeight, err := l.Cfg.ChainIO.GetBestBlock()
 	if err != nil {
 		msg.err <- err
@@ -1915,6 +2368,24 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 	defer pendingReservation.Unlock()
 
 	chanState := pendingReservation.partialState
+
+	// If we have an aux funding desc, then we can use it to populate some
+	// of the optional, but opaque TLV blobs we'll carry for the channel.
+	chanState.CustomBlob = fn.MapOption(func(desc AuxFundingDesc) tlv.Blob {
+		return desc.CustomFundingBlob
+	})(req.auxFundingDesc)
+	chanState.LocalCommitment.CustomBlob = fn.MapOption(
+		func(desc AuxFundingDesc) tlv.Blob {
+			return desc.CustomLocalCommitBlob
+		},
+	)(req.auxFundingDesc)
+	chanState.RemoteCommitment.CustomBlob = fn.MapOption(
+		func(desc AuxFundingDesc) tlv.Blob {
+			return desc.CustomRemoteCommitBlob
+		},
+	)(req.auxFundingDesc)
+
+	chanType := pendingReservation.partialState.ChanType
 	chanState.FundingOutpoint = *req.fundingOutpoint
 	fundingTxIn := wire.NewTxIn(req.fundingOutpoint, nil, nil)
 
@@ -1927,14 +2398,27 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 	if pendingReservation.partialState.ChanType.HasLeaseExpiration() {
 		leaseExpiry = pendingReservation.partialState.ThawHeight
 	}
+
+	localAuxLeaves := fn.MapOption(
+		func(desc AuxFundingDesc) CommitAuxLeaves {
+			return desc.LocalInitAuxLeaves
+		},
+	)(req.auxFundingDesc)
+	remoteAuxLeaves := fn.MapOption(
+		func(desc AuxFundingDesc) CommitAuxLeaves {
+			return desc.RemoteInitAuxLeaves
+		},
+	)(req.auxFundingDesc)
+
 	ourCommitTx, theirCommitTx, err := CreateCommitmentTxns(
 		localBalance, remoteBalance,
 		pendingReservation.ourContribution.ChannelConfig,
 		pendingReservation.theirContribution.ChannelConfig,
 		pendingReservation.ourContribution.FirstCommitmentPoint,
 		pendingReservation.theirContribution.FirstCommitmentPoint,
-		*fundingTxIn, pendingReservation.partialState.ChanType,
+		*fundingTxIn, chanType,
 		pendingReservation.partialState.IsInitiator, leaseExpiry,
+		WithAuxLeaves(localAuxLeaves, remoteAuxLeaves),
 	)
 	if err != nil {
 		req.err <- err
@@ -1969,13 +2453,10 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 	walletLog.Debugf("Remote commit tx for ChannelPoint(%v): %v",
 		req.fundingOutpoint, spew.Sdump(theirCommitTx))
 
-	channelValue := int64(pendingReservation.partialState.Capacity)
-	hashCache := input.NewTxSigHashesV0Only(ourCommitTx)
-	theirKey := pendingReservation.theirContribution.MultiSigKey
-	ourKey := pendingReservation.ourContribution.MultiSigKey
-	witnessScript, _, err := input.GenFundingPkScript(
-		ourKey.PubKey.SerializeCompressed(),
-		theirKey.PubKey.SerializeCompressed(), channelValue,
+	// With both commitment transactions created, we'll now verify their
+	// signature on our commitment.
+	err = l.verifyCommitSig(
+		pendingReservation, req.theirCommitmentSig, ourCommitTx,
 	)
 	if err != nil {
 		req.err <- err
@@ -1983,53 +2464,49 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 		return
 	}
 
-	sigHash, err := txscript.CalcWitnessSigHash(
-		witnessScript, hashCache, txscript.SigHashAll, ourCommitTx, 0,
-		channelValue,
-	)
-	if err != nil {
-		req.err <- err
-		req.completeChan <- nil
-		return
-	}
-
-	// Verify that we've received a valid signature from the remote party
-	// for our version of the commitment transaction.
-	if !req.theirCommitmentSig.Verify(sigHash, theirKey.PubKey) {
-		req.err <- fmt.Errorf("counterparty's commitment signature " +
-			"is invalid")
-		req.completeChan <- nil
-		return
-	}
 	theirCommitSigBytes := req.theirCommitmentSig.Serialize()
 	chanState.LocalCommitment.CommitSig = theirCommitSigBytes
+
+	channelValue := int64(pendingReservation.partialState.Capacity)
+	theirKey := pendingReservation.theirContribution.MultiSigKey
+	ourKey := pendingReservation.ourContribution.MultiSigKey
+
+	var (
+		fundingWitnessScript []byte
+		fundingTxOut         *wire.TxOut
+	)
+	if chanType.IsTaproot() {
+		//nolint:ll
+		fundingWitnessScript, fundingTxOut, err = input.GenTaprootFundingScript(
+			ourKey.PubKey, theirKey.PubKey, channelValue,
+			pendingReservation.partialState.TapscriptRoot,
+		)
+	} else {
+		//nolint:ll
+		fundingWitnessScript, fundingTxOut, err = input.GenFundingPkScript(
+			ourKey.PubKey.SerializeCompressed(),
+			theirKey.PubKey.SerializeCompressed(), channelValue,
+		)
+	}
+	if err != nil {
+		req.err <- err
+		req.completeChan <- nil
+		return
+	}
 
 	// With their signature for our version of the commitment transactions
 	// verified, we can now generate a signature for their version,
 	// allowing the funding transaction to be safely broadcast.
-	p2wsh, err := input.WitnessScriptHash(witnessScript)
+	sigTheirCommit, err := l.signCommitTx(
+		pendingReservation, theirCommitTx, fundingTxOut,
+		fundingWitnessScript,
+	)
 	if err != nil {
 		req.err <- err
 		req.completeChan <- nil
 		return
 	}
-	signDesc := input.SignDescriptor{
-		WitnessScript: witnessScript,
-		KeyDesc:       ourKey,
-		Output: &wire.TxOut{
-			PkScript: p2wsh,
-			Value:    channelValue,
-		},
-		HashType:   txscript.SigHashAll,
-		SigHashes:  input.NewTxSigHashesV0Only(theirCommitTx),
-		InputIndex: 0,
-	}
-	sigTheirCommit, err := l.Cfg.Signer.SignOutputRaw(theirCommitTx, &signDesc)
-	if err != nil {
-		req.err <- err
-		req.completeChan <- nil
-		return
-	}
+
 	pendingReservation.ourCommitmentSig = sigTheirCommit
 
 	_, bestHeight, err := l.Cfg.ChainIO.GetBestBlock()
@@ -2065,6 +2542,7 @@ func (l *LightningWallet) handleSingleFunderSigs(req *addSingleFunderSigsMsg) {
 
 	l.limboMtx.Lock()
 	delete(l.fundingLimbo, req.pendingFundingID)
+	delete(l.reservationIDs, pendingReservation.pendingChanID)
 	l.limboMtx.Unlock()
 
 	l.intentMtx.Lock()
@@ -2125,32 +2603,59 @@ func initStateHints(commit1, commit2 *wire.MsgTx,
 func (l *LightningWallet) ValidateChannel(channelState *channeldb.OpenChannel,
 	fundingTx *wire.MsgTx) error {
 
+	var chanOpts []ChannelOpt
+	l.Cfg.AuxLeafStore.WhenSome(func(s AuxLeafStore) {
+		chanOpts = append(chanOpts, WithLeafStore(s))
+	})
+	l.Cfg.AuxSigner.WhenSome(func(s AuxSigner) {
+		chanOpts = append(chanOpts, WithAuxSigner(s))
+	})
+
 	// First, we'll obtain a fully signed commitment transaction so we can
 	// pass into it on the chanvalidate package for verification.
-	channel, err := NewLightningChannel(l.Cfg.Signer, channelState, nil)
-	if err != nil {
-		return err
-	}
-	signedCommitTx, err := channel.getSignedCommitTx()
-	if err != nil {
-		return err
-	}
-
-	// We'll also need the multi-sig witness script itself so the
-	// chanvalidate package can check it for correctness against the
-	// funding transaction, and also commitment validity.
-	localKey := channelState.LocalChanCfg.MultiSigKey.PubKey
-	remoteKey := channelState.RemoteChanCfg.MultiSigKey.PubKey
-	witnessScript, err := input.GenMultiSigScript(
-		localKey.SerializeCompressed(),
-		remoteKey.SerializeCompressed(),
+	channel, err := NewLightningChannel(
+		l.Cfg.Signer, channelState, nil, chanOpts...,
 	)
 	if err != nil {
 		return err
 	}
-	pkScript, err := input.WitnessScriptHash(witnessScript)
+
+	localKey := channelState.LocalChanCfg.MultiSigKey.PubKey
+	remoteKey := channelState.RemoteChanCfg.MultiSigKey.PubKey
+
+	// We'll also need the multi-sig witness script itself so the
+	// chanvalidate package can check it for correctness against the
+	// funding transaction, and also commitment validity.
+	var fundingScript []byte
+	if channelState.ChanType.IsTaproot() {
+		fundingScript, _, err = input.GenTaprootFundingScript(
+			localKey, remoteKey, int64(channel.Capacity),
+			channelState.TapscriptRoot,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		witnessScript, err := input.GenMultiSigScript(
+			localKey.SerializeCompressed(),
+			remoteKey.SerializeCompressed(),
+		)
+		if err != nil {
+			return err
+		}
+		fundingScript, err = input.WitnessScriptHash(witnessScript)
+		if err != nil {
+			return err
+		}
+	}
+
+	signedCommitTx, err := channel.getSignedCommitTx()
 	if err != nil {
 		return err
+	}
+	commitCtx := &chanvalidate.CommitmentContext{
+		Value:               channel.Capacity,
+		FullySignedCommitTx: signedCommitTx,
 	}
 
 	// Finally, we'll pass in all the necessary context needed to fully
@@ -2160,12 +2665,9 @@ func (l *LightningWallet) ValidateChannel(channelState *channeldb.OpenChannel,
 		Locator: &chanvalidate.OutPointChanLocator{
 			ChanPoint: channelState.FundingOutpoint,
 		},
-		MultiSigPkScript: pkScript,
+		MultiSigPkScript: fundingScript,
 		FundingTx:        fundingTx,
-		CommitCtx: &chanvalidate.CommitmentContext{
-			Value:               channel.Capacity,
-			FullySignedCommitTx: signedCommitTx,
-		},
+		CommitCtx:        commitCtx,
 	})
 	if err != nil {
 		return err
@@ -2174,21 +2676,34 @@ func (l *LightningWallet) ValidateChannel(channelState *channeldb.OpenChannel,
 	return nil
 }
 
+// CancelRebroadcast cancels the rebroadcast of the given transaction.
+func (l *LightningWallet) CancelRebroadcast(txid chainhash.Hash) {
+	// For neutrino, we don't config the rebroadcaster for the wallet as it
+	// manages the rebroadcasting logic in neutrino itself.
+	if l.Cfg.Rebroadcaster != nil {
+		l.Cfg.Rebroadcaster.MarkAsConfirmed(txid)
+	}
+}
+
 // CoinSource is a wrapper around the wallet that implements the
 // chanfunding.CoinSource interface.
 type CoinSource struct {
-	wallet *LightningWallet
+	wallet    *LightningWallet
+	allowUtxo func(Utxo) bool
 }
 
 // NewCoinSource creates a new instance of the CoinSource wrapper struct.
-func NewCoinSource(w *LightningWallet) *CoinSource {
-	return &CoinSource{wallet: w}
+func NewCoinSource(w *LightningWallet, allowUtxo func(Utxo) bool) *CoinSource {
+	return &CoinSource{
+		wallet:    w,
+		allowUtxo: allowUtxo,
+	}
 }
 
 // ListCoins returns all UTXOs from the source that have between
 // minConfs and maxConfs number of confirmations.
 func (c *CoinSource) ListCoins(minConfs int32,
-	maxConfs int32) ([]chanfunding.Coin, error) {
+	maxConfs int32) ([]wallet.Coin, error) {
 
 	utxos, err := c.wallet.ListUnspentWitnessFromDefaultAccount(
 		minConfs, maxConfs,
@@ -2197,9 +2712,20 @@ func (c *CoinSource) ListCoins(minConfs int32,
 		return nil, err
 	}
 
-	var coins []chanfunding.Coin
+	var coins []wallet.Coin
+
 	for _, utxo := range utxos {
-		coins = append(coins, chanfunding.Coin{
+		// If there is a filter function supplied all utxos not adhering
+		// to these conditions will be discarded.
+		if c.allowUtxo != nil && !c.allowUtxo(*utxo) {
+			walletLog.Infof("Cannot use unconfirmed "+
+				"utxo=%v because it is unstable and could be "+
+				"replaced", utxo.OutPoint)
+
+			continue
+		}
+
+		coins = append(coins, wallet.Coin{
 			TxOut: wire.TxOut{
 				Value:    int64(utxo.Value),
 				PkScript: utxo.PkScript,
@@ -2214,13 +2740,13 @@ func (c *CoinSource) ListCoins(minConfs int32,
 // CoinFromOutPoint attempts to locate details pertaining to a coin based on
 // its outpoint. If the coin isn't under the control of the backing CoinSource,
 // then an error should be returned.
-func (c *CoinSource) CoinFromOutPoint(op wire.OutPoint) (*chanfunding.Coin, error) {
-	inputInfo, err := c.wallet.FetchInputInfo(&op)
+func (c *CoinSource) CoinFromOutPoint(op wire.OutPoint) (*wallet.Coin, error) {
+	inputInfo, err := c.wallet.FetchOutpointInfo(&op)
 	if err != nil {
 		return nil, err
 	}
 
-	return &chanfunding.Coin{
+	return &wallet.Coin{
 		TxOut: wire.TxOut{
 			Value:    int64(inputInfo.Value),
 			PkScript: inputInfo.PkScript,
@@ -2312,7 +2838,7 @@ func NewWalletPrevOutputFetcher(wc WalletController) *WalletPrevOutputFetcher {
 // passed outpoint. A nil value will be returned if the passed outpoint doesn't
 // exist.
 func (w *WalletPrevOutputFetcher) FetchPrevOutput(op wire.OutPoint) *wire.TxOut {
-	utxo, err := w.wc.FetchInputInfo(&op)
+	utxo, err := w.wc.FetchOutpointInfo(&op)
 	if err != nil {
 		return nil
 	}

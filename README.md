@@ -1,9 +1,10 @@
 ## Lightning Network Daemon
 
-[![Build Status](https://img.shields.io/travis/lightningnetwork/lnd.svg)](https://travis-ci.org/lightningnetwork/lnd)
+[![Release build](https://github.com/lightningnetwork/lnd/actions/workflows/release.yaml/badge.svg)](https://github.com/lightningnetwork/lnd/actions/workflows/release.yaml)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/lightningnetwork/lnd/blob/master/LICENSE)
 [![Irc](https://img.shields.io/badge/chat-on%20libera-brightgreen.svg)](https://web.libera.chat/#lnd)
 [![Godoc](https://godoc.org/github.com/lightningnetwork/lnd?status.svg)](https://godoc.org/github.com/lightningnetwork/lnd)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lightningnetwork/lnd)](https://goreportcard.com/report/github.com/lightningnetwork/lnd)
 
 <img src="logo.png">
 
@@ -50,7 +51,7 @@ said, the current status of `lnd`'s BOLT compliance is:
 The daemon has been designed to be as developer friendly as possible in order
 to facilitate application development on top of `lnd`. Two primary RPC
 interfaces are exported: an HTTP REST API, and a [gRPC](https://grpc.io/)
-service. The exported API's are not yet stable, so be warned: they may change
+service. The exported APIs are not yet stable, so be warned: they may change
 drastically in the near future.
 
 An automatically generated set of documentation for the RPC APIs can be found

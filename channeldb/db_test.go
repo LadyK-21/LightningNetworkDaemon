@@ -1,23 +1,37 @@
 package channeldb
 
 import (
+	"image/color"
 	"math"
 	"math/rand"
 	"net"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/stretchr/testify/require"
+)
+
+var (
+	testAddr = &net.TCPAddr{IP: (net.IP)([]byte{0xA, 0x0, 0x0, 0x1}),
+		Port: 9000}
+	anotherAddr, _ = net.ResolveTCPAddr("tcp",
+		"[2001:db8:85a3:0:0:8a2e:370:7334]:80")
+	testAddrs = []net.Addr{testAddr}
+
+	testFeatures = lnwire.NewFeatureVector(nil, lnwire.Features)
 )
 
 func TestOpenWithCreate(t *testing.T) {
@@ -51,11 +65,7 @@ func TestOpenWithCreate(t *testing.T) {
 
 	// Now, reopen the same db in dry run migration mode. Since we have not
 	// applied any migrations, this should ignore the flag and not fail.
-	cdb, err = Open(dbPath, OptionDryRunMigration(true))
-	require.NoError(t, err, "unable to create channeldb")
-	if err := cdb.Close(); err != nil {
-		t.Fatalf("unable to close channeldb: %v", err)
-	}
+	OpenForTesting(t, dbPath, OptionDryRunMigration(true))
 }
 
 // TestWipe tests that the database wipe operation completes successfully
@@ -141,7 +151,7 @@ func TestFetchClosedChannelForID(t *testing.T) {
 		state.FundingOutpoint.Index = i
 
 		// We calculate the ChannelID and use it to fetch the summary.
-		cid := lnwire.NewChanIDFromOutPoint(&state.FundingOutpoint)
+		cid := lnwire.NewChanIDFromOutPoint(state.FundingOutpoint)
 		fetchedSummary, err := cdb.FetchClosedChannelForID(cid)
 		if err != nil {
 			t.Fatalf("unable to fetch close summary: %v", err)
@@ -159,32 +169,32 @@ func TestFetchClosedChannelForID(t *testing.T) {
 	// As a final test we make sure that we get ErrClosedChannelNotFound
 	// for a ChannelID we didn't add to the DB.
 	state.FundingOutpoint.Index++
-	cid := lnwire.NewChanIDFromOutPoint(&state.FundingOutpoint)
+	cid := lnwire.NewChanIDFromOutPoint(state.FundingOutpoint)
 	_, err = cdb.FetchClosedChannelForID(cid)
 	if err != ErrClosedChannelNotFound {
 		t.Fatalf("expected ErrClosedChannelNotFound, instead got: %v", err)
 	}
 }
 
-// TestAddrsForNode tests the we're able to properly obtain all the addresses
-// for a target node.
-func TestAddrsForNode(t *testing.T) {
+// TestMultiSourceAddrsForNode tests the we're able to properly obtain all the
+// addresses for a target node from multiple backends - in this case, the
+// channel db and graph db.
+func TestMultiSourceAddrsForNode(t *testing.T) {
 	t.Parallel()
 
 	fullDB, err := MakeTestDB(t)
 	require.NoError(t, err, "unable to make test database")
 
-	graph := fullDB.ChannelGraph()
+	graph, err := graphdb.MakeTestGraph(t)
+	require.NoError(t, err)
 
 	// We'll make a test vertex to insert into the database, as the source
 	// node, but this node will only have half the number of addresses it
 	// usually does.
-	testNode, err := createTestVertex(fullDB)
+	testNode := createTestVertex(t)
 	require.NoError(t, err, "unable to create test node")
 	testNode.Addresses = []net.Addr{testAddr}
-	if err := graph.SetSourceNode(testNode); err != nil {
-		t.Fatalf("unable to set source node: %v", err)
-	}
+	require.NoError(t, graph.SetSourceNode(testNode))
 
 	// Next, we'll make a link node with the same pubkey, but with an
 	// additional address.
@@ -194,28 +204,27 @@ func TestAddrsForNode(t *testing.T) {
 		fullDB.channelStateDB.linkNodeDB, wire.MainNet, nodePub,
 		anotherAddr,
 	)
-	if err := linkNode.Sync(); err != nil {
-		t.Fatalf("unable to sync link node: %v", err)
-	}
+	require.NoError(t, linkNode.Sync())
+
+	// Create a multi-backend address source from the channel db and graph
+	// db.
+	addrSource := NewMultiAddrSource(fullDB, graph)
 
 	// Now that we've created a link node, as well as a vertex for the
 	// node, we'll query for all its addresses.
-	nodeAddrs, err := fullDB.AddrsForNode(nodePub)
+	known, nodeAddrs, err := addrSource.AddrsForNode(nodePub)
 	require.NoError(t, err, "unable to obtain node addrs")
+	require.True(t, known)
 
 	expectedAddrs := make(map[string]struct{})
 	expectedAddrs[testAddr.String()] = struct{}{}
 	expectedAddrs[anotherAddr.String()] = struct{}{}
 
 	// Finally, ensure that all the expected addresses are found.
-	if len(nodeAddrs) != len(expectedAddrs) {
-		t.Fatalf("expected %v addrs, got %v",
-			len(expectedAddrs), len(nodeAddrs))
-	}
+	require.Len(t, nodeAddrs, len(expectedAddrs))
+
 	for _, addr := range nodeAddrs {
-		if _, ok := expectedAddrs[addr.String()]; !ok {
-			t.Fatalf("unexpected addr: %v", addr)
-		}
+		require.Contains(t, expectedAddrs, addr.String())
 	}
 }
 
@@ -233,26 +242,36 @@ func TestFetchChannel(t *testing.T) {
 	channelState := createTestChannel(t, cdb, openChannelOption())
 
 	// Next, attempt to fetch the channel by its chan point.
-	dbChannel, err := cdb.FetchChannel(nil, channelState.FundingOutpoint)
+	dbChannel, err := cdb.FetchChannel(channelState.FundingOutpoint)
 	require.NoError(t, err, "unable to fetch channel")
 
 	// The decoded channel state should be identical to what we stored
 	// above.
-	if !reflect.DeepEqual(channelState, dbChannel) {
-		t.Fatalf("channel state doesn't match:: %v vs %v",
-			spew.Sdump(channelState), spew.Sdump(dbChannel))
-	}
+	require.Equal(t, channelState, dbChannel)
 
-	// If we attempt to query for a non-exist ante channel, then we should
+	// Next, attempt to fetch the channel by its channel ID.
+	chanID := lnwire.NewChanIDFromOutPoint(channelState.FundingOutpoint)
+	dbChannel, err = cdb.FetchChannelByID(nil, chanID)
+	require.NoError(t, err, "unable to fetch channel")
+
+	// The decoded channel state should be identical to what we stored
+	// above.
+	require.Equal(t, channelState, dbChannel)
+
+	// If we attempt to query for a non-existent channel, then we should
 	// get an error.
 	channelState2 := createTestChannelState(t, cdb)
 	require.NoError(t, err, "unable to create channel state")
-	channelState2.FundingOutpoint.Index ^= 1
 
-	_, err = cdb.FetchChannel(nil, channelState2.FundingOutpoint)
-	if err == nil {
-		t.Fatalf("expected query to fail")
-	}
+	uniqueOutputIndex.Add(1)
+	channelState2.FundingOutpoint.Index = uniqueOutputIndex.Load()
+
+	_, err = cdb.FetchChannel(channelState2.FundingOutpoint)
+	require.ErrorIs(t, err, ErrChannelNotFound)
+
+	chanID2 := lnwire.NewChanIDFromOutPoint(channelState2.FundingOutpoint)
+	_, err = cdb.FetchChannelByID(nil, chanID2)
+	require.ErrorIs(t, err, ErrChannelNotFound)
 }
 
 func genRandomChannelShell() (*ChannelShell, error) {
@@ -282,6 +301,10 @@ func genRandomChannelShell() (*ChannelShell, error) {
 	}
 	shaChainProducer := shachain.NewRevocationProducer(*revRoot)
 
+	commitParams := CommitmentParams{
+		CsvDelay: uint16(rand.Int63()),
+	}
+
 	return &ChannelShell{
 		NodeAddrs: []net.Addr{&net.TCPAddr{
 			IP:   net.ParseIP("127.0.0.1"),
@@ -296,9 +319,7 @@ func genRandomChannelShell() (*ChannelShell, error) {
 			),
 			IdentityPub: pub,
 			LocalChanCfg: ChannelConfig{
-				ChannelConstraints: ChannelConstraints{
-					CsvDelay: uint16(rand.Int63()),
-				},
+				CommitmentParams: commitParams,
 				PaymentBasePoint: keychain.KeyDescriptor{
 					KeyLocator: keychain.KeyLocator{
 						Family: keychain.KeyFamily(rand.Int63()),
@@ -385,7 +406,7 @@ func TestRestoreChannelShells(t *testing.T) {
 
 	// We should also be able to find the channel if we query for it
 	// directly.
-	_, err = cdb.FetchChannel(nil, channelShell.Chan.FundingOutpoint)
+	_, err = cdb.FetchChannel(channelShell.Chan.FundingOutpoint)
 	require.NoError(t, err, "unable to fetch channel")
 
 	// We should also be able to find the link node that was inserted by
@@ -434,7 +455,7 @@ func TestAbandonChannel(t *testing.T) {
 
 	// At this point, the channel should no longer be found in the set of
 	// open channels.
-	_, err = cdb.FetchChannel(nil, chanState.FundingOutpoint)
+	_, err = cdb.FetchChannel(chanState.FundingOutpoint)
 	if err != ErrChannelNotFound {
 		t.Fatalf("channel should not have been found: %v", err)
 	}
@@ -597,7 +618,9 @@ func TestFetchChannels(t *testing.T) {
 				channelIDOption(pendingWaitingChan),
 			)
 
-			err = pendingClosing.MarkCoopBroadcasted(nil, true)
+			err = pendingClosing.MarkCoopBroadcasted(
+				nil, lntypes.Local,
+			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -617,7 +640,9 @@ func TestFetchChannels(t *testing.T) {
 				channelIDOption(openWaitingChan),
 				openChannelOption(),
 			)
-			err = openClosing.MarkCoopBroadcasted(nil, true)
+			err = openClosing.MarkCoopBroadcasted(
+				nil, lntypes.Local,
+			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -694,4 +719,29 @@ func TestFetchHistoricalChannel(t *testing.T) {
 	if err != ErrChannelNotFound {
 		t.Fatalf("expected chan not found, got: %v", err)
 	}
+}
+
+func createLightningNode(priv *btcec.PrivateKey) *models.LightningNode {
+	updateTime := rand.Int63()
+
+	pub := priv.PubKey().SerializeCompressed()
+	n := &models.LightningNode{
+		HaveNodeAnnouncement: true,
+		AuthSigBytes:         testSig.Serialize(),
+		LastUpdate:           time.Unix(updateTime, 0),
+		Color:                color.RGBA{1, 2, 3, 0},
+		Alias:                "kek" + string(pub),
+		Features:             testFeatures,
+		Addresses:            testAddrs,
+	}
+	copy(n.PubKeyBytes[:], priv.PubKey().SerializeCompressed())
+
+	return n
+}
+
+func createTestVertex(t *testing.T) *models.LightningNode {
+	priv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	return createLightningNode(priv)
 }

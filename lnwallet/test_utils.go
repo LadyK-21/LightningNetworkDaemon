@@ -1,6 +1,8 @@
 package lnwallet
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,11 +16,15 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
+	"github.com/lightningnetwork/lnd/tlv"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -98,6 +104,10 @@ var (
 	bobDustLimit   = btcutil.Amount(1300)
 
 	testChannelCapacity float64 = 10
+
+	// ctxb is a context that will never be cancelled, that is used in
+	// place of a real quit context.
+	ctxb = context.Background()
 )
 
 // CreateTestChannels creates to fully populated channels to be used within
@@ -106,8 +116,9 @@ var (
 // allocated to each side. Within the channel, Alice is the initiator. If
 // tweaklessCommits is true, then the commits within the channels will use the
 // new format, otherwise the legacy format.
-func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
-	*LightningChannel, *LightningChannel, error) {
+func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
+	dbModifiers ...channeldb.OptionModifier) (*LightningChannel,
+	*LightningChannel, error) {
 
 	channelCapacity, err := btcutil.NewAmount(testChannelCapacity)
 	if err != nil {
@@ -148,13 +159,15 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 	}
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        aliceDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(channelCapacity),
 			ChanReserve:      channelCapacity / 100,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         uint16(csvTimeoutAlice),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: aliceDustLimit,
+			CsvDelay:  uint16(csvTimeoutAlice),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeys[0].PubKey(),
@@ -173,13 +186,15 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        bobDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(channelCapacity),
 			ChanReserve:      channelCapacity / 100,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         uint16(csvTimeoutBob),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: bobDustLimit,
+			CsvDelay:  uint16(csvTimeoutBob),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeys[0].PubKey(),
@@ -228,21 +243,8 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 		return nil, nil, err
 	}
 
-	dbAlice, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbAlice.Close())
-	})
-
-	dbBob, err := channeldb.Open(t.TempDir())
-	if err != nil {
-		return nil, nil, err
-	}
-	t.Cleanup(func() {
-		require.NoError(t, dbBob.Close())
-	})
+	dbAlice := channeldb.OpenForTesting(t, t.TempDir(), dbModifiers...)
+	dbBob := channeldb.OpenForTesting(t, t.TempDir(), dbModifiers...)
 
 	estimator := chainfee.NewStaticEstimator(6000, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
@@ -252,7 +254,7 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 	commitFee := calcStaticFee(chanType, 0)
 	var anchorAmt btcutil.Amount
 	if chanType.HasAnchors() {
-		anchorAmt += 2 * anchorSize
+		anchorAmt += 2 * AnchorSize
 	}
 
 	aliceBalance := lnwire.NewMSatFromSatoshis(
@@ -342,14 +344,33 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 		Packager:                channeldb.NewChannelPackager(shortChanID),
 	}
 
-	aliceSigner := &input.MockSigner{Privkeys: aliceKeys}
-	bobSigner := &input.MockSigner{Privkeys: bobKeys}
+	// If the channel type has a tapscript root, then we'll also specify
+	// one here to apply to both the channels.
+	if chanType.HasTapscriptRoot() {
+		var tapscriptRoot chainhash.Hash
+		_, err := io.ReadFull(rand.Reader, tapscriptRoot[:])
+		if err != nil {
+			return nil, nil, err
+		}
+
+		someRoot := fn.Some(tapscriptRoot)
+
+		aliceChannelState.TapscriptRoot = someRoot
+		bobChannelState.TapscriptRoot = someRoot
+	}
+
+	aliceSigner := input.NewMockSigner(aliceKeys, nil)
+	bobSigner := input.NewMockSigner(bobKeys, nil)
 
 	// TODO(roasbeef): make mock version of pre-image store
+
+	auxSigner := NewDefaultAuxSignerMock(t)
 
 	alicePool := NewSigPool(1, aliceSigner)
 	channelAlice, err := NewLightningChannel(
 		aliceSigner, aliceChannelState, alicePool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -364,6 +385,8 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 	bobPool := NewSigPool(1, bobSigner)
 	channelBob, err := NewLightningChannel(
 		bobSigner, bobChannelState, bobPool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -413,10 +436,41 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType) (
 	return channelAlice, channelBob, nil
 }
 
+// initMusigNonce is used to manually setup musig2 nonces for a new channel,
+// outside the normal chan-reest flow.
+func initMusigNonce(chanA, chanB *LightningChannel) error {
+	chanANonces, err := chanA.GenMusigNonces()
+	if err != nil {
+		return err
+	}
+	chanBNonces, err := chanB.GenMusigNonces()
+	if err != nil {
+		return err
+	}
+
+	if err := chanA.InitRemoteMusigNonces(chanBNonces); err != nil {
+		return err
+	}
+	if err := chanB.InitRemoteMusigNonces(chanANonces); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // initRevocationWindows simulates a new channel being opened within the p2p
 // network by populating the initial revocation windows of the passed
 // commitment state machines.
 func initRevocationWindows(chanA, chanB *LightningChannel) error {
+	// If these are taproot chanenls, then we need to also simulate sending
+	// either FundingLocked or ChannelReestablish by calling
+	// InitRemoteMusigNonces for both sides.
+	if chanA.channelState.ChanType.IsTaproot() {
+		if err := initMusigNonce(chanA, chanB); err != nil {
+			return err
+		}
+	}
+
 	aliceNextRevoke, err := chanA.NextRevocationKey()
 	if err != nil {
 		return err
@@ -484,9 +538,10 @@ func calcStaticFee(chanType channeldb.ChannelType, numHTLCs int) btcutil.Amount 
 		htlcWeight = 172
 		feePerKw   = btcutil.Amount(24/4) * 1000
 	)
-	return feePerKw *
-		(btcutil.Amount(CommitWeight(chanType) +
-			htlcWeight*int64(numHTLCs))) / 1000
+	htlcsWeight := htlcWeight * int64(numHTLCs)
+	totalWeight := CommitWeight(chanType) + lntypes.WeightUnit(htlcsWeight)
+
+	return feePerKw * (btcutil.Amount(totalWeight)) / 1000
 }
 
 // ForceStateTransition executes the necessary interaction between the two
@@ -494,11 +549,12 @@ func calcStaticFee(chanType channeldb.ChannelType, numHTLCs int) btcutil.Amount 
 // pending updates. This method is useful when testing interactions between two
 // live state machines.
 func ForceStateTransition(chanA, chanB *LightningChannel) error {
-	aliceSig, aliceHtlcSigs, _, err := chanA.SignNextCommitment()
+	aliceNewCommit, err := chanA.SignNextCommitment(ctxb)
 	if err != nil {
 		return err
 	}
-	if err = chanB.ReceiveNewCommitment(aliceSig, aliceHtlcSigs); err != nil {
+	err = chanB.ReceiveNewCommitment(aliceNewCommit.CommitSigs)
+	if err != nil {
 		return err
 	}
 
@@ -506,15 +562,17 @@ func ForceStateTransition(chanA, chanB *LightningChannel) error {
 	if err != nil {
 		return err
 	}
-	bobSig, bobHtlcSigs, _, err := chanB.SignNextCommitment()
+	bobNewCommit, err := chanB.SignNextCommitment(ctxb)
 	if err != nil {
 		return err
 	}
 
-	if _, _, _, _, err := chanA.ReceiveRevocation(bobRevocation); err != nil {
+	_, _, err = chanA.ReceiveRevocation(bobRevocation)
+	if err != nil {
 		return err
 	}
-	if err := chanA.ReceiveNewCommitment(bobSig, bobHtlcSigs); err != nil {
+	err = chanA.ReceiveNewCommitment(bobNewCommit.CommitSigs)
+	if err != nil {
 		return err
 	}
 
@@ -522,9 +580,45 @@ func ForceStateTransition(chanA, chanB *LightningChannel) error {
 	if err != nil {
 		return err
 	}
-	if _, _, _, _, err := chanB.ReceiveRevocation(aliceRevocation); err != nil {
+	_, _, err = chanB.ReceiveRevocation(aliceRevocation)
+	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func NewDefaultAuxSignerMock(t *testing.T) *MockAuxSigner {
+	auxSigner := NewAuxSignerMock(EmptyMockJobHandler)
+
+	type testSigBlob struct {
+		BlobInt tlv.RecordT[tlv.TlvType65634, uint16]
+	}
+
+	var sigBlobBuf bytes.Buffer
+	sigBlob := testSigBlob{
+		BlobInt: tlv.NewPrimitiveRecord[tlv.TlvType65634, uint16](5),
+	}
+	tlvStream, err := tlv.NewStream(sigBlob.BlobInt.Record())
+	require.NoError(t, err, "unable to create tlv stream")
+	require.NoError(t, tlvStream.Encode(&sigBlobBuf))
+
+	auxSigner.On(
+		"SubmitSecondLevelSigBatch", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(nil)
+	auxSigner.On(
+		"PackSigs", mock.Anything,
+	).Return(fn.Ok(fn.Some(sigBlobBuf.Bytes())))
+	auxSigner.On(
+		"UnpackSigs", mock.Anything,
+	).Return(fn.Ok([]fn.Option[tlv.Blob]{
+		fn.Some(sigBlobBuf.Bytes()),
+	}))
+	auxSigner.On(
+		"VerifySecondLevelSigs", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(nil)
+
+	return auxSigner
 }

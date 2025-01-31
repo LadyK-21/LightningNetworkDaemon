@@ -23,6 +23,7 @@ type MessageType uint16
 // Lightning protocol.
 const (
 	MsgWarning                 MessageType = 1
+	MsgStfu                                = 2
 	MsgInit                                = 16
 	MsgError                               = 17
 	MsgPing                                = 18
@@ -31,9 +32,14 @@ const (
 	MsgAcceptChannel                       = 33
 	MsgFundingCreated                      = 34
 	MsgFundingSigned                       = 35
-	MsgFundingLocked                       = 36
+	MsgChannelReady                        = 36
 	MsgShutdown                            = 38
 	MsgClosingSigned                       = 39
+	MsgClosingComplete                     = 40
+	MsgClosingSig                          = 41
+	MsgDynPropose                          = 111
+	MsgDynAck                              = 113
+	MsgDynReject                           = 115
 	MsgUpdateAddHTLC                       = 128
 	MsgUpdateFulfillHTLC                   = 130
 	MsgUpdateFailHTLC                      = 131
@@ -46,12 +52,35 @@ const (
 	MsgNodeAnnouncement                    = 257
 	MsgChannelUpdate                       = 258
 	MsgAnnounceSignatures                  = 259
+	MsgAnnounceSignatures2                 = 260
 	MsgQueryShortChanIDs                   = 261
 	MsgReplyShortChanIDsEnd                = 262
 	MsgQueryChannelRange                   = 263
 	MsgReplyChannelRange                   = 264
 	MsgGossipTimestampRange                = 265
+	MsgChannelAnnouncement2                = 267
+	MsgChannelUpdate2                      = 271
+	MsgKickoffSig                          = 777
 )
+
+// IsChannelUpdate is a filter function that discerns channel update messages
+// from the other messages in the Lightning Network Protocol.
+func (t MessageType) IsChannelUpdate() bool {
+	switch t {
+	case MsgUpdateAddHTLC:
+		return true
+	case MsgUpdateFulfillHTLC:
+		return true
+	case MsgUpdateFailHTLC:
+		return true
+	case MsgUpdateFailMalformedHTLC:
+		return true
+	case MsgUpdateFee:
+		return true
+	default:
+		return false
+	}
+}
 
 // ErrorEncodeMessage is used when failed to encode the message payload.
 func ErrorEncodeMessage(err error) error {
@@ -78,6 +107,8 @@ func (t MessageType) String() string {
 	switch t {
 	case MsgWarning:
 		return "Warning"
+	case MsgStfu:
+		return "Stfu"
 	case MsgInit:
 		return "Init"
 	case MsgOpenChannel:
@@ -88,12 +119,20 @@ func (t MessageType) String() string {
 		return "MsgFundingCreated"
 	case MsgFundingSigned:
 		return "MsgFundingSigned"
-	case MsgFundingLocked:
-		return "FundingLocked"
+	case MsgChannelReady:
+		return "ChannelReady"
 	case MsgShutdown:
 		return "Shutdown"
 	case MsgClosingSigned:
 		return "ClosingSigned"
+	case MsgDynPropose:
+		return "DynPropose"
+	case MsgDynAck:
+		return "DynAck"
+	case MsgDynReject:
+		return "DynReject"
+	case MsgKickoffSig:
+		return "KickoffSig"
 	case MsgUpdateAddHTLC:
 		return "UpdateAddHTLC"
 	case MsgUpdateFailHTLC:
@@ -134,6 +173,16 @@ func (t MessageType) String() string {
 		return "ReplyChannelRange"
 	case MsgGossipTimestampRange:
 		return "GossipTimestampRange"
+	case MsgClosingComplete:
+		return "ClosingComplete"
+	case MsgClosingSig:
+		return "ClosingSig"
+	case MsgAnnounceSignatures2:
+		return "MsgAnnounceSignatures2"
+	case MsgChannelAnnouncement2:
+		return "ChannelAnnouncement2"
+	case MsgChannelUpdate2:
+		return "ChannelUpdate2"
 	default:
 		return "<unknown>"
 	}
@@ -172,6 +221,19 @@ type Message interface {
 	MsgType() MessageType
 }
 
+// LinkUpdater is an interface implemented by most messages in BOLT 2 that are
+// allowed to update the channel state.
+type LinkUpdater interface {
+	// All LinkUpdater messages are messages and so we embed the interface
+	// so that we can treat it as a message if all we know about it is that
+	// it is a LinkUpdater message.
+	Message
+
+	// TargetChanID returns the channel id of the link for which this
+	// message is intended.
+	TargetChanID() ChannelID
+}
+
 // makeEmptyMessage creates a new empty message of the proper concrete type
 // based on the passed message type.
 func makeEmptyMessage(msgType MessageType) (Message, error) {
@@ -180,6 +242,8 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 	switch msgType {
 	case MsgWarning:
 		msg = &Warning{}
+	case MsgStfu:
+		msg = &Stfu{}
 	case MsgInit:
 		msg = &Init{}
 	case MsgOpenChannel:
@@ -190,12 +254,20 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &FundingCreated{}
 	case MsgFundingSigned:
 		msg = &FundingSigned{}
-	case MsgFundingLocked:
-		msg = &FundingLocked{}
+	case MsgChannelReady:
+		msg = &ChannelReady{}
 	case MsgShutdown:
 		msg = &Shutdown{}
 	case MsgClosingSigned:
 		msg = &ClosingSigned{}
+	case MsgDynPropose:
+		msg = &DynPropose{}
+	case MsgDynAck:
+		msg = &DynAck{}
+	case MsgDynReject:
+		msg = &DynReject{}
+	case MsgKickoffSig:
+		msg = &KickoffSig{}
 	case MsgUpdateAddHTLC:
 		msg = &UpdateAddHTLC{}
 	case MsgUpdateFailHTLC:
@@ -215,15 +287,15 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 	case MsgError:
 		msg = &Error{}
 	case MsgChannelAnnouncement:
-		msg = &ChannelAnnouncement{}
+		msg = &ChannelAnnouncement1{}
 	case MsgChannelUpdate:
-		msg = &ChannelUpdate{}
+		msg = &ChannelUpdate1{}
 	case MsgNodeAnnouncement:
 		msg = &NodeAnnouncement{}
 	case MsgPing:
 		msg = &Ping{}
 	case MsgAnnounceSignatures:
-		msg = &AnnounceSignatures{}
+		msg = &AnnounceSignatures1{}
 	case MsgPong:
 		msg = &Pong{}
 	case MsgQueryShortChanIDs:
@@ -236,10 +308,27 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &ReplyChannelRange{}
 	case MsgGossipTimestampRange:
 		msg = &GossipTimestampRange{}
+	case MsgClosingComplete:
+		msg = &ClosingComplete{}
+	case MsgClosingSig:
+		msg = &ClosingSig{}
+	case MsgAnnounceSignatures2:
+		msg = &AnnounceSignatures2{}
+	case MsgChannelAnnouncement2:
+		msg = &ChannelAnnouncement2{}
+	case MsgChannelUpdate2:
+		msg = &ChannelUpdate2{}
 	default:
-		if msgType < CustomTypeStart {
+		// If the message is not within our custom range and has not
+		// specifically been overridden, return an unknown message.
+		//
+		// Note that we do not allow custom message overrides to replace
+		// known message types, only protocol messages that are not yet
+		// known to lnd.
+		if msgType < CustomTypeStart && !IsCustomOverride(msgType) {
 			return nil, &UnknownMessage{msgType}
 		}
+
 		msg = &Custom{
 			Type: msgType,
 		}

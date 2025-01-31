@@ -67,7 +67,10 @@ func TestProbabilityExtrapolation(t *testing.T) {
 	// If we use a static value for the node probability (no extrapolation
 	// of data from other channels), all ten bad channels will be tried
 	// first before switching to the paid channel.
-	ctx.mcCfg.AprioriWeight = 1
+	estimator, ok := ctx.mcCfg.Estimator.(*AprioriEstimator)
+	if ok {
+		estimator.AprioriWeight = 1
+	}
 	attempts, err = ctx.testPayment(1)
 	require.NoError(t, err, "payment failed")
 	if len(attempts) != 11 {
@@ -293,7 +296,7 @@ func testMppSend(t *testing.T, testCase *mppSendTestCase) {
 	case err == nil && testCase.expectedFailure:
 		t.Fatal("expected payment to fail")
 	case err != nil && !testCase.expectedFailure:
-		t.Fatal("expected payment to succeed")
+		t.Fatalf("expected payment to succeed, got %v", err)
 	}
 
 	if len(attempts) != testCase.expectedAttempts {
@@ -376,7 +379,7 @@ func TestPaymentAddrOnlyNoSplit(t *testing.T) {
 	twoPathGraph(ctx.graph, chanSize, chanSize)
 
 	payAddrOnlyFeatures := []lnwire.FeatureBit{
-		lnwire.TLVOnionPayloadOptional,
+		lnwire.TLVOnionPayloadRequired,
 		lnwire.PaymentAddrOptional,
 	}
 

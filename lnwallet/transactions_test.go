@@ -8,9 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
+	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -93,41 +95,80 @@ func newTestContext(t *testing.T) *testContext {
 	return tc
 }
 
-var testHtlcs = []struct {
+type htlc struct {
 	incoming bool
 	amount   lnwire.MilliSatoshi
 	expiry   uint32
 	preimage string
-}{
+}
+
+var testHtlcsSet1 = []htlc{
+	// htlc 0.
 	{
 		incoming: true,
 		amount:   1000000,
 		expiry:   500,
-		preimage: "0000000000000000000000000000000000000000000000000000000000000000",
+		preimage: "0000000000000000000000000000000000000000000000000" +
+			"000000000000000",
 	},
+	// htlc 1.
 	{
 		incoming: true,
 		amount:   2000000,
 		expiry:   501,
-		preimage: "0101010101010101010101010101010101010101010101010101010101010101",
+		preimage: "0101010101010101010101010101010101010101010101010" +
+			"101010101010101",
 	},
+	// htlc 2.
 	{
 		incoming: false,
 		amount:   2000000,
 		expiry:   502,
-		preimage: "0202020202020202020202020202020202020202020202020202020202020202",
+		preimage: "0202020202020202020202020202020202020202020202020" +
+			"202020202020202",
 	},
+	// htlc 3.
 	{
 		incoming: false,
 		amount:   3000000,
 		expiry:   503,
-		preimage: "0303030303030303030303030303030303030303030303030303030303030303",
+		preimage: "03030303030303030303030303030303030303030303030303" +
+			"03030303030303",
 	},
+	// htlc 4.
 	{
 		incoming: true,
 		amount:   4000000,
 		expiry:   504,
-		preimage: "0404040404040404040404040404040404040404040404040404040404040404",
+		preimage: "0404040404040404040404040404040404040404040404040" +
+			"404040404040404",
+	},
+}
+
+var testHtlcsSet2 = []htlc{
+	// htlc 1.
+	{
+		incoming: true,
+		amount:   2000000,
+		expiry:   501,
+		preimage: "01010101010101010101010101010101010101010101010101" +
+			"01010101010101",
+	},
+	// htlc 5.
+	{
+		incoming: false,
+		amount:   5000000,
+		expiry:   506,
+		preimage: "05050505050505050505050505050505050505050505050505" +
+			"05050505050505",
+	},
+	// htlc 6.
+	{
+		incoming: false,
+		amount:   5000001,
+		expiry:   505,
+		preimage: "05050505050505050505050505050505050505050505050505" +
+			"05050505050505",
 	},
 }
 
@@ -138,10 +179,11 @@ type htlcDesc struct {
 }
 
 type testCase struct {
-	Name          string
-	LocalBalance  lnwire.MilliSatoshi
-	RemoteBalance lnwire.MilliSatoshi
-	FeePerKw      btcutil.Amount
+	Name              string
+	LocalBalance      lnwire.MilliSatoshi
+	RemoteBalance     lnwire.MilliSatoshi
+	FeePerKw          btcutil.Amount
+	DustLimitSatoshis btcutil.Amount
 
 	// UseTestHtlcs defined whether the fixed set of test htlc should be
 	// added to the channel before checking the commitment assertions.
@@ -169,9 +211,17 @@ func TestCommitmentAndHTLCTransactions(t *testing.T) {
 			jsonFile: "test_vectors_legacy.json",
 		},
 		{
-			name:     "anchors",
-			chanType: channeldb.SingleFunderTweaklessBit | channeldb.AnchorOutputsBit,
+			name: "anchors",
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit,
 			jsonFile: "test_vectors_anchors.json",
+		},
+		{
+			name: "zero fee htlc tx",
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.ZeroHtlcTxFeeBit,
+			jsonFile: "test_vectors_zero_fee_htlc_tx.json",
 		},
 	}
 
@@ -180,31 +230,34 @@ func TestCommitmentAndHTLCTransactions(t *testing.T) {
 
 		var testCases []testCase
 
-		jsonText, err := ioutil.ReadFile(set.jsonFile)
+		jsonText, err := os.ReadFile(set.jsonFile)
 		require.NoError(t, err)
 
 		err = json.Unmarshal(jsonText, &testCases)
 		require.NoError(t, err)
 
-		t.Run(set.name, func(t *testing.T) {
-			for _, test := range testCases {
-				test := test
+		for _, test := range testCases {
+			test := test
+			name := fmt.Sprintf("%s-%s", set.name, test.Name)
+
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
 				t.Run(test.Name, func(t *testing.T) {
 					testVectors(t, set.chanType, test)
 				})
-			}
-		})
+			})
+		}
 	}
 }
 
 // addTestHtlcs adds the test vector htlcs to the update logs of the local and
 // remote node.
-func addTestHtlcs(t *testing.T, remote,
-	local *LightningChannel) map[[20]byte]lntypes.Preimage {
+func addTestHtlcs(t *testing.T, remote, local *LightningChannel,
+	htlcSet []htlc) map[[20]byte]lntypes.Preimage {
 
 	hash160map := make(map[[20]byte]lntypes.Preimage)
-	for _, htlc := range testHtlcs {
+	for _, htlc := range htlcSet {
 		preimage, err := lntypes.MakePreimageFromStr(htlc.preimage)
 		require.NoError(t, err)
 
@@ -217,7 +270,7 @@ func addTestHtlcs(t *testing.T, remote,
 		hash160map[hash160] = preimage
 
 		// Add htlc to the channel.
-		chanID := lnwire.NewChanIDFromOutPoint(remote.ChanPoint)
+		chanID := lnwire.NewChanIDFromOutPoint(remote.ChannelPoint())
 
 		msg := &lnwire.UpdateAddHTLC{
 			Amount:      htlc.amount,
@@ -226,14 +279,14 @@ func addTestHtlcs(t *testing.T, remote,
 			PaymentHash: hash,
 		}
 		if htlc.incoming {
-			htlcID, err := remote.AddHTLC(msg, nil)
+			htlcID, err := remote.addHTLC(msg, nil, NoBuffer)
 			require.NoError(t, err, "unable to add htlc")
 
 			msg.ID = htlcID
 			_, err = local.ReceiveHTLC(msg)
 			require.NoError(t, err, "unable to recv htlc")
 		} else {
-			htlcID, err := local.AddHTLC(msg, nil)
+			htlcID, err := local.addHTLC(msg, nil, NoBuffer)
 			require.NoError(t, err, "unable to add htlc")
 
 			msg.ID = htlcID
@@ -251,6 +304,18 @@ func addTestHtlcs(t *testing.T, remote,
 func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 	tc := newTestContext(t)
 
+	// Determine which htlc set to use.
+	testHtlcs := testHtlcsSet1
+	if strings.Contains(test.Name, "same amount and preimage") {
+		testHtlcs = testHtlcsSet2
+	}
+
+	// If the test specifies a dust limit, then use it instead of the
+	// default.
+	if test.DustLimitSatoshis != 0 {
+		tc.dustLimit = test.DustLimitSatoshis
+	}
+
 	// Balances in the test vectors are before subtraction of in-flight
 	// htlcs. Convert to spendable balances.
 	remoteBalance := test.RemoteBalance
@@ -266,6 +331,11 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 		}
 	}
 
+	// Assert that the remote and local balances add up to the channel
+	// capacity.
+	require.EqualValues(t, lnwire.NewMSatFromSatoshis(tc.fundingAmount),
+		remoteBalance+localBalance)
+
 	// Set up a test channel on which the test commitment transaction is
 	// going to be produced.
 	remoteChannel, localChannel := createTestChannelsForVectors(
@@ -280,33 +350,43 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 	// retrieve the corresponding preimage.
 	var hash160map map[[20]byte]lntypes.Preimage
 	if test.UseTestHtlcs {
-		hash160map = addTestHtlcs(t, remoteChannel, localChannel)
+		hash160map = addTestHtlcs(
+			t, remoteChannel, localChannel, testHtlcs,
+		)
 	}
 
 	// Execute commit dance to arrive at the point where the local node has
 	// received the test commitment and the remote signature.
-	localSig, localHtlcSigs, _, err := localChannel.SignNextCommitment()
+	localNewCommit, err := localChannel.SignNextCommitment(ctxb)
 	require.NoError(t, err, "local unable to sign commitment")
 
-	err = remoteChannel.ReceiveNewCommitment(localSig, localHtlcSigs)
+	err = remoteChannel.ReceiveNewCommitment(localNewCommit.CommitSigs)
 	require.NoError(t, err)
 
 	revMsg, _, _, err := remoteChannel.RevokeCurrentCommitment()
 	require.NoError(t, err)
 
-	_, _, _, _, err = localChannel.ReceiveRevocation(revMsg)
+	_, _, err = localChannel.ReceiveRevocation(revMsg)
 	require.NoError(t, err)
 
-	remoteSig, remoteHtlcSigs, _, err := remoteChannel.SignNextCommitment()
+	remoteNewCommit, err := remoteChannel.SignNextCommitment(ctxb)
 	require.NoError(t, err)
 
-	require.Equal(t, test.RemoteSigHex, hex.EncodeToString(remoteSig.ToSignatureBytes()))
+	require.Equal(
+		t, test.RemoteSigHex,
+		hex.EncodeToString(
+			remoteNewCommit.CommitSig.ToSignatureBytes(),
+		),
+	)
 
-	for i, sig := range remoteHtlcSigs {
-		require.Equal(t, test.HtlcDescs[i].RemoteSigHex, hex.EncodeToString(sig.ToSignatureBytes()))
+	for i, sig := range remoteNewCommit.HtlcSigs {
+		require.Equal(
+			t, test.HtlcDescs[i].RemoteSigHex,
+			hex.EncodeToString(sig.ToSignatureBytes()),
+		)
 	}
 
-	err = localChannel.ReceiveNewCommitment(remoteSig, remoteHtlcSigs)
+	err = localChannel.ReceiveNewCommitment(remoteNewCommit.CommitSigs)
 	require.NoError(t, err)
 
 	_, _, _, err = localChannel.RevokeCurrentCommitment()
@@ -321,7 +401,12 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 	var txBytes bytes.Buffer
 	require.NoError(t, forceCloseSum.CloseTx.Serialize(&txBytes))
 
-	require.Equal(t, test.ExpectedCommitmentTxHex, hex.EncodeToString(txBytes.Bytes()))
+	require.Equal(
+		t, test.ExpectedCommitmentTxHex,
+		hex.EncodeToString(txBytes.Bytes()),
+	)
+
+	resolutions := forceCloseSum.ContractResolutions.UnwrapOrFail(t)
 
 	// Obtain the second level transactions that the local node's channel
 	// state machine has produced. Store them in a map indexed by commit tx
@@ -336,7 +421,8 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 		secondLevelTxes[index] = tx
 	}
 
-	for _, r := range forceCloseSum.HtlcResolutions.IncomingHTLCs {
+	htlcResolutions := resolutions.HtlcResolutions
+	for _, r := range htlcResolutions.IncomingHTLCs {
 		successTx := r.SignedSuccessTx
 		witnessScript := successTx.TxIn[0].Witness[4]
 		var hash160 [20]byte
@@ -345,7 +431,7 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 		successTx.TxIn[0].Witness[3] = preimage[:]
 		storeTx(r.HtlcPoint().Index, successTx)
 	}
-	for _, r := range forceCloseSum.HtlcResolutions.OutgoingHTLCs {
+	for _, r := range htlcResolutions.OutgoingHTLCs {
 		storeTx(r.HtlcPoint().Index, r.SignedTimeoutTx)
 	}
 
@@ -372,27 +458,6 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 			hex.EncodeToString(b.Bytes()),
 		)
 	}
-}
-
-// htlcViewFromHTLCs constructs an htlcView of PaymentDescriptors from a slice
-// of channeldb.HTLC structs.
-func htlcViewFromHTLCs(htlcs []channeldb.HTLC) *htlcView {
-	var theHTLCView htlcView
-	for _, htlc := range htlcs {
-		paymentDesc := &PaymentDescriptor{
-			RHash:   htlc.RHash,
-			Timeout: htlc.RefundTimeout,
-			Amount:  htlc.Amt,
-		}
-		if htlc.Incoming {
-			theHTLCView.theirUpdates =
-				append(theHTLCView.theirUpdates, paymentDesc)
-		} else {
-			theHTLCView.ourUpdates =
-				append(theHTLCView.ourUpdates, paymentDesc)
-		}
-	}
-	return &theHTLCView
 }
 
 func TestCommitTxStateHint(t *testing.T) {
@@ -534,22 +599,22 @@ func testSpendValidation(t *testing.T, tweakless bool) {
 	remoteCommitTweak := input.SingleTweakBytes(commitPoint, aliceKeyPub)
 	localCommitTweak := input.SingleTweakBytes(commitPoint, bobKeyPub)
 
-	aliceSelfOutputSigner := &input.MockSigner{
-		Privkeys: []*btcec.PrivateKey{aliceKeyPriv},
-	}
+	aliceSelfOutputSigner := input.NewMockSigner(
+		[]*btcec.PrivateKey{aliceKeyPriv}, nil,
+	)
 
 	// Calculate the dust limit we'll use for the test.
 	dustLimit := DustLimitForSize(input.UnknownWitnessSize)
 
 	aliceChanCfg := &channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
+		CommitmentParams: channeldb.CommitmentParams{
 			DustLimit: dustLimit,
 			CsvDelay:  csvTimeout,
 		},
 	}
 
 	bobChanCfg := &channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
+		CommitmentParams: channeldb.CommitmentParams{
 			DustLimit: dustLimit,
 			CsvDelay:  csvTimeout,
 		},
@@ -570,6 +635,7 @@ func testSpendValidation(t *testing.T, tweakless bool) {
 	commitmentTx, err := CreateCommitTx(
 		channelType, *fakeFundingTxIn, keyRing, aliceChanCfg,
 		bobChanCfg, channelBalance, channelBalance, 0, true, 0,
+		fn.None[CommitAuxLeaves](),
 	)
 	if err != nil {
 		t.Fatalf("unable to create commitment transaction: %v", nil)
@@ -626,7 +692,7 @@ func testSpendValidation(t *testing.T, tweakless bool) {
 		t.Fatalf("spend from delay output is invalid: %v", err)
 	}
 
-	localSigner := &input.MockSigner{Privkeys: []*btcec.PrivateKey{bobKeyPriv}}
+	localSigner := input.NewMockSigner([]*btcec.PrivateKey{bobKeyPriv}, nil)
 
 	// Next, we'll test bob spending with the derived revocation key to
 	// simulate the scenario when Alice broadcasts this commitment
@@ -773,15 +839,17 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 
 	// Define channel configurations.
 	remoteCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit: tc.dustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 				tc.fundingAmount,
 			),
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         tc.localCsvDelay,
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: tc.dustLimit,
+			CsvDelay:  tc.localCsvDelay,
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: tc.remoteFundingPrivkey.PubKey(),
@@ -800,15 +868,17 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 		},
 	}
 	localCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit: tc.dustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 				tc.fundingAmount,
 			),
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-			CsvDelay:         tc.localCsvDelay,
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: tc.dustLimit,
+			CsvDelay:  tc.localCsvDelay,
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: tc.localFundingPrivkey.PubKey(),
@@ -844,15 +914,12 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 	)
 
 	// Create temporary databases.
-	dbRemote, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
-
-	dbLocal, err := channeldb.Open(t.TempDir())
-	require.NoError(t, err)
+	dbRemote := channeldb.OpenForTesting(t, t.TempDir())
+	dbLocal := channeldb.OpenForTesting(t, t.TempDir())
 
 	// Create the initial commitment transactions for the channel.
 	feePerKw := chainfee.SatPerKWeight(feeRate)
-	commitWeight := int64(input.CommitWeight)
+	commitWeight := lntypes.WeightUnit(input.CommitWeight)
 	if chanType.HasAnchors() {
 		commitWeight = input.AnchorCommitWeight
 	}
@@ -860,7 +927,7 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 
 	var anchorAmt btcutil.Amount
 	if chanType.HasAnchors() {
-		anchorAmt = 2 * anchorSize
+		anchorAmt = 2 * AnchorSize
 	}
 
 	remoteCommitTx, localCommitTx, err := CreateCommitmentTxns(
@@ -941,19 +1008,22 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 	}
 
 	// Create mock signers that can sign for the keys that are used.
-	localSigner := &input.MockSigner{Privkeys: []*btcec.PrivateKey{
+	localSigner := input.NewMockSigner([]*btcec.PrivateKey{
 		tc.localPaymentBasepointSecret, tc.localDelayedPaymentBasepointSecret,
 		tc.localFundingPrivkey, localDummy1, localDummy2,
-	}}
+	}, nil)
 
-	remoteSigner := &input.MockSigner{Privkeys: []*btcec.PrivateKey{
+	remoteSigner := input.NewMockSigner([]*btcec.PrivateKey{
 		tc.remoteFundingPrivkey, tc.remoteRevocationBasepointSecret,
 		tc.remotePaymentBasepointSecret, remoteDummy1, remoteDummy2,
-	}}
+	}, nil)
 
+	auxSigner := NewDefaultAuxSignerMock(t)
 	remotePool := NewSigPool(1, remoteSigner)
 	channelRemote, err := NewLightningChannel(
 		remoteSigner, remoteChannelState, remotePool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	require.NoError(t, err)
 	require.NoError(t, remotePool.Start())
@@ -961,6 +1031,8 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 	localPool := NewSigPool(1, localSigner)
 	channelLocal, err := NewLightningChannel(
 		localSigner, localChannelState, localPool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	require.NoError(t, err)
 	require.NoError(t, localPool.Start())

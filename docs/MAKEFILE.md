@@ -10,7 +10,7 @@ $  make install
 ```
 
 The command `make check` requires `bitcoind` (almost any version should do) to
-be available in the system's `$PATH` variable. Otherwise some of the tests will
+be available in the system's `$PATH` variable. Otherwise, some tests will
 fail.
 
 Developers
@@ -95,7 +95,7 @@ Related: [`unit`](#unit)
 
 `flakehunter`
 -------------
-Runs the itegration test suite endlessly until a failure is detected.
+Runs the integration test suite endlessly until a failure is detected.
 
 Arguments:
 - `icase=<itestcase>`
@@ -159,6 +159,10 @@ Lists all known make targets.
 `rpc`
 -----
 Compiles the `lnrpc` proto files.
+
+`sample-conf-check`
+-------------------
+Checks whether all required options of `lnd --help` are included in [sample-lnd.conf](github.com/lightningnetwork/lnd/blob/master/sample-lnd.conf) and that the default values of `lnd --help` are also mentioned correctly.
 
 `scratch`
 ---------

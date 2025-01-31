@@ -3,6 +3,8 @@ package lnwire
 import (
 	"bytes"
 	"io"
+
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // CommitSig is sent by either side to stage any pending HTLC's in the
@@ -36,6 +38,17 @@ type CommitSig struct {
 	// transaction should be signed.
 	HtlcSigs []Sig
 
+	// PartialSig is used to transmit a musig2 extended partial signature
+	// that also carries along the public nonce of the signer.
+	//
+	// NOTE: This field is only populated if a musig2 taproot channel is
+	// being signed for. In this case, the above Sig type MUST be blank.
+	PartialSig OptPartialSigWithNonceTLV
+
+	// CustomRecords maps TLV types to byte slices, storing arbitrary data
+	// intended for inclusion in the ExtraData field.
+	CustomRecords CustomRecords
+
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
@@ -44,9 +57,7 @@ type CommitSig struct {
 
 // NewCommitSig creates a new empty CommitSig message.
 func NewCommitSig() *CommitSig {
-	return &CommitSig{
-		ExtraData: make([]byte, 0),
-	}
+	return &CommitSig{}
 }
 
 // A compile time check to ensure CommitSig implements the lnwire.Message
@@ -58,12 +69,39 @@ var _ Message = (*CommitSig)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *CommitSig) Decode(r io.Reader, pver uint32) error {
-	return ReadElements(r,
+	// msgExtraData is a temporary variable used to read the message extra
+	// data field from the reader.
+	var msgExtraData ExtraOpaqueData
+
+	err := ReadElements(r,
 		&c.ChanID,
 		&c.CommitSig,
 		&c.HtlcSigs,
-		&c.ExtraData,
+		&msgExtraData,
 	)
+	if err != nil {
+		return err
+	}
+
+	// Extract TLV records from the extra data field.
+	partialSig := c.PartialSig.Zero()
+
+	customRecords, parsed, extraData, err := ParseAndExtractCustomRecords(
+		msgExtraData, &partialSig,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Set the corresponding TLV types if they were included in the stream.
+	if _, ok := parsed[partialSig.TlvType()]; ok {
+		c.PartialSig = tlv.SomeRecordT(partialSig)
+	}
+
+	c.CustomRecords = customRecords
+	c.ExtraData = extraData
+
+	return nil
 }
 
 // Encode serializes the target CommitSig into the passed io.Writer
@@ -71,6 +109,18 @@ func (c *CommitSig) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *CommitSig) Encode(w *bytes.Buffer, pver uint32) error {
+	recordProducers := make([]tlv.RecordProducer, 0, 1)
+	c.PartialSig.WhenSome(func(sig PartialSigWithNonceTLV) {
+		recordProducers = append(recordProducers, &sig)
+	})
+
+	extraData, err := MergeAndEncode(
+		recordProducers, c.ExtraData, c.CustomRecords,
+	)
+	if err != nil {
+		return err
+	}
+
 	if err := WriteChannelID(w, c.ChanID); err != nil {
 		return err
 	}
@@ -83,7 +133,7 @@ func (c *CommitSig) Encode(w *bytes.Buffer, pver uint32) error {
 		return err
 	}
 
-	return WriteBytes(w, c.ExtraData)
+	return WriteBytes(w, extraData)
 }
 
 // MsgType returns the integer uniquely identifying this message type on the

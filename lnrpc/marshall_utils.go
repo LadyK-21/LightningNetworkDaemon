@@ -3,13 +3,18 @@ package lnrpc
 import (
 	"encoding/hex"
 	"errors"
-	fmt "fmt"
+	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/lightningnetwork/lnd/aliasmgr"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"golang.org/x/exp/maps"
 )
 
 var (
@@ -18,6 +23,9 @@ var (
 	ErrSatMsatMutualExclusive = errors.New(
 		"sat and msat arguments are mutually exclusive",
 	)
+
+	// ErrNegativeAmt is returned when a negative amount is specified.
+	ErrNegativeAmt = errors.New("amount cannot be negative")
 )
 
 // CalculateFeeLimit returns the fee limit in millisatoshis. If a percentage
@@ -49,6 +57,10 @@ func CalculateFeeLimit(feeLimit *FeeLimit,
 func UnmarshallAmt(amtSat, amtMsat int64) (lnwire.MilliSatoshi, error) {
 	if amtSat != 0 && amtMsat != 0 {
 		return 0, ErrSatMsatMutualExclusive
+	}
+
+	if amtSat < 0 || amtMsat < 0 {
+		return 0, ErrNegativeAmt
 	}
 
 	if amtSat != 0 {
@@ -106,11 +118,7 @@ func MarshalUtxos(utxos []*lnwallet.Utxo, activeNetParams *chaincfg.Params) (
 
 		// Now that we know we have a proper mapping to an address,
 		// we'll convert the regular outpoint to an lnrpc variant.
-		outpoint := &OutPoint{
-			TxidBytes:   utxo.OutPoint.Hash[:],
-			TxidStr:     utxo.OutPoint.Hash.String(),
-			OutputIndex: utxo.OutPoint.Index,
-		}
+		outpoint := MarshalOutPoint(&utxo.OutPoint)
 
 		utxoResp := Utxo{
 			AddressType:   addrType,
@@ -172,4 +180,59 @@ func MarshallOutputType(o txscript.ScriptClass) OutputScriptType {
 	default:
 		return OutputScriptType_SCRIPT_TYPE_PUBKEY_HASH
 	}
+}
+
+// MarshalOutPoint converts a wire.OutPoint to its proto counterpart.
+func MarshalOutPoint(op *wire.OutPoint) *OutPoint {
+	return &OutPoint{
+		TxidBytes:   op.Hash[:],
+		TxidStr:     op.Hash.String(),
+		OutputIndex: op.Index,
+	}
+}
+
+// UnmarshallCoinSelectionStrategy converts a lnrpc.CoinSelectionStrategy proto
+// type to its wallet.CoinSelectionStrategy counterpart type, considering
+// a global default strategy if necessary.
+//
+// The globalStrategy parameter specifies the default coin selection strategy
+// to use if the strategy is set to STRATEGY_USE_GLOBAL_CONFIG. This allows
+// flexibility in defining a default strategy at a global level.
+func UnmarshallCoinSelectionStrategy(strategy CoinSelectionStrategy,
+	globalStrategy wallet.CoinSelectionStrategy) (
+	wallet.CoinSelectionStrategy, error) {
+
+	switch strategy {
+	case CoinSelectionStrategy_STRATEGY_USE_GLOBAL_CONFIG:
+		return globalStrategy, nil
+
+	case CoinSelectionStrategy_STRATEGY_LARGEST:
+		return wallet.CoinSelectionLargest, nil
+
+	case CoinSelectionStrategy_STRATEGY_RANDOM:
+		return wallet.CoinSelectionRandom, nil
+
+	default:
+		return nil, fmt.Errorf("unknown coin selection strategy "+
+			"%v", strategy)
+	}
+}
+
+// MarshalAliasMap converts a ScidAliasMap to its proto counterpart. This is
+// used in various RPCs that handle scid alias mappings.
+func MarshalAliasMap(scidMap aliasmgr.ScidAliasMap) []*AliasMap {
+	return fn.Map(
+		maps.Keys(scidMap),
+		func(base lnwire.ShortChannelID) *AliasMap {
+			return &AliasMap{
+				BaseScid: base.ToUint64(),
+				Aliases: fn.Map(
+					scidMap[base],
+					func(a lnwire.ShortChannelID) uint64 {
+						return a.ToUint64()
+					},
+				),
+			}
+		},
+	)
 }

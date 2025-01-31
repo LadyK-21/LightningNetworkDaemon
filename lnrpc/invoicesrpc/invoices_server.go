@@ -5,13 +5,13 @@ package invoicesrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/macaroons"
@@ -30,6 +30,9 @@ const (
 )
 
 var (
+	// ErrServerShuttingDown is returned when the server is shutting down.
+	ErrServerShuttingDown = errors.New("server shutting down")
+
 	// macaroonOps are the set of capabilities that our minted macaroon (if
 	// it doesn't already exist) will have.
 	macaroonOps = []bakery.Op{
@@ -62,6 +65,10 @@ var (
 			Action: "write",
 		}},
 		"/invoicesrpc.Invoices/LookupInvoiceV2": {{
+			Entity: "invoices",
+			Action: "write",
+		}},
+		"/invoicesrpc.Invoices/HtlcModifier": {{
 			Entity: "invoices",
 			Action: "write",
 		}},
@@ -131,7 +138,7 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		err = ioutil.WriteFile(macFilePath, invoicesMacBytes, 0644)
+		err = os.WriteFile(macFilePath, invoicesMacBytes, 0644)
 		if err != nil {
 			_ = os.Remove(macFilePath)
 			return nil, nil, err
@@ -215,8 +222,9 @@ func (r *ServerShell) RegisterWithRestServer(ctx context.Context,
 // methods routed towards it.
 //
 // NOTE: This is part of the lnrpc.GrpcHandler interface.
-func (r *ServerShell) CreateSubServer(configRegistry lnrpc.SubServerConfigDispatcher) (
-	lnrpc.SubServer, lnrpc.MacaroonPerms, error) {
+func (r *ServerShell) CreateSubServer(
+	configRegistry lnrpc.SubServerConfigDispatcher) (lnrpc.SubServer,
+	lnrpc.MacaroonPerms, error) {
 
 	subServer, macPermissions, err := createNewSubServer(configRegistry)
 	if err != nil {
@@ -237,7 +245,9 @@ func (s *Server) SubscribeSingleInvoice(req *SubscribeSingleInvoiceRequest,
 		return err
 	}
 
-	invoiceClient, err := s.cfg.InvoiceRegistry.SubscribeSingleInvoice(hash)
+	invoiceClient, err := s.cfg.InvoiceRegistry.SubscribeSingleInvoice(
+		updateStream.Context(), hash,
+	)
 	if err != nil {
 		return err
 	}
@@ -253,6 +263,14 @@ func (s *Server) SubscribeSingleInvoice(req *SubscribeSingleInvoiceRequest,
 			)
 			if err != nil {
 				return err
+			}
+
+			// Give the aux data parser a chance to format the
+			// custom data in the invoice HTLCs.
+			err = s.cfg.ParseAuxData(rpcInvoice)
+			if err != nil {
+				return fmt.Errorf("error parsing custom data: "+
+					"%w", err)
 			}
 
 			if err := updateStream.Send(rpcInvoice); err != nil {
@@ -286,8 +304,8 @@ func (s *Server) SettleInvoice(ctx context.Context,
 		return nil, err
 	}
 
-	err = s.cfg.InvoiceRegistry.SettleHodlInvoice(preimage)
-	if err != nil && err != channeldb.ErrInvoiceAlreadySettled {
+	err = s.cfg.InvoiceRegistry.SettleHodlInvoice(ctx, preimage)
+	if err != nil && !errors.Is(err, invoices.ErrInvoiceAlreadySettled) {
 		return nil, err
 	}
 
@@ -305,7 +323,7 @@ func (s *Server) CancelInvoice(ctx context.Context,
 		return nil, err
 	}
 
-	err = s.cfg.InvoiceRegistry.CancelInvoice(paymentHash)
+	err = s.cfg.InvoiceRegistry.CancelInvoice(ctx, paymentHash)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +398,7 @@ func (s *Server) AddHoldInvoice(ctx context.Context,
 func (s *Server) LookupInvoiceV2(ctx context.Context,
 	req *LookupInvoiceMsg) (*lnrpc.Invoice, error) {
 
-	var invoiceRef channeldb.InvoiceRef
+	var invoiceRef invoices.InvoiceRef
 
 	// First, we'll attempt to parse out the invoice ref from the proto
 	// oneof.  If none of the three currently supported types was
@@ -395,7 +413,7 @@ func (s *Server) LookupInvoiceV2(ctx context.Context,
 			)
 		}
 
-		invoiceRef = channeldb.InvoiceRefByHash(payHash)
+		invoiceRef = invoices.InvoiceRefByHash(payHash)
 
 	case req.GetPaymentAddr() != nil &&
 		req.LookupModifier == LookupModifier_HTLC_SET_BLANK:
@@ -403,13 +421,13 @@ func (s *Server) LookupInvoiceV2(ctx context.Context,
 		var payAddr [32]byte
 		copy(payAddr[:], req.GetPaymentAddr())
 
-		invoiceRef = channeldb.InvoiceRefByAddrBlankHtlc(payAddr)
+		invoiceRef = invoices.InvoiceRefByAddrBlankHtlc(payAddr)
 
 	case req.GetPaymentAddr() != nil:
 		var payAddr [32]byte
 		copy(payAddr[:], req.GetPaymentAddr())
 
-		invoiceRef = channeldb.InvoiceRefByAddr(payAddr)
+		invoiceRef = invoices.InvoiceRefByAddr(payAddr)
 
 	case req.GetSetId() != nil &&
 		req.LookupModifier == LookupModifier_HTLC_SET_ONLY:
@@ -417,13 +435,13 @@ func (s *Server) LookupInvoiceV2(ctx context.Context,
 		var setID [32]byte
 		copy(setID[:], req.GetSetId())
 
-		invoiceRef = channeldb.InvoiceRefBySetIDFiltered(setID)
+		invoiceRef = invoices.InvoiceRefBySetIDFiltered(setID)
 
 	case req.GetSetId() != nil:
 		var setID [32]byte
 		copy(setID[:], req.GetSetId())
 
-		invoiceRef = channeldb.InvoiceRefBySetID(setID)
+		invoiceRef = invoices.InvoiceRefBySetID(setID)
 
 	default:
 		return nil, status.Error(codes.InvalidArgument,
@@ -432,13 +450,60 @@ func (s *Server) LookupInvoiceV2(ctx context.Context,
 
 	// Attempt to locate the invoice, returning a nice "not found" error if
 	// we can't find it in the database.
-	invoice, err := s.cfg.InvoiceRegistry.LookupInvoiceByRef(invoiceRef)
+	invoice, err := s.cfg.InvoiceRegistry.LookupInvoiceByRef(
+		ctx, invoiceRef,
+	)
 	switch {
-	case err == channeldb.ErrInvoiceNotFound:
+	case errors.Is(err, invoices.ErrInvoiceNotFound):
 		return nil, status.Error(codes.NotFound, err.Error())
 	case err != nil:
 		return nil, err
 	}
 
-	return CreateRPCInvoice(&invoice, s.cfg.ChainParams)
+	rpcInvoice, err := CreateRPCInvoice(&invoice, s.cfg.ChainParams)
+	if err != nil {
+		return nil, err
+	}
+
+	// Give the aux data parser a chance to format the custom data in the
+	// invoice HTLCs.
+	err = s.cfg.ParseAuxData(rpcInvoice)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing custom data: %w", err)
+	}
+
+	return rpcInvoice, nil
+}
+
+// HtlcModifier is a bidirectional streaming RPC that allows a client to
+// intercept and modify the HTLCs that attempt to settle the given invoice. The
+// server will send HTLCs of invoices to the client and the client can modify
+// some aspects of the HTLC in order to pass the invoice acceptance tests.
+func (s *Server) HtlcModifier(
+	modifierServer Invoices_HtlcModifierServer) error {
+
+	modifier := newHtlcModifier(s.cfg.ChainParams, modifierServer)
+	reset, modifierQuit, err := s.cfg.HtlcModifier.RegisterInterceptor(
+		modifier.onIntercept,
+	)
+	if err != nil {
+		return fmt.Errorf("cannot register interceptor: %w", err)
+	}
+
+	defer reset()
+
+	log.Debugf("Invoice HTLC modifier client connected")
+
+	for {
+		select {
+		case <-modifierServer.Context().Done():
+			return modifierServer.Context().Err()
+
+		case <-modifierQuit:
+			return ErrServerShuttingDown
+
+		case <-s.quit:
+			return ErrServerShuttingDown
+		}
+	}
 }

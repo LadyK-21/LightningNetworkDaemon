@@ -4,7 +4,7 @@ import "fmt"
 
 // Config holds etcd configuration alongside with configuration related to our higher level interface.
 //
-// nolint:lll
+//nolint:ll
 type Config struct {
 	Embedded bool `long:"embedded" description:"Use embedded etcd instance instead of the external one. Note: use for testing only."`
 
@@ -14,7 +14,7 @@ type Config struct {
 
 	EmbeddedLogFile string `long:"embedded_log_file" description:"Optional log file to use for embedded instance logs. note: use for testing only."`
 
-	Host string `long:"host" description:"Etcd database host."`
+	Host string `long:"host" description:"Etcd database host. Supports multiple hosts separated by a comma."`
 
 	User string `long:"user" description:"Etcd database user."`
 

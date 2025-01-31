@@ -11,7 +11,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/channeldb"
 )
 
 const (
@@ -75,6 +74,11 @@ var (
 	// out of range.
 	ErrNumConfsOutOfRange = fmt.Errorf("number of confirmations must be "+
 		"between %d and %d", 1, MaxNumConfs)
+
+	// ErrEmptyWitnessStack is returned when a spending transaction has an
+	// empty witness stack. More details in,
+	// - https://github.com/bitcoin/bitcoin/issues/28730
+	ErrEmptyWitnessStack = errors.New("witness stack is empty")
 )
 
 // rescanState indicates the progression of a registration before the notifier
@@ -201,21 +205,6 @@ func (r ConfRequest) String() string {
 	return fmt.Sprintf("script=%v", r.PkScript)
 }
 
-// ConfHintKey returns the key that will be used to index the confirmation
-// request's hint within the height hint cache.
-func (r ConfRequest) ConfHintKey() ([]byte, error) {
-	if r.TxID == ZeroHash {
-		return r.PkScript.Script(), nil
-	}
-
-	var txid bytes.Buffer
-	if err := channeldb.WriteElement(&txid, r.TxID); err != nil {
-		return nil, err
-	}
-
-	return txid.Bytes(), nil
-}
-
 // MatchesTx determines whether the given transaction satisfies the confirmation
 // request. If the confirmation request is for a script, then we'll check all of
 // the outputs of the transaction to determine if it matches. Otherwise, we'll
@@ -255,20 +244,25 @@ type ConfNtfn struct {
 	// notification is to be sent.
 	NumConfirmations uint32
 
-	// Event contains references to the channels that the notifications are to
-	// be sent over.
+	// Event contains references to the channels that the notifications are
+	// to be sent over.
 	Event *ConfirmationEvent
 
 	// HeightHint is the minimum height in the chain that we expect to find
 	// this txid.
 	HeightHint uint32
 
-	// dispatched is false if the confirmed notification has not been sent yet.
+	// dispatched is false if the confirmed notification has not been sent
+	// yet.
 	dispatched bool
 
 	// includeBlock is true if the dispatched notification should also have
 	// the block included with it.
 	includeBlock bool
+
+	// numConfsLeft is the number of confirmations left to be sent to the
+	// subscriber.
+	numConfsLeft uint32
 }
 
 // HistoricalConfDispatch parametrizes a manual rescan for a particular
@@ -367,22 +361,6 @@ func (r SpendRequest) String() string {
 			r.PkScript)
 	}
 	return fmt.Sprintf("outpoint=<zero>, script=%v", r.PkScript)
-}
-
-// SpendHintKey returns the key that will be used to index the spend request's
-// hint within the height hint cache.
-func (r SpendRequest) SpendHintKey() ([]byte, error) {
-	if r.OutPoint == ZeroOutPoint {
-		return r.PkScript.Script(), nil
-	}
-
-	var outpoint bytes.Buffer
-	err := channeldb.WriteElement(&outpoint, r.OutPoint)
-	if err != nil {
-		return nil, err
-	}
-
-	return outpoint.Bytes(), nil
 }
 
 // MatchesTx determines whether the given transaction satisfies the spend
@@ -616,6 +594,7 @@ func (n *TxNotifier) newConfNtfn(txid *chainhash.Hash,
 		}),
 		HeightHint:   heightHint,
 		includeBlock: opts.includeBlock,
+		numConfsLeft: numConfs,
 	}, nil
 }
 
@@ -691,20 +670,28 @@ func (n *TxNotifier) RegisterConf(txid *chainhash.Hash, pkScript []byte,
 		// already been found, we'll attempt to deliver them immediately
 		// to this client.
 		Log.Debugf("Attempting to dispatch confirmation for %v on "+
-			"registration since rescan has finished",
-			ntfn.ConfRequest)
+			"registration since rescan has finished, conf_id=%v",
+			ntfn.ConfRequest, ntfn.ConfID)
 
 		// The default notification we assigned above includes the
 		// block along with the rest of the details. However not all
 		// clients want the block, so we make a copy here w/o the block
 		// if needed so we can give clients only what they ask for.
-		if !ntfn.includeBlock && confSet.details != nil {
-			confSet.details.Block = nil
+		confDetails := confSet.details
+		if !ntfn.includeBlock && confDetails != nil {
+			confDetailsCopy := *confDetails
+			confDetailsCopy.Block = nil
+
+			confDetails = &confDetailsCopy
 		}
 
-		err := n.dispatchConfDetails(ntfn, confSet.details)
-		if err != nil {
-			return nil, err
+		// Deliver the details to the whole conf set where this ntfn
+		// lives in.
+		for _, subscriber := range confSet.ntfns {
+			err := n.dispatchConfDetails(subscriber, confDetails)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		return &ConfRegistration{
@@ -795,8 +782,8 @@ func (n *TxNotifier) CancelConf(confRequest ConfRequest, confID uint64) {
 		return
 	}
 
-	Log.Infof("Canceling confirmation notification: conf_id=%d, %v", confID,
-		confRequest)
+	Log.Debugf("Canceling confirmation notification: conf_id=%d, %v",
+		confID, confRequest)
 
 	// We'll close all the notification channels to let the client know
 	// their cancel request has been fulfilled.
@@ -935,10 +922,16 @@ func (n *TxNotifier) dispatchConfDetails(
 	// If there are no conf details to dispatch or if the notification has
 	// already been dispatched, then we can skip dispatching to this
 	// client.
-	if details == nil || ntfn.dispatched {
-		Log.Debugf("Skipping dispatch of conf details(%v) for "+
-			"request %v, dispatched=%v", details, ntfn.ConfRequest,
-			ntfn.dispatched)
+	if details == nil {
+		Log.Debugf("Skipped dispatching nil conf details for request "+
+			"%v, conf_id=%v", ntfn.ConfRequest, ntfn.ConfID)
+
+		return nil
+	}
+
+	if ntfn.dispatched {
+		Log.Debugf("Skipped dispatched conf details for request %v "+
+			"conf_id=%v", ntfn.ConfRequest, ntfn.ConfID)
 
 		return nil
 	}
@@ -948,16 +941,16 @@ func (n *TxNotifier) dispatchConfDetails(
 	// we'll dispatch a confirmation notification to the caller.
 	confHeight := details.BlockHeight + ntfn.NumConfirmations - 1
 	if confHeight <= n.currentHeight {
-		Log.Infof("Dispatching %v confirmation notification for %v",
-			ntfn.NumConfirmations, ntfn.ConfRequest)
+		Log.Debugf("Dispatching %v confirmation notification for "+
+			"conf_id=%v, %v", ntfn.NumConfirmations, ntfn.ConfID,
+			ntfn.ConfRequest)
 
 		// We'll send a 0 value to the Updates channel,
 		// indicating that the transaction/output script has already
 		// been confirmed.
-		select {
-		case ntfn.Event.Updates <- 0:
-		case <-n.quit:
-			return ErrTxNotifierExiting
+		err := n.notifyNumConfsLeft(ntfn, 0)
+		if err != nil {
+			return err
 		}
 
 		select {
@@ -967,8 +960,8 @@ func (n *TxNotifier) dispatchConfDetails(
 			return ErrTxNotifierExiting
 		}
 	} else {
-		Log.Debugf("Queueing %v confirmation notification for %v at tip ",
-			ntfn.NumConfirmations, ntfn.ConfRequest)
+		Log.Debugf("Queueing %v confirmation notification for %v at "+
+			"tip", ntfn.NumConfirmations, ntfn.ConfRequest)
 
 		// Otherwise, we'll keep track of the notification
 		// request by the height at which we should dispatch the
@@ -984,10 +977,9 @@ func (n *TxNotifier) dispatchConfDetails(
 		// confirmations are left for the transaction/output script to
 		// be confirmed.
 		numConfsLeft := confHeight - n.currentHeight
-		select {
-		case ntfn.Event.Updates <- numConfsLeft:
-		case <-n.quit:
-			return ErrTxNotifierExiting
+		err := n.notifyNumConfsLeft(ntfn, numConfsLeft)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1081,7 +1073,7 @@ func (n *TxNotifier) RegisterSpend(outpoint *wire.OutPoint, pkScript []byte,
 	n.Lock()
 	defer n.Unlock()
 
-	Log.Infof("New spend subscription: spend_id=%d, %v, height_hint=%d",
+	Log.Debugf("New spend subscription: spend_id=%d, %v, height_hint=%d",
 		ntfn.SpendID, ntfn.SpendRequest, startHeight)
 
 	// Keep track of the notification request so that we can properly
@@ -1159,7 +1151,7 @@ func (n *TxNotifier) RegisterSpend(outpoint *wire.OutPoint, pkScript []byte,
 	// notifications don't also attempt a historical dispatch.
 	spendSet.rescanStatus = rescanPending
 
-	Log.Infof("Dispatching historical spend rescan for %v, start=%d, "+
+	Log.Debugf("Dispatching historical spend rescan for %v, start=%d, "+
 		"end=%d", ntfn.SpendRequest, startHeight, n.currentHeight)
 
 	return &SpendRegistration{
@@ -1194,7 +1186,7 @@ func (n *TxNotifier) CancelSpend(spendRequest SpendRequest, spendID uint64) {
 		return
 	}
 
-	Log.Infof("Canceling spend notification: spend_id=%d, %v", spendID,
+	Log.Debugf("Canceling spend notification: spend_id=%d, %v", spendID,
 		spendRequest)
 
 	// We'll close all the notification channels to let the client know
@@ -1325,6 +1317,19 @@ func (n *TxNotifier) updateSpendDetails(spendRequest SpendRequest,
 		return nil
 	}
 
+	// Return an error if the witness data is not present in the spending
+	// transaction.
+	//
+	// NOTE: if the witness stack is empty, we will do a critical log which
+	// shuts down the node.
+	if !details.HasSpenderWitness() {
+		Log.Criticalf("Found spending tx for outpoint=%v, but the "+
+			"transaction %v does not have witness",
+			spendRequest.OutPoint, details.SpendingTx.TxHash())
+
+		return ErrEmptyWitnessStack
+	}
+
 	// If the historical rescan found the spending transaction for this
 	// request, but it's at a later height than the notifier (this can
 	// happen due to latency with the backend during a reorg), then we'll
@@ -1374,7 +1379,7 @@ func (n *TxNotifier) dispatchSpendDetails(ntfn *SpendNtfn, details *SpendDetail)
 		return nil
 	}
 
-	Log.Infof("Dispatching confirmed spend notification for %v at "+
+	Log.Debugf("Dispatching confirmed spend notification for %v at "+
 		"current height=%d: %v", ntfn.SpendRequest, n.currentHeight,
 		details)
 
@@ -1739,10 +1744,9 @@ func (n *TxNotifier) NotifyHeight(height uint32) error {
 					continue
 				}
 
-				select {
-				case ntfn.Event.Updates <- numConfsLeft:
-				case <-n.quit:
-					return ErrTxNotifierExiting
+				err := n.notifyNumConfsLeft(ntfn, numConfsLeft)
+				if err != nil {
+					return err
 				}
 			}
 		}
@@ -1753,9 +1757,6 @@ func (n *TxNotifier) NotifyHeight(height uint32) error {
 	for ntfn := range n.ntfnsByConfirmHeight[height] {
 		confSet := n.confNotifications[ntfn.ConfRequest]
 
-		Log.Infof("Dispatching %v confirmation notification for %v",
-			ntfn.NumConfirmations, ntfn.ConfRequest)
-
 		// The default notification we assigned above includes the
 		// block along with the rest of the details. However not all
 		// clients want the block, so we make a copy here w/o the block
@@ -1764,6 +1765,20 @@ func (n *TxNotifier) NotifyHeight(height uint32) error {
 		if !ntfn.includeBlock {
 			confDetails.Block = nil
 		}
+
+		// If the `confDetails` has already been sent before, we'll
+		// skip it and continue processing the next one.
+		if ntfn.dispatched {
+			Log.Debugf("Skipped dispatched conf details for "+
+				"request %v conf_id=%v", ntfn.ConfRequest,
+				ntfn.ConfID)
+
+			continue
+		}
+
+		Log.Debugf("Dispatching %v confirmation notification for "+
+			"conf_id=%v, %v", ntfn.NumConfirmations, ntfn.ConfID,
+			ntfn.ConfRequest)
 
 		select {
 		case ntfn.Event.Confirmed <- &confDetails:
@@ -1842,6 +1857,9 @@ func (n *TxNotifier) DisconnectTip(blockHeight uint32) error {
 					return ErrTxNotifierExiting
 				default:
 				}
+
+				// We also reset the num of confs update.
+				ntfn.numConfsLeft = ntfn.NumConfirmations
 
 				// Then, we'll check if the current
 				// transaction/output script was included in the
@@ -2078,4 +2096,31 @@ func (n *TxNotifier) TearDown() {
 			delete(spendSet.ntfns, spendID)
 		}
 	}
+}
+
+// notifyNumConfsLeft sends the number of confirmations left to the
+// notification subscriber through the Event.Updates channel.
+//
+// NOTE: must be used with the TxNotifier's lock held.
+func (n *TxNotifier) notifyNumConfsLeft(ntfn *ConfNtfn, num uint32) error {
+	// If the number left is no less than the recorded value, we can skip
+	// sending it as it means this same value has already been sent before.
+	if num >= ntfn.numConfsLeft {
+		Log.Debugf("Skipped dispatched update (numConfsLeft=%v) for "+
+			"request %v conf_id=%v", num, ntfn.ConfRequest,
+			ntfn.ConfID)
+
+		return nil
+	}
+
+	// Update the number of confirmations left to the notification.
+	ntfn.numConfsLeft = num
+
+	select {
+	case ntfn.Event.Updates <- num:
+	case <-n.quit:
+		return ErrTxNotifierExiting
+	}
+
+	return nil
 }

@@ -98,7 +98,7 @@ function check_tag_correct() {
   fi
 
   # Build lnd to extract version.
-  go build ${PKG}/cmd/lnd
+  env GOEXPERIMENT=loopvar go build ${PKG}/cmd/lnd
 
   # Extract version command output.
   lnd_version_output=$(./lnd --version)
@@ -129,11 +129,23 @@ function check_tag_correct() {
 
 # build_release builds the actual release binaries.
 #   arguments: <version-tag> <build-system(s)> <build-tags> <ldflags>
+#              <go-version>
 function build_release() {
   local tag=$1
   local sys=$2
   local buildtags=$3
   local ldflags=$4
+  local goversion=$5
+
+  # Check if the active Go version matches the specified Go version.
+  active_go_version=$(go version | awk '{print $3}' | sed 's/go//')
+  if [ "$active_go_version" != "$goversion" ]; then
+    echo "Error: active Go version ($active_go_version) does not match \
+required Go version ($goversion)."
+    exit 1
+  fi
+
+  echo "Building release for tag $tag with Go version $goversion"
 
   green " - Packaging vendor"
   go mod vendor
@@ -177,8 +189,8 @@ function build_release() {
     pushd "${dir}"
 
     green " - Building: ${os} ${arch} ${arm} with build tags '${buildtags}'"
-    env CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lnd
-    env CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lncli
+    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lnd
+    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=$arm go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/lncli
     popd
 
     # Add the hashes for the individual binaries as well for easy verification
@@ -202,7 +214,7 @@ function build_release() {
 function usage() {
   red "Usage: "
   red "release.sh check-tag <version-tag>"
-  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags>"
+  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags> <go-version>"
 }
 
 # Whatever sub command is passed in, we need at least 2 arguments.

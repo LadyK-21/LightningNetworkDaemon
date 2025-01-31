@@ -18,7 +18,7 @@ var defaultSetDesc = setDesc{
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
 	},
-	lnwire.TLVOnionPayloadOptional: {
+	lnwire.TLVOnionPayloadRequired: {
 		SetInit:         {}, // I
 		SetNodeAnn:      {}, // N
 		SetInvoice:      {}, // 9
@@ -79,8 +79,28 @@ var defaultSetDesc = setDesc{
 		SetInit:    {}, // I
 		SetNodeAnn: {}, // N
 	},
+	lnwire.RouteBlindingOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+		SetInvoice: {}, // 9
+	},
+	lnwire.QuiescenceOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
 	lnwire.ShutdownAnySegwitOptional: {
 		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.SimpleTaprootChannelsOptionalStaging: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.SimpleTaprootOverlayChansOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.ExperimentalEndorsementOptional: {
 		SetNodeAnn: {}, // N
 	},
 }
