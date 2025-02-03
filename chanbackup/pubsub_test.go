@@ -36,7 +36,7 @@ func (m *mockSwapper) UpdateAndSwap(newBackup PackedMulti) error {
 
 	swapState, err := newBackup.Unpack(m.keyChain)
 	if err != nil {
-		return fmt.Errorf("unable to decode on disk swaps: %v", err)
+		return fmt.Errorf("unable to decode on disk swaps: %w", err)
 	}
 
 	m.swapState = swapState
@@ -277,4 +277,18 @@ func TestSubSwapperUpdater(t *testing.T) {
 	// Verify that the new set of backups, now has one less after the
 	// sub-swapper switches the new set with the old.
 	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// Check ManualUpdate method.
+	channel, err := genRandomOpenChannelShell()
+	require.NoError(t, err)
+	single := NewSingle(channel, nil)
+	backupSet[channel.FundingOutpoint] = single
+	require.NoError(t, subSwapper.ManualUpdate([]Single{single}))
+
+	// Verify that the state of the backup is as expected.
+	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// Check the case ManualUpdate returns an error.
+	swapper.fail = true
+	require.Error(t, subSwapper.ManualUpdate([]Single{single}))
 }

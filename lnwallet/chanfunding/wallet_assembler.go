@@ -3,14 +3,40 @@ package chanfunding
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/txsort"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+)
+
+const (
+	// DefaultReservationTimeout is the default time we wait until we remove
+	// an unfinished (zombiestate) open channel flow from memory.
+	DefaultReservationTimeout = 10 * time.Minute
+
+	// DefaultLockDuration is the default duration used to lock outputs.
+	DefaultLockDuration = 10 * time.Minute
+)
+
+var (
+	// LndInternalLockID is the binary representation of the SHA256 hash of
+	// the string "lnd-internal-lock-id" and is used for UTXO lock leases to
+	// identify that we ourselves are locking an UTXO, for example when
+	// giving out a funded PSBT. The ID corresponds to the hex value of
+	// ede19a92ed321a4705f8a1cccc1d4f6182545d4bb4fae08bd5937831b7e38f98.
+	LndInternalLockID = wtxmgr.LockID{
+		0xed, 0xe1, 0x9a, 0x92, 0xed, 0x32, 0x1a, 0x47,
+		0x05, 0xf8, 0xa1, 0xcc, 0xcc, 0x1d, 0x4f, 0x61,
+		0x82, 0x54, 0x5d, 0x4b, 0xb4, 0xfa, 0xe0, 0x8b,
+		0xd5, 0x93, 0x78, 0x31, 0xb7, 0xe3, 0x8f, 0x98,
+	}
 )
 
 // FullIntent is an intent that is fully backed by the internal wallet. This
@@ -30,15 +56,15 @@ type FullIntent struct {
 
 	// InputCoins are the set of coins selected as inputs to this funding
 	// transaction.
-	InputCoins []Coin
+	InputCoins []wallet.Coin
 
 	// ChangeOutputs are the set of outputs that the Assembler will use as
 	// change from the main funding transaction.
 	ChangeOutputs []*wire.TxOut
 
-	// coinLocker is the Assembler's instance of the OutpointLocker
+	// coinLeaser is the Assembler's instance of the OutputLeaser
 	// interface.
-	coinLocker OutpointLocker
+	coinLeaser OutputLeaser
 
 	// coinSource is the Assembler's instance of the CoinSource interface.
 	coinSource CoinSource
@@ -110,13 +136,12 @@ func (f *FullIntent) CompileFundingTx(extraInputs []*wire.TxIn,
 	prevOutFetcher := NewSegWitV0DualFundingPrevOutputFetcher(
 		f.coinSource, extraInputs,
 	)
-	signDesc := input.SignDescriptor{
-		SigHashes: txscript.NewTxSigHashes(
-			fundingTx, prevOutFetcher,
-		),
-		PrevOutputFetcher: prevOutFetcher,
-	}
+	sigHashes := txscript.NewTxSigHashes(fundingTx, prevOutFetcher)
 	for i, txIn := range fundingTx.TxIn {
+		signDesc := input.SignDescriptor{
+			SigHashes:         sigHashes,
+			PrevOutputFetcher: prevOutFetcher,
+		}
 		// We can only sign this input if it's ours, so we'll ask the
 		// coin source if it can map this outpoint into a coin we own.
 		// If not, then we'll continue as it isn't our input.
@@ -194,7 +219,13 @@ func (f *FullIntent) Outputs() []*wire.TxOut {
 // NOTE: Part of the chanfunding.Intent interface.
 func (f *FullIntent) Cancel() {
 	for _, coin := range f.InputCoins {
-		f.coinLocker.UnlockOutpoint(coin.OutPoint)
+		err := f.coinLeaser.ReleaseOutput(
+			LndInternalLockID, coin.OutPoint,
+		)
+		if err != nil {
+			log.Warnf("Failed to release UTXO %s (%v))",
+				coin.OutPoint, err)
+		}
 	}
 
 	f.ShimIntent.Cancel()
@@ -208,13 +239,17 @@ type WalletConfig struct {
 	// CoinSource is what the WalletAssembler uses to list/locate coins.
 	CoinSource CoinSource
 
+	// CoinSelectionStrategy is the strategy that is used for selecting
+	// coins when funding a transaction.
+	CoinSelectionStrategy wallet.CoinSelectionStrategy
+
 	// CoinSelectionLocker allows the WalletAssembler to gain exclusive
 	// access to the current set of coins returned by the CoinSource.
 	CoinSelectLocker CoinSelectionLocker
 
-	// CoinLocker is what the WalletAssembler uses to lock coins that may
+	// CoinLeaser is what the WalletAssembler uses to lease coins that may
 	// be used as inputs for a new funding transaction.
-	CoinLocker OutpointLocker
+	CoinLeaser OutputLeaser
 
 	// Signer allows the WalletAssembler to sign inputs on any potential
 	// funding transactions.
@@ -261,22 +296,75 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		log.Infof("Performing funding tx coin selection using %v "+
 			"sat/kw as fee rate", int64(r.FeeRate))
 
+		var (
+			// allCoins refers to the entirety of coins in our
+			// wallet that are available for funding a channel.
+			allCoins []wallet.Coin
+
+			// manuallySelectedCoins refers to the client-side
+			// selected coins that should be considered available
+			// for funding a channel.
+			manuallySelectedCoins []wallet.Coin
+			err                   error
+		)
+
+		// Convert manually selected outpoints to coins.
+		manuallySelectedCoins, err = outpointsToCoins(
+			r.Outpoints, w.cfg.CoinSource.CoinFromOutPoint,
+		)
+		if err != nil {
+			return err
+		}
+
 		// Find all unlocked unspent witness outputs that satisfy the
 		// minimum number of confirmations required. Coin selection in
 		// this function currently ignores the configured coin selection
 		// strategy.
-		coins, err := w.cfg.CoinSource.ListCoins(
+		allCoins, err = w.cfg.CoinSource.ListCoins(
 			r.MinConfs, math.MaxInt32,
 		)
 		if err != nil {
 			return err
 		}
 
+		// Ensure that all manually selected coins remain unspent.
+		unspent := make(map[wire.OutPoint]struct{})
+		for _, coin := range allCoins {
+			unspent[coin.OutPoint] = struct{}{}
+		}
+		for _, coin := range manuallySelectedCoins {
+			if _, ok := unspent[coin.OutPoint]; !ok {
+				return fmt.Errorf("outpoint already spent or "+
+					"locked by another subsystem: %v",
+					coin.OutPoint)
+			}
+		}
+
+		// The coin selection algorithm requires to know what
+		// inputs/outputs are already present in the funding
+		// transaction and what a change output would look like. Since
+		// a channel funding is always either a P2WSH or P2TR output,
+		// we can use just P2WSH here (both of these output types have
+		// the same length). And we currently don't support specifying a
+		// change output type, so we always use P2TR.
+		var fundingOutputWeight input.TxWeightEstimator
+		fundingOutputWeight.AddP2WSHOutput()
+		changeType := P2TRChangeAddress
+
 		var (
-			selectedCoins        []Coin
+			coins                []wallet.Coin
+			selectedCoins        []wallet.Coin
 			localContributionAmt btcutil.Amount
 			changeAmt            btcutil.Amount
 		)
+
+		// If outputs were specified manually then we'll take the
+		// corresponding coins as basis for coin selection. Otherwise,
+		// all available coins from our wallet are used.
+		coins = allCoins
+		if len(manuallySelectedCoins) > 0 {
+			coins = manuallySelectedCoins
+		}
 
 		// Perform coin selection over our available, unlocked unspent
 		// outputs in order to find enough coins to meet the funding
@@ -285,8 +373,93 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		// If there's no funding amount at all (receiving an inbound
 		// single funder request), then we don't need to perform any
 		// coin selection at all.
-		case r.LocalAmt == 0:
+		case r.LocalAmt == 0 && r.FundUpToMaxAmt == 0:
 			break
+
+		// The local funding amount cannot be used in combination with
+		// the funding up to some maximum amount. If that is the case
+		// we return an error.
+		case r.LocalAmt != 0 && r.FundUpToMaxAmt != 0:
+			return fmt.Errorf("cannot use a local funding amount " +
+				"and fundmax parameters")
+
+		// We cannot use the subtract fees flag while using the funding
+		// up to some maximum amount. If that is the case we return an
+		// error.
+		case r.SubtractFees && r.FundUpToMaxAmt != 0:
+			return fmt.Errorf("cannot subtract fees from local " +
+				"amount while using fundmax parameters")
+
+		// In case this request uses funding up to some maximum amount,
+		// we will call the specialized coin selection function for
+		// that.
+		case r.FundUpToMaxAmt != 0 && r.MinFundAmt != 0:
+			// We need to ensure that manually selected coins, which
+			// are spent entirely on the channel funding, leave
+			// enough funds in the wallet to cover for a reserve.
+			reserve := r.WalletReserve
+			if len(manuallySelectedCoins) > 0 {
+				sumCoins := func(
+					coins []wallet.Coin) btcutil.Amount {
+
+					var sum btcutil.Amount
+					for _, coin := range coins {
+						sum += btcutil.Amount(
+							coin.Value,
+						)
+					}
+
+					return sum
+				}
+
+				sumManual := sumCoins(manuallySelectedCoins)
+				sumAll := sumCoins(allCoins)
+
+				// If sufficient reserve funds are available we
+				// don't have to provide for it during coin
+				// selection. The manually selected coins can be
+				// spent entirely on the channel funding. If
+				// the excess of coins cover the reserve
+				// partially then we have to provide for the
+				// rest during coin selection.
+				excess := sumAll - sumManual
+				if excess >= reserve {
+					reserve = 0
+				} else {
+					reserve -= excess
+				}
+			}
+
+			selectedCoins, localContributionAmt, changeAmt,
+				err = CoinSelectUpToAmount(
+				r.FeeRate, r.MinFundAmt, r.FundUpToMaxAmt,
+				reserve, w.cfg.DustLimit, coins,
+				w.cfg.CoinSelectionStrategy,
+				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
+			)
+			if err != nil {
+				return err
+			}
+
+			// Now where the actual channel capacity is determined
+			// we can check for local contribution constraints.
+			//
+			// Ensure that the remote channel reserve does not
+			// exceed 20% of the channel capacity.
+			if r.RemoteChanReserve >= localContributionAmt/5 {
+				return fmt.Errorf("remote channel reserve " +
+					"must be less than the %%20 of the " +
+					"channel capacity")
+			}
+			// Ensure that the initial remote balance does not
+			// exceed our local contribution as that would leave a
+			// negative balance on our side.
+			if r.PushAmt >= localContributionAmt {
+				return fmt.Errorf("amount pushed to remote " +
+					"peer for initial state must be " +
+					"below the local funding amount")
+			}
 
 		// In case this request want the fees subtracted from the local
 		// amount, we'll call the specialized method for that. This
@@ -294,8 +467,12 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		// from our wallet.
 		case r.SubtractFees:
 			dustLimit := w.cfg.DustLimit
-			selectedCoins, localContributionAmt, changeAmt, err = CoinSelectSubtractFees(
+			selectedCoins, localContributionAmt, changeAmt,
+				err = CoinSelectSubtractFees(
 				r.FeeRate, r.LocalAmt, dustLimit, coins,
+				w.cfg.CoinSelectionStrategy,
+				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
 			)
 			if err != nil {
 				return err
@@ -308,6 +485,9 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 			localContributionAmt = r.LocalAmt
 			selectedCoins, changeAmt, err = CoinSelect(
 				r.FeeRate, r.LocalAmt, dustLimit, coins,
+				w.cfg.CoinSelectionStrategy,
+				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
 			)
 			if err != nil {
 				return err
@@ -347,16 +527,24 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		for _, coin := range selectedCoins {
 			outpoint := coin.OutPoint
 
-			w.cfg.CoinLocker.LockOutpoint(outpoint)
+			_, err = w.cfg.CoinLeaser.LeaseOutput(
+				LndInternalLockID, outpoint,
+				DefaultReservationTimeout,
+			)
+			if err != nil {
+				return err
+			}
 		}
 
 		newIntent := &FullIntent{
 			ShimIntent: ShimIntent{
 				localFundingAmt:  localContributionAmt,
 				remoteFundingAmt: r.RemoteAmt,
+				musig2:           r.Musig2,
+				tapscriptRoot:    r.TapscriptRoot,
 			},
 			InputCoins: selectedCoins,
-			coinLocker: w.cfg.CoinLocker,
+			coinLeaser: w.cfg.CoinLeaser,
 			coinSource: w.cfg.CoinSource,
 			signer:     w.cfg.Signer,
 		}
@@ -374,6 +562,28 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 	}
 
 	return intent, nil
+}
+
+// outpointsToCoins maps outpoints to coins in our wallet iff these coins are
+// existent and returns an error otherwise.
+func outpointsToCoins(outpoints []wire.OutPoint,
+	coinFromOutPoint func(wire.OutPoint) (*wallet.Coin, error)) (
+	[]wallet.Coin, error) {
+
+	var selectedCoins []wallet.Coin
+	for _, outpoint := range outpoints {
+		coin, err := coinFromOutPoint(
+			outpoint,
+		)
+		if err != nil {
+			return nil, err
+		}
+		selectedCoins = append(
+			selectedCoins, *coin,
+		)
+	}
+
+	return selectedCoins, nil
 }
 
 // FundingTxAvailable is an empty method that an assembler can implement to

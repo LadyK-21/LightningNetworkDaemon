@@ -1,7 +1,10 @@
 package htlcswitch
 
 import (
+	"fmt"
+
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -93,9 +96,13 @@ type htlcPacket struct {
 	// link.
 	outgoingTimeout uint32
 
-	// customRecords are user-defined records in the custom type range that
-	// were included in the payload.
-	customRecords record.CustomSet
+	// inOnionCustomRecords are user-defined records in the custom type
+	// range that were included in the onion payload.
+	inOnionCustomRecords record.CustomSet
+
+	// inWireCustomRecords are custom type range TLVs that are included
+	// in the incoming update_add_htlc wire message.
+	inWireCustomRecords lnwire.CustomRecords
 
 	// originalOutgoingChanID is used when sending back failure messages.
 	// It is only used for forwarded Adds on option_scid_alias channels.
@@ -103,6 +110,9 @@ type htlcPacket struct {
 	// but receives a channel_update with the alias SCID. Instead, the
 	// payer should receive a channel_update with the public SCID.
 	originalOutgoingChanID lnwire.ShortChannelID
+
+	// inboundFee is the fee schedule of the incoming channel.
+	inboundFee models.InboundFee
 }
 
 // inKey returns the circuit key used to identify the incoming htlc.
@@ -127,4 +137,13 @@ func (p *htlcPacket) keystone() Keystone {
 		InKey:  p.inKey(),
 		OutKey: p.outKey(),
 	}
+}
+
+// String returns a human-readable description of the packet.
+func (p *htlcPacket) String() string {
+	return fmt.Sprintf("keystone=%v, sourceRef=%v, destRef=%v, "+
+		"incomingAmount=%v, amount=%v, localFailure=%v, hasSource=%v "+
+		"isResolution=%v", p.keystone(), p.sourceRef, p.destRef,
+		p.incomingAmount, p.amount, p.localFailure, p.hasSource,
+		p.isResolution)
 }

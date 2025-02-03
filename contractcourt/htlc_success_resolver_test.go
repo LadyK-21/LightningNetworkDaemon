@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -12,11 +13,15 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/stretchr/testify/require"
 )
 
 var testHtlcAmt = lnwire.MilliSatoshi(200000)
@@ -34,6 +39,15 @@ type htlcResolverTestContext struct {
 	finalHtlcOutcomeStored bool
 
 	t *testing.T
+}
+
+func newHtlcResolverTestContextFromReader(t *testing.T,
+	newResolver func(htlc channeldb.HTLC,
+		cfg ResolverConfig) ContractResolver) *htlcResolverTestContext {
+
+	ctx := newHtlcResolverTestContext(t, newResolver)
+
+	return ctx
 }
 
 func newHtlcResolverTestContext(t *testing.T,
@@ -64,8 +78,10 @@ func newHtlcResolverTestContext(t *testing.T,
 				return nil
 			},
 			Sweeper: newMockSweeper(),
-			IncubateOutputs: func(wire.OutPoint, *lnwallet.OutgoingHtlcResolution,
-				*lnwallet.IncomingHtlcResolution, uint32) error {
+			IncubateOutputs: func(wire.OutPoint,
+				fn.Option[lnwallet.OutgoingHtlcResolution],
+				fn.Option[lnwallet.IncomingHtlcResolution],
+				uint32, fn.Option[int32]) error {
 
 				return nil
 			},
@@ -87,6 +103,12 @@ func newHtlcResolverTestContext(t *testing.T,
 				return nil
 			},
 			HtlcNotifier: htlcNotifier,
+			Budget:       *DefaultBudgetConfig(),
+			QueryIncomingCircuit: func(
+				circuit models.CircuitKey) *models.CircuitKey {
+
+				return nil
+			},
 		},
 		PutResolverReport: func(_ kvdb.RwTx,
 			report *channeldb.ResolverReport) error {
@@ -110,7 +132,7 @@ func newHtlcResolverTestContext(t *testing.T,
 
 	htlc := channeldb.HTLC{
 		RHash:     testResHash,
-		OnionBlob: testOnionBlob,
+		OnionBlob: lnmock.MockOnion(),
 		Amt:       testHtlcAmt,
 	}
 
@@ -122,7 +144,11 @@ func newHtlcResolverTestContext(t *testing.T,
 func (i *htlcResolverTestContext) resolve() {
 	// Start resolver.
 	i.resolverResultChan = make(chan resolveResult, 1)
+
 	go func() {
+		err := i.resolver.Launch()
+		require.NoError(i.t, err)
+
 		nextResolver, err := i.resolver.Resolve()
 		i.resolverResultChan <- resolveResult{
 			nextResolver: nextResolver,
@@ -176,17 +202,15 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 			// that our sweep succeeded.
 			preCheckpoint: func(ctx *htlcResolverTestContext,
 				_ bool) error {
-				// The resolver will create and publish a sweep
-				// tx.
-				resolver := ctx.resolver.(*htlcSuccessResolver)
-				resolver.Sweeper.(*mockSweeper).
-					createSweepTxChan <- sweepTx
 
-				// Confirm the sweep, which should resolve it.
-				ctx.notifier.ConfChan <- &chainntnfs.TxConfirmation{
-					Tx:          sweepTx,
-					BlockHeight: testInitialBlockHeight - 1,
+				// The resolver will offer the input to the
+				// sweeper.
+				details := &chainntnfs.SpendDetail{
+					SpendingTx:    sweepTx,
+					SpentOutPoint: &htlcOutpoint,
+					SpenderTxHash: &sweepTxid,
 				}
+				ctx.notifier.SpendChan <- details
 
 				return nil
 			},
@@ -207,8 +231,8 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	)
 }
 
-// TestSecondStageResolution tests successful sweep of a second stage htlc
-// claim, going through the Nursery.
+// TestHtlcSuccessSecondStageResolution tests successful sweep of a second
+// stage htlc claim, going through the Nursery.
 func TestHtlcSuccessSecondStageResolution(t *testing.T) {
 	commitOutpoint := wire.OutPoint{Index: 2}
 	htlcOutpoint := wire.OutPoint{Index: 3}
@@ -271,6 +295,7 @@ func TestHtlcSuccessSecondStageResolution(t *testing.T) {
 
 				ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
 					SpendingTx:    sweepTx,
+					SpentOutPoint: &htlcOutpoint,
 					SpenderTxHash: &sweepHash,
 				}
 
@@ -294,6 +319,8 @@ func TestHtlcSuccessSecondStageResolution(t *testing.T) {
 // TestHtlcSuccessSecondStageResolutionSweeper test that a resolver with
 // non-nil SignDetails will offer the second-level transaction to the sweeper
 // for re-signing.
+//
+//nolint:ll
 func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 	commitOutpoint := wire.OutPoint{Index: 2}
 	htlcOutpoint := wire.OutPoint{Index: 3}
@@ -391,9 +418,22 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 				_ bool) error {
 
 				resolver := ctx.resolver.(*htlcSuccessResolver)
-				inp := <-resolver.Sweeper.(*mockSweeper).sweptInputs
+
+				var (
+					inp input.Input
+					ok  bool
+				)
+
+				select {
+				case inp, ok = <-resolver.Sweeper.(*mockSweeper).sweptInputs:
+					require.True(t, ok)
+
+				case <-time.After(1 * time.Second):
+					t.Fatal("expected input to be swept")
+				}
+
 				op := inp.OutPoint()
-				if *op != commitOutpoint {
+				if op != commitOutpoint {
 					return fmt.Errorf("outpoint %v swept, "+
 						"expected %v", op,
 						commitOutpoint)
@@ -404,6 +444,7 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 					SpenderTxHash:     &reSignedHash,
 					SpenderInputIndex: 1,
 					SpendingHeight:    10,
+					SpentOutPoint:     &commitOutpoint,
 				}
 				return nil
 			},
@@ -426,23 +467,43 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 						SpenderTxHash:     &reSignedHash,
 						SpenderInputIndex: 1,
 						SpendingHeight:    10,
+						SpentOutPoint:     &commitOutpoint,
 					}
-				}
-
-				ctx.notifier.EpochChan <- &chainntnfs.BlockEpoch{
-					Height: 13,
 				}
 
 				// We expect it to sweep the second-level
 				// transaction we notfied about above.
 				resolver := ctx.resolver.(*htlcSuccessResolver)
-				inp := <-resolver.Sweeper.(*mockSweeper).sweptInputs
+
+				// Mock `waitForSpend` to return the commit
+				// spend.
+				ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
+					SpendingTx:        reSignedSuccessTx,
+					SpenderTxHash:     &reSignedHash,
+					SpenderInputIndex: 1,
+					SpendingHeight:    10,
+					SpentOutPoint:     &commitOutpoint,
+				}
+
+				var (
+					inp input.Input
+					ok  bool
+				)
+
+				select {
+				case inp, ok = <-resolver.Sweeper.(*mockSweeper).sweptInputs:
+					require.True(t, ok)
+
+				case <-time.After(1 * time.Second):
+					t.Fatal("expected input to be swept")
+				}
+
 				op := inp.OutPoint()
 				exp := wire.OutPoint{
 					Hash:  reSignedHash,
 					Index: 1,
 				}
-				if *op != exp {
+				if op != exp {
 					return fmt.Errorf("swept outpoint %v, expected %v",
 						op, exp)
 				}
@@ -453,6 +514,7 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 					SpendingTx:     sweepTx,
 					SpenderTxHash:  &sweepHash,
 					SpendingHeight: 14,
+					SpentOutPoint:  &op,
 				}
 
 				return nil
@@ -500,11 +562,14 @@ func testHtlcSuccess(t *testing.T, resolution lnwallet.IncomingHtlcResolution,
 	// for the next portion of the test.
 	ctx := newHtlcResolverTestContext(t,
 		func(htlc channeldb.HTLC, cfg ResolverConfig) ContractResolver {
-			return &htlcSuccessResolver{
+			r := &htlcSuccessResolver{
 				contractResolverKit: *newContractResolverKit(cfg),
 				htlc:                htlc,
 				htlcResolution:      resolution,
 			}
+			r.initLogger("htlcSuccessResolver")
+
+			return r
 		},
 	)
 
@@ -554,11 +619,11 @@ func runFromCheckpoint(t *testing.T, ctx *htlcResolverTestContext,
 
 		var resolved, incubating bool
 		if h, ok := resolver.(*htlcSuccessResolver); ok {
-			resolved = h.resolved
+			resolved = h.resolved.Load()
 			incubating = h.outputIncubating
 		}
 		if h, ok := resolver.(*htlcTimeoutResolver); ok {
-			resolved = h.resolved
+			resolved = h.resolved.Load()
 			incubating = h.outputIncubating
 		}
 
@@ -602,7 +667,12 @@ func runFromCheckpoint(t *testing.T, ctx *htlcResolverTestContext,
 
 		checkpointedState = append(checkpointedState, b.Bytes())
 		nextCheckpoint++
-		checkpointChan <- struct{}{}
+		select {
+		case checkpointChan <- struct{}{}:
+		case <-time.After(1 * time.Second):
+			t.Fatal("checkpoint timeout")
+		}
+
 		return nil
 	}
 
@@ -613,6 +683,8 @@ func runFromCheckpoint(t *testing.T, ctx *htlcResolverTestContext,
 	// preCheckpoint logic if needed.
 	resumed := true
 	for i, cp := range expectedCheckpoints {
+		t.Logf("Running checkpoint %d", i)
+
 		if cp.preCheckpoint != nil {
 			if err := cp.preCheckpoint(ctx, resumed); err != nil {
 				t.Fatalf("failure at stage %d: %v", i, err)
@@ -621,15 +693,15 @@ func runFromCheckpoint(t *testing.T, ctx *htlcResolverTestContext,
 		resumed = false
 
 		// Wait for the resolver to have checkpointed its state.
-		<-checkpointChan
+		select {
+		case <-checkpointChan:
+		case <-time.After(1 * time.Second):
+			t.Fatalf("resolver did not checkpoint at stage %d", i)
+		}
 	}
 
 	// Wait for the resolver to fully complete.
 	ctx.waitForResult()
-
-	if nextCheckpoint < len(expectedCheckpoints) {
-		t.Fatalf("not all checkpoints hit")
-	}
 
 	return checkpointedState
 }

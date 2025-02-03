@@ -15,12 +15,11 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 
 	testCases := []struct {
 		name              string
-		mustBeExplicit    bool
 		channelFeatures   *lnwire.RawFeatureVector
 		localFeatures     *lnwire.RawFeatureVector
 		remoteFeatures    *lnwire.RawFeatureVector
 		expectsCommitType lnwallet.CommitmentType
-		expectsChanType   lnwire.ChannelType
+		expectsChanType   *lnwire.ChannelType
 		zeroConf          bool
 		scidAlias         bool
 		expectsErr        error
@@ -32,7 +31,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.AnchorsZeroFeeHtlcTxRequired,
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -40,31 +39,10 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.StaticRemoteKeyOptional,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 			),
+			//nolint:ll
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType: lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-				lnwire.AnchorsZeroFeeHtlcTxRequired,
-			)),
-			expectsErr: nil,
-		},
-		{
-			name: "local funder wants explicit, remote doesn't " +
-				"support so fall back",
-			mustBeExplicit: true,
-			channelFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-				lnwire.AnchorsZeroFeeHtlcTxRequired,
-			),
-			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
-				lnwire.AnchorsZeroFeeHtlcTxOptional,
-				lnwire.ExplicitChannelTypeOptional,
-			),
-			remoteFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
-				lnwire.AnchorsZeroFeeHtlcTxOptional,
-			),
-			expectsErr: errUnsupportedExplicitNegotiation,
+			expectsChanType:   nil,
+			expectsErr:        nil,
 		},
 		{
 			name: "explicit missing remote commitment feature",
@@ -73,7 +51,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.AnchorsZeroFeeHtlcTxRequired,
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -93,7 +71,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ZeroConfOptional,
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
 				lnwire.ExplicitChannelTypeOptional,
@@ -106,8 +84,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeScriptEnforcedLease,
-			expectsChanType: lnwire.ChannelType(
-				*lnwire.NewRawFeatureVector(
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
 					lnwire.ZeroConfRequired,
 					lnwire.StaticRemoteKeyRequired,
 					lnwire.AnchorsZeroFeeHtlcTxRequired,
@@ -126,7 +104,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ZeroConfOptional,
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -137,8 +115,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType: lnwire.ChannelType(
-				*lnwire.NewRawFeatureVector(
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
 					lnwire.ZeroConfRequired,
 					lnwire.StaticRemoteKeyRequired,
 					lnwire.AnchorsZeroFeeHtlcTxRequired,
@@ -157,7 +135,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ScidAliasOptional,
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ScriptEnforcedLeaseOptional,
 				lnwire.ExplicitChannelTypeOptional,
@@ -170,8 +148,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeScriptEnforcedLease,
-			expectsChanType: lnwire.ChannelType(
-				*lnwire.NewRawFeatureVector(
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
 					lnwire.ScidAliasRequired,
 					lnwire.StaticRemoteKeyRequired,
 					lnwire.AnchorsZeroFeeHtlcTxRequired,
@@ -190,7 +168,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
 				lnwire.ScidAliasOptional,
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -201,8 +179,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType: lnwire.ChannelType(
-				*lnwire.NewRawFeatureVector(
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
 					lnwire.ScidAliasRequired,
 					lnwire.StaticRemoteKeyRequired,
 					lnwire.AnchorsZeroFeeHtlcTxRequired,
@@ -218,7 +196,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.AnchorsZeroFeeHtlcTxRequired,
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -228,10 +206,12 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType: lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-				lnwire.AnchorsZeroFeeHtlcTxRequired,
-			)),
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+					lnwire.AnchorsZeroFeeHtlcTxRequired,
+				),
+			),
 			expectsErr: nil,
 		},
 		{
@@ -240,7 +220,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.StaticRemoteKeyRequired,
 			),
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -250,16 +230,18 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeTweakless,
-			expectsChanType: lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-			)),
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+				),
+			),
 			expectsErr: nil,
 		},
 		{
 			name:            "explicit legacy",
 			channelFeatures: lnwire.NewRawFeatureVector(),
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -269,17 +251,19 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeLegacy,
-			expectsChanType:   lnwire.ChannelType(*lnwire.NewRawFeatureVector()),
-			expectsErr:        nil,
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(),
+			),
+			expectsErr: nil,
 		},
 		// Both sides signal the explicit chan type bit, so we expect
 		// that we return the corresponding chan type feature bits,
-		// even though we didn't set an explicit channel type.
+		// even though we didn't set a desired channel type.
 		{
-			name:            "implicit anchors",
+			name:            "default explicit anchors",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 				lnwire.ExplicitChannelTypeOptional,
 			),
@@ -289,27 +273,27 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.ExplicitChannelTypeOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeAnchorsZeroFeeHtlcTx,
-			expectsChanType: lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-				lnwire.AnchorsZeroFeeHtlcTxRequired,
-			)),
+			expectsChanType: (*lnwire.ChannelType)(
+				lnwire.NewRawFeatureVector(
+					lnwire.StaticRemoteKeyRequired,
+					lnwire.AnchorsZeroFeeHtlcTxRequired,
+				),
+			),
 			expectsErr: nil,
 		},
 		{
 			name:            "implicit tweakless",
 			channelFeatures: nil,
 			localFeatures: lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyOptional,
+				lnwire.StaticRemoteKeyRequired,
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 			),
 			remoteFeatures: lnwire.NewRawFeatureVector(
 				lnwire.StaticRemoteKeyOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeTweakless,
-			expectsChanType: lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-				lnwire.StaticRemoteKeyRequired,
-			)),
-			expectsErr: nil,
+			expectsChanType:   nil,
+			expectsErr:        nil,
 		},
 		{
 			name:            "implicit legacy",
@@ -320,7 +304,7 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				lnwire.AnchorsZeroFeeHtlcTxOptional,
 			),
 			expectsCommitType: lnwallet.CommitmentTypeLegacy,
-			expectsChanType:   lnwire.ChannelType(*lnwire.NewRawFeatureVector()),
+			expectsChanType:   nil,
 			expectsErr:        nil,
 		},
 	}
@@ -343,9 +327,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 				)
 			}
 
-			_, lChan, lCommit, err := negotiateCommitmentType(
+			lChan, lCommit, err := negotiateCommitmentType(
 				channelType, localFeatures, remoteFeatures,
-				testCase.mustBeExplicit,
 			)
 
 			var (
@@ -369,9 +352,8 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			require.Equal(t, testCase.scidAlias, localScid)
 			require.Equal(t, testCase.expectsErr, err)
 
-			_, rChan, rCommit, err := negotiateCommitmentType(
+			rChan, rCommit, err := negotiateCommitmentType(
 				channelType, remoteFeatures, localFeatures,
-				testCase.mustBeExplicit,
 			)
 
 			if rChan != nil {
@@ -402,11 +384,11 @@ func TestCommitmentTypeNegotiation(t *testing.T) {
 			)
 
 			require.Equal(
-				t, testCase.expectsChanType, *lChan,
+				t, testCase.expectsChanType, lChan,
 				testCase.name,
 			)
 			require.Equal(
-				t, testCase.expectsChanType, *rChan,
+				t, testCase.expectsChanType, rChan,
 				testCase.name,
 			)
 		})

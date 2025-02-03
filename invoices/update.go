@@ -1,11 +1,12 @@
 package invoices
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/lightningnetwork/lnd/amp"
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -15,29 +16,44 @@ import (
 // update to be carried out.
 type invoiceUpdateCtx struct {
 	hash                 lntypes.Hash
-	circuitKey           channeldb.CircuitKey
+	circuitKey           CircuitKey
 	amtPaid              lnwire.MilliSatoshi
 	expiry               uint32
 	currentHeight        int32
 	finalCltvRejectDelta int32
-	customRecords        record.CustomSet
-	mpp                  *record.MPP
-	amp                  *record.AMP
-	metadata             []byte
+
+	// wireCustomRecords are the custom records that were included with the
+	// HTLC wire message.
+	wireCustomRecords lnwire.CustomRecords
+
+	// customRecords is a map of custom records that were included with the
+	// HTLC onion payload.
+	customRecords record.CustomSet
+
+	mpp          *record.MPP
+	amp          *record.AMP
+	metadata     []byte
+	pathID       *chainhash.Hash
+	totalAmtMsat lnwire.MilliSatoshi
 }
 
 // invoiceRef returns an identifier that can be used to lookup or update the
 // invoice this HTLC is targeting.
-func (i *invoiceUpdateCtx) invoiceRef() channeldb.InvoiceRef {
+func (i *invoiceUpdateCtx) invoiceRef() InvoiceRef {
 	switch {
+	case i.pathID != nil:
+		return InvoiceRefByHashAndAddr(i.hash, *i.pathID)
+
 	case i.amp != nil && i.mpp != nil:
 		payAddr := i.mpp.PaymentAddr()
-		return channeldb.InvoiceRefByAddr(payAddr)
+		return InvoiceRefByAddr(payAddr)
+
 	case i.mpp != nil:
 		payAddr := i.mpp.PaymentAddr()
-		return channeldb.InvoiceRefByHashAndAddr(i.hash, payAddr)
+		return InvoiceRefByHashAndAddr(i.hash, payAddr)
+
 	default:
-		return channeldb.InvoiceRefByHash(i.hash)
+		return InvoiceRefByHash(i.hash)
 	}
 }
 
@@ -87,49 +103,62 @@ func (i invoiceUpdateCtx) settleRes(preimage lntypes.Preimage,
 // acceptRes is a helper function which creates an accept resolution with
 // the information contained in the invoiceUpdateCtx and the accept resolution
 // result provided.
-func (i invoiceUpdateCtx) acceptRes(outcome acceptResolutionResult) *htlcAcceptResolution {
+func (i invoiceUpdateCtx) acceptRes(
+	outcome acceptResolutionResult) *htlcAcceptResolution {
+
 	return newAcceptResolution(i.circuitKey, outcome)
 }
 
-// updateInvoice is a callback for DB.UpdateInvoice that contains the invoice
-// settlement logic. It returns a hltc resolution that indicates what the
-// outcome of the update was.
-func updateInvoice(ctx *invoiceUpdateCtx, inv *channeldb.Invoice) (
-	*channeldb.InvoiceUpdateDesc, HtlcResolution, error) {
+// resolveReplayedHtlc returns the HTLC resolution for a replayed HTLC. The
+// returned boolean indicates whether the HTLC was replayed or not.
+func resolveReplayedHtlc(ctx *invoiceUpdateCtx, inv *Invoice) (bool,
+	HtlcResolution, error) {
 
 	// Don't update the invoice when this is a replayed htlc.
-	htlc, ok := inv.Htlcs[ctx.circuitKey]
-	if ok {
-		switch htlc.State {
-		case channeldb.HtlcStateCanceled:
-			return nil, ctx.failRes(ResultReplayToCanceled), nil
-
-		case channeldb.HtlcStateAccepted:
-			return nil, ctx.acceptRes(resultReplayToAccepted), nil
-
-		case channeldb.HtlcStateSettled:
-			pre := inv.Terms.PaymentPreimage
-
-			// Terms.PaymentPreimage will be nil for AMP invoices.
-			// Set it to the HTLC's AMP Preimage instead.
-			if pre == nil {
-				pre = htlc.AMP.Preimage
-			}
-
-			return nil, ctx.settleRes(
-				*pre,
-				ResultReplayToSettled,
-			), nil
-
-		default:
-			return nil, nil, errors.New("unknown htlc state")
-		}
+	htlc, replayedHTLC := inv.Htlcs[ctx.circuitKey]
+	if !replayedHTLC {
+		return false, nil, nil
 	}
+
+	switch htlc.State {
+	case HtlcStateCanceled:
+		return true, ctx.failRes(ResultReplayToCanceled), nil
+
+	case HtlcStateAccepted:
+		return true, ctx.acceptRes(resultReplayToAccepted), nil
+
+	case HtlcStateSettled:
+		pre := inv.Terms.PaymentPreimage
+
+		// Terms.PaymentPreimage will be nil for AMP invoices.
+		// Set it to the HTLCs AMP Preimage instead.
+		if pre == nil {
+			pre = htlc.AMP.Preimage
+		}
+
+		return true, ctx.settleRes(
+			*pre,
+			ResultReplayToSettled,
+		), nil
+
+	default:
+		return true, nil, errors.New("unknown htlc state")
+	}
+}
+
+// updateInvoice is a callback for DB.UpdateInvoice that contains the invoice
+// settlement logic. It returns a HTLC resolution that indicates what the
+// outcome of the update was.
+//
+// NOTE: Make sure replayed HTLCs are always considered before calling this
+// function.
+func updateInvoice(ctx *invoiceUpdateCtx, inv *Invoice) (
+	*InvoiceUpdateDesc, HtlcResolution, error) {
 
 	// If no MPP payload was provided, then we expect this to be a keysend,
 	// or a payment to an invoice created before we started to require the
 	// MPP payload.
-	if ctx.mpp == nil {
+	if ctx.mpp == nil && ctx.pathID == nil {
 		return updateLegacy(ctx, inv)
 	}
 
@@ -138,8 +167,7 @@ func updateInvoice(ctx *invoiceUpdateCtx, inv *channeldb.Invoice) (
 
 // updateMpp is a callback for DB.UpdateInvoice that contains the invoice
 // settlement logic for mpp payments.
-func updateMpp(ctx *invoiceUpdateCtx,
-	inv *channeldb.Invoice) (*channeldb.InvoiceUpdateDesc,
+func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 	HtlcResolution, error) {
 
 	// Reject HTLCs to AMP invoices if they are missing an AMP payload, and
@@ -158,17 +186,38 @@ func updateMpp(ctx *invoiceUpdateCtx,
 
 	setID := ctx.setID()
 
+	var (
+		totalAmt    = ctx.totalAmtMsat
+		paymentAddr []byte
+	)
+	// If an MPP record is present, then the payment address and total
+	// payment amount is extracted from it. Otherwise, the pathID is used
+	// to extract the payment address.
+	if ctx.mpp != nil {
+		totalAmt = ctx.mpp.TotalMsat()
+		payAddr := ctx.mpp.PaymentAddr()
+		paymentAddr = payAddr[:]
+	} else {
+		paymentAddr = ctx.pathID[:]
+	}
+
+	// For storage, we don't really care where the custom records came from.
+	// So we merge them together and store them in the same field.
+	customRecords := lnwire.CustomRecords(
+		ctx.customRecords,
+	).MergedCopy(ctx.wireCustomRecords)
+
 	// Start building the accept descriptor.
-	acceptDesc := &channeldb.HtlcAcceptDesc{
+	acceptDesc := &HtlcAcceptDesc{
 		Amt:           ctx.amtPaid,
 		Expiry:        ctx.expiry,
 		AcceptHeight:  ctx.currentHeight,
-		MppTotalAmt:   ctx.mpp.TotalMsat(),
-		CustomRecords: ctx.customRecords,
+		MppTotalAmt:   totalAmt,
+		CustomRecords: record.CustomSet(customRecords),
 	}
 
 	if ctx.amp != nil {
-		acceptDesc.AMP = &channeldb.InvoiceHtlcAMPData{
+		acceptDesc.AMP = &InvoiceHtlcAMPData{
 			Record:   *ctx.amp,
 			Hash:     ctx.hash,
 			Preimage: nil,
@@ -179,32 +228,32 @@ func updateMpp(ctx *invoiceUpdateCtx,
 	// non-mpp payments that are accepted even after the invoice is settled.
 	// Because non-mpp payments don't have a payment address, this is needed
 	// to thwart probing.
-	if inv.State != channeldb.ContractOpen {
+	if inv.State != ContractOpen {
 		return nil, ctx.failRes(ResultInvoiceNotOpen), nil
 	}
 
 	// Check the payment address that authorizes the payment.
-	if ctx.mpp.PaymentAddr() != inv.Terms.PaymentAddr {
+	if !bytes.Equal(paymentAddr, inv.Terms.PaymentAddr[:]) {
 		return nil, ctx.failRes(ResultAddressMismatch), nil
 	}
 
 	// Don't accept zero-valued sets.
-	if ctx.mpp.TotalMsat() == 0 {
+	if totalAmt == 0 {
 		return nil, ctx.failRes(ResultHtlcSetTotalTooLow), nil
 	}
 
 	// Check that the total amt of the htlc set is high enough. In case this
 	// is a zero-valued invoice, it will always be enough.
-	if ctx.mpp.TotalMsat() < inv.Terms.Value {
+	if totalAmt < inv.Terms.Value {
 		return nil, ctx.failRes(ResultHtlcSetTotalTooLow), nil
 	}
 
-	htlcSet := inv.HTLCSet(setID, channeldb.HtlcStateAccepted)
+	htlcSet := inv.HTLCSet(setID, HtlcStateAccepted)
 
-	// Check whether total amt matches other htlcs in the set.
+	// Check whether total amt matches other HTLCs in the set.
 	var newSetTotal lnwire.MilliSatoshi
 	for _, htlc := range htlcSet {
-		if ctx.mpp.TotalMsat() != htlc.MppTotalAmt {
+		if totalAmt != htlc.MppTotalAmt {
 			return nil, ctx.failRes(ResultHtlcSetTotalMismatch), nil
 		}
 
@@ -213,11 +262,6 @@ func updateMpp(ctx *invoiceUpdateCtx,
 
 	// Add amount of new htlc.
 	newSetTotal += ctx.amtPaid
-
-	// Make sure the communicated set total isn't overpaid.
-	if newSetTotal > ctx.mpp.TotalMsat() {
-		return nil, ctx.failRes(ResultHtlcSetOverpayment), nil
-	}
 
 	// The invoice is still open. Check the expiry.
 	if ctx.expiry < uint32(ctx.currentHeight+ctx.finalCltvRejectDelta) {
@@ -228,45 +272,46 @@ func updateMpp(ctx *invoiceUpdateCtx,
 		return nil, ctx.failRes(ResultExpiryTooSoon), nil
 	}
 
-	if setID != nil && *setID == channeldb.BlankPayAddr {
+	if setID != nil && *setID == BlankPayAddr {
 		return nil, ctx.failRes(ResultAmpError), nil
 	}
 
 	// Record HTLC in the invoice database.
-	newHtlcs := map[channeldb.CircuitKey]*channeldb.HtlcAcceptDesc{
+	newHtlcs := map[CircuitKey]*HtlcAcceptDesc{
 		ctx.circuitKey: acceptDesc,
 	}
 
-	update := channeldb.InvoiceUpdateDesc{
-		AddHtlcs: newHtlcs,
+	update := InvoiceUpdateDesc{
+		UpdateType: AddHTLCsUpdate,
+		AddHtlcs:   newHtlcs,
 	}
 
 	// If the invoice cannot be settled yet, only record the htlc.
-	setComplete := newSetTotal == ctx.mpp.TotalMsat()
+	setComplete := newSetTotal >= totalAmt
 	if !setComplete {
 		return &update, ctx.acceptRes(resultPartialAccepted), nil
 	}
 
-	// Check to see if we can settle or this is an hold invoice and
+	// Check to see if we can settle or this is a hold invoice, and
 	// we need to wait for the preimage.
 	if inv.HodlInvoice {
-		update.State = &channeldb.InvoiceStateUpdateDesc{
-			NewState: channeldb.ContractAccepted,
-			SetID:    setID,
+		update.State = &InvoiceStateUpdateDesc{
+			NewState: ContractAccepted,
 		}
 		return &update, ctx.acceptRes(resultAccepted), nil
 	}
 
 	var (
-		htlcPreimages map[channeldb.CircuitKey]lntypes.Preimage
+		htlcPreimages map[CircuitKey]lntypes.Preimage
 		htlcPreimage  lntypes.Preimage
 	)
 	if ctx.amp != nil {
 		var failRes *HtlcFailResolution
 		htlcPreimages, failRes = reconstructAMPPreimages(ctx, htlcSet)
 		if failRes != nil {
-			update.State = &channeldb.InvoiceStateUpdateDesc{
-				NewState: channeldb.ContractCanceled,
+			update.UpdateType = CancelInvoiceUpdate
+			update.State = &InvoiceStateUpdateDesc{
+				NewState: ContractCanceled,
 				SetID:    setID,
 			}
 			return &update, failRes, nil
@@ -279,8 +324,8 @@ func updateMpp(ctx *invoiceUpdateCtx,
 		htlcPreimage = *inv.Terms.PaymentPreimage
 	}
 
-	update.State = &channeldb.InvoiceStateUpdateDesc{
-		NewState:      channeldb.ContractSettled,
+	update.State = &InvoiceStateUpdateDesc{
+		NewState:      ContractSettled,
 		Preimage:      inv.Terms.PaymentPreimage,
 		HTLCPreimages: htlcPreimages,
 		SetID:         setID,
@@ -290,10 +335,10 @@ func updateMpp(ctx *invoiceUpdateCtx,
 }
 
 // HTLCSet is a map of CircuitKey to InvoiceHTLC.
-type HTLCSet = map[channeldb.CircuitKey]*channeldb.InvoiceHTLC
+type HTLCSet = map[CircuitKey]*InvoiceHTLC
 
 // HTLCPreimages is a map of CircuitKey to preimage.
-type HTLCPreimages = map[channeldb.CircuitKey]lntypes.Preimage
+type HTLCPreimages = map[CircuitKey]lntypes.Preimage
 
 // reconstructAMPPreimages reconstructs the root seed for an AMP HTLC set and
 // verifies that all derived child hashes match the payment hashes of the HTLCs
@@ -316,7 +361,7 @@ func reconstructAMPPreimages(ctx *invoiceUpdateCtx,
 
 	// Next, construct an index mapping the position in childDescs to a
 	// circuit key for all preexisting HTLCs.
-	indexToCircuitKey := make(map[int]channeldb.CircuitKey)
+	indexToCircuitKey := make(map[int]CircuitKey)
 
 	// Add the child descriptor for each HTLC in the HTLC set, recording
 	// it's position within the slice.
@@ -350,7 +395,7 @@ func reconstructAMPPreimages(ctx *invoiceUpdateCtx,
 	// Finally, construct the map of learned preimages indexed by circuit
 	// key, so that they can be persisted along with each HTLC when updating
 	// the invoice.
-	htlcPreimages := make(map[channeldb.CircuitKey]lntypes.Preimage)
+	htlcPreimages := make(map[CircuitKey]lntypes.Preimage)
 	htlcPreimages[ctx.circuitKey] = children[0].Preimage
 	for idx, child := range children[1:] {
 		circuitKey := indexToCircuitKey[idx]
@@ -367,11 +412,11 @@ func reconstructAMPPreimages(ctx *invoiceUpdateCtx,
 // send payments and any invoices we created in the past that are valid and
 // still had the optional mpp bit set.
 func updateLegacy(ctx *invoiceUpdateCtx,
-	inv *channeldb.Invoice) (*channeldb.InvoiceUpdateDesc, HtlcResolution, error) {
+	inv *Invoice) (*InvoiceUpdateDesc, HtlcResolution, error) {
 
 	// If the invoice is already canceled, there is no further
 	// checking to do.
-	if inv.State == channeldb.ContractCanceled {
+	if inv.State == ContractCanceled {
 		return nil, ctx.failRes(ResultInvoiceAlreadyCanceled), nil
 	}
 
@@ -401,7 +446,7 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 	// Don't allow settling the invoice with an old style
 	// htlc if we are already in the process of gathering an
 	// mpp set.
-	for _, htlc := range inv.HTLCSet(nil, channeldb.HtlcStateAccepted) {
+	for _, htlc := range inv.HTLCSet(nil, HtlcStateAccepted) {
 		if htlc.MppTotalAmt > 0 {
 			return nil, ctx.failRes(ResultMppInProgress), nil
 		}
@@ -416,27 +461,34 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 		return nil, ctx.failRes(ResultExpiryTooSoon), nil
 	}
 
+	// For storage, we don't really care where the custom records came from.
+	// So we merge them together and store them in the same field.
+	customRecords := lnwire.CustomRecords(
+		ctx.customRecords,
+	).MergedCopy(ctx.wireCustomRecords)
+
 	// Record HTLC in the invoice database.
-	newHtlcs := map[channeldb.CircuitKey]*channeldb.HtlcAcceptDesc{
+	newHtlcs := map[CircuitKey]*HtlcAcceptDesc{
 		ctx.circuitKey: {
 			Amt:           ctx.amtPaid,
 			Expiry:        ctx.expiry,
 			AcceptHeight:  ctx.currentHeight,
-			CustomRecords: ctx.customRecords,
+			CustomRecords: record.CustomSet(customRecords),
 		},
 	}
 
-	update := channeldb.InvoiceUpdateDesc{
-		AddHtlcs: newHtlcs,
+	update := InvoiceUpdateDesc{
+		AddHtlcs:   newHtlcs,
+		UpdateType: AddHTLCsUpdate,
 	}
 
 	// Don't update invoice state if we are accepting a duplicate payment.
 	// We do accept or settle the HTLC.
 	switch inv.State {
-	case channeldb.ContractAccepted:
+	case ContractAccepted:
 		return &update, ctx.acceptRes(resultDuplicateToAccepted), nil
 
-	case channeldb.ContractSettled:
+	case ContractSettled:
 		return &update, ctx.settleRes(
 			*inv.Terms.PaymentPreimage, ResultDuplicateToSettled,
 		), nil
@@ -445,15 +497,15 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 	// Check to see if we can settle or this is an hold invoice and we need
 	// to wait for the preimage.
 	if inv.HodlInvoice {
-		update.State = &channeldb.InvoiceStateUpdateDesc{
-			NewState: channeldb.ContractAccepted,
+		update.State = &InvoiceStateUpdateDesc{
+			NewState: ContractAccepted,
 		}
 
 		return &update, ctx.acceptRes(resultAccepted), nil
 	}
 
-	update.State = &channeldb.InvoiceStateUpdateDesc{
-		NewState: channeldb.ContractSettled,
+	update.State = &InvoiceStateUpdateDesc{
+		NewState: ContractSettled,
 		Preimage: inv.Terms.PaymentPreimage,
 	}
 

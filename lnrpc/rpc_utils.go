@@ -3,10 +3,14 @@ package lnrpc
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/sweep"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
@@ -14,6 +18,43 @@ const (
 	// middleware registration call. This is declared here rather than where
 	// it's mainly used to avoid circular package dependencies.
 	RegisterRPCMiddlewareURI = "/lnrpc.Lightning/RegisterRPCMiddleware"
+)
+
+var (
+	// ProtoJSONMarshalOpts is a struct that holds the default marshal
+	// options for marshaling protobuf messages into JSON in a
+	// human-readable way. This should only be used in the CLI and in
+	// integration tests.
+	ProtoJSONMarshalOpts = &protojson.MarshalOptions{
+		EmitUnpopulated: true,
+		UseProtoNames:   true,
+		Indent:          "    ",
+		UseHexForBytes:  true,
+	}
+
+	// ProtoJSONUnmarshalOpts is a struct that holds the default unmarshal
+	// options for un-marshaling lncli JSON into protobuf messages. This
+	// should only be used in the CLI and in integration tests.
+	ProtoJSONUnmarshalOpts = &protojson.UnmarshalOptions{
+		AllowPartial:   false,
+		UseHexForBytes: true,
+	}
+
+	// RESTJsonMarshalOpts is a struct that holds the default marshal
+	// options for marshaling protobuf messages into REST JSON in a
+	// human-readable way. This should be used when interacting with the
+	// REST proxy only.
+	RESTJsonMarshalOpts = &protojson.MarshalOptions{
+		EmitUnpopulated: true,
+		UseProtoNames:   true,
+	}
+
+	// RESTJsonUnmarshalOpts is a struct that holds the default unmarshal
+	// options for un-marshaling REST JSON into protobuf messages. This
+	// should be used when interacting with the REST proxy only.
+	RESTJsonUnmarshalOpts = &protojson.UnmarshalOptions{
+		AllowPartial: false,
+	}
 )
 
 // RPCTransaction returns a rpc transaction.
@@ -76,9 +117,13 @@ func RPCTransaction(tx *lnwallet.TransactionDetail) *Transaction {
 }
 
 // RPCTransactionDetails returns a set of rpc transaction details.
-func RPCTransactionDetails(txns []*lnwallet.TransactionDetail) *TransactionDetails {
+func RPCTransactionDetails(txns []*lnwallet.TransactionDetail, firstIdx,
+	lastIdx uint64) *TransactionDetails {
+
 	txDetails := &TransactionDetails{
 		Transactions: make([]*Transaction, len(txns)),
+		FirstIndex:   firstIdx,
+		LastIndex:    lastIdx,
 	}
 
 	for i, tx := range txns {
@@ -154,4 +199,68 @@ func GetChanPointFundingTxid(chanPoint *ChannelPoint) (*chainhash.Hash, error) {
 	}
 
 	return chainhash.NewHash(txid)
+}
+
+// GetChannelOutPoint returns the outpoint of the related channel point.
+func GetChannelOutPoint(chanPoint *ChannelPoint) (*OutPoint, error) {
+	var txid []byte
+
+	// A channel point's funding txid can be get/set as a byte slice or a
+	// string. In the case it is a string, decode it.
+	switch chanPoint.GetFundingTxid().(type) {
+	case *ChannelPoint_FundingTxidBytes:
+		txid = chanPoint.GetFundingTxidBytes()
+
+	case *ChannelPoint_FundingTxidStr:
+		s := chanPoint.GetFundingTxidStr()
+		h, err := chainhash.NewHashFromStr(s)
+		if err != nil {
+			return nil, err
+		}
+
+		txid = h[:]
+	}
+
+	return &OutPoint{
+		TxidBytes:   txid,
+		OutputIndex: chanPoint.OutputIndex,
+	}, nil
+}
+
+// CalculateFeeRate uses either satPerByte or satPerVByte, but not both, from a
+// request to calculate the fee rate. It provides compatibility for the
+// deprecated field, satPerByte. Once the field is safe to be removed, the
+// check can then be deleted.
+func CalculateFeeRate(satPerByte, satPerVByte uint64, targetConf uint32,
+	estimator chainfee.Estimator) (chainfee.SatPerKWeight, error) {
+
+	var feeRate chainfee.SatPerKWeight
+
+	// We only allow using either the deprecated field or the new field.
+	if satPerByte != 0 && satPerVByte != 0 {
+		return feeRate, fmt.Errorf("either SatPerByte or " +
+			"SatPerVByte should be set, but not both")
+	}
+
+	// Default to satPerVByte, and overwrite it if satPerByte is set.
+	satPerKw := chainfee.SatPerKVByte(satPerVByte * 1000).FeePerKWeight()
+	if satPerByte != 0 {
+		satPerKw = chainfee.SatPerKVByte(
+			satPerByte * 1000,
+		).FeePerKWeight()
+	}
+
+	// Based on the passed fee related parameters, we'll determine an
+	// appropriate fee rate for this transaction.
+	feePref := sweep.FeeEstimateInfo{
+		ConfTarget: targetConf,
+		FeeRate:    satPerKw,
+	}
+	// TODO(yy): need to pass the configured max fee here.
+	feeRate, err := feePref.Estimate(estimator, 0)
+	if err != nil {
+		return feeRate, err
+	}
+
+	return feeRate, nil
 }

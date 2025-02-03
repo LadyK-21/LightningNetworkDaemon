@@ -6,10 +6,13 @@ import (
 	"reflect"
 
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
+	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -31,6 +34,7 @@ import (
 	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/watchtower"
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
+	"google.golang.org/protobuf/proto"
 )
 
 // subRPCServerConfigs is special sub-config in the main configuration that
@@ -109,20 +113,21 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 	chanRouter *routing.ChannelRouter,
 	routerBackend *routerrpc.RouterBackend,
 	nodeSigner *netann.NodeSigner,
-	graphDB *channeldb.ChannelGraph,
+	graphDB *graphdb.ChannelGraph,
 	chanStateDB *channeldb.ChannelStateDB,
 	sweeper *sweep.UtxoSweeper,
 	tower *watchtower.Standalone,
-	towerClient wtclient.Client,
-	anchorTowerClient wtclient.Client,
+	towerClientMgr *wtclient.Manager,
 	tcpResolver lncfg.TCPResolver,
 	genInvoiceFeatures func() *lnwire.FeatureVector,
 	genAmpInvoiceFeatures func() *lnwire.FeatureVector,
-	getNodeAnnouncement func() (lnwire.NodeAnnouncement, error),
-	updateNodeAnnouncement func(modifiers ...netann.NodeAnnModifier) error,
+	getNodeAnnouncement func() lnwire.NodeAnnouncement,
+	updateNodeAnnouncement func(features *lnwire.RawFeatureVector,
+		modifiers ...netann.NodeAnnModifier) error,
 	parseAddr func(addr string) (net.Addr, error),
-	rpcLogger btclog.Logger,
-	getAlias func(lnwire.ChannelID) (lnwire.ShortChannelID, error)) error {
+	rpcLogger btclog.Logger, aliasMgr *aliasmgr.Manager,
+	auxDataParser fn.Option[AuxDataParser],
+	invoiceHtlcModifier *invoices.HtlcModificationInterceptor) error {
 
 	// First, we'll use reflect to obtain a version of the config struct
 	// that allows us to programmatically inspect its fields.
@@ -197,6 +202,14 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 			subCfgValue.FieldByName("CurrentNumAnchorChans").Set(
 				reflect.ValueOf(cc.Wallet.CurrentNumAnchorChans),
 			)
+			subCfgValue.FieldByName("CoinSelectionStrategy").Set(
+				reflect.ValueOf(
+					cc.Wallet.Cfg.CoinSelectionStrategy,
+				),
+			)
+			subCfgValue.FieldByName("ChanStateDB").Set(
+				reflect.ValueOf(chanStateDB),
+			)
 
 		case *autopilotrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -217,6 +230,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 			subCfgValue.FieldByName("ChainNotifier").Set(
 				reflect.ValueOf(cc.ChainNotifier),
 			)
+			subCfgValue.FieldByName("Chain").Set(
+				reflect.ValueOf(cc.ChainIO),
+			)
 
 		case *invoicesrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -230,6 +246,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 			subCfgValue.FieldByName("InvoiceRegistry").Set(
 				reflect.ValueOf(invoiceRegistry),
 			)
+			subCfgValue.FieldByName("HtlcModifier").Set(
+				reflect.ValueOf(invoiceHtlcModifier),
+			)
 			subCfgValue.FieldByName("IsChannelActive").Set(
 				reflect.ValueOf(htlcSwitch.HasActiveLink),
 			)
@@ -240,9 +259,6 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 				reflect.ValueOf(nodeSigner),
 			)
 			defaultDelta := cfg.Bitcoin.TimeLockDelta
-			if cfg.registeredChains.PrimaryChain() == chainreg.LitecoinChain {
-				defaultDelta = cfg.Litecoin.TimeLockDelta
-			}
 			subCfgValue.FieldByName("DefaultCLTVExpiry").Set(
 				reflect.ValueOf(defaultDelta),
 			)
@@ -259,7 +275,21 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 				reflect.ValueOf(genAmpInvoiceFeatures),
 			)
 			subCfgValue.FieldByName("GetAlias").Set(
-				reflect.ValueOf(getAlias),
+				reflect.ValueOf(aliasMgr.GetPeerAlias),
+			)
+
+			parseAuxData := func(m proto.Message) error {
+				return fn.MapOptionZ(
+					auxDataParser,
+					func(p AuxDataParser) error {
+						return p.InlineParseCustomData(
+							m,
+						)
+					},
+				)
+			}
+			subCfgValue.FieldByName("ParseAuxData").Set(
+				reflect.ValueOf(parseAuxData),
 			)
 
 		case *neutrinorpc.Config:
@@ -272,6 +302,11 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 		// RouterRPC isn't conditionally compiled and doesn't need to be
 		// populated using reflection.
 		case *routerrpc.Config:
+			subCfgValue := extractReflectValue(subCfg)
+
+			subCfgValue.FieldByName("AliasMgr").Set(
+				reflect.ValueOf(aliasMgr),
+			)
 
 		case *watchtowerrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -286,15 +321,12 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 		case *wtclientrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
 
-			if towerClient != nil && anchorTowerClient != nil {
+			if towerClientMgr != nil {
 				subCfgValue.FieldByName("Active").Set(
-					reflect.ValueOf(towerClient != nil),
+					reflect.ValueOf(towerClientMgr != nil),
 				)
-				subCfgValue.FieldByName("Client").Set(
-					reflect.ValueOf(towerClient),
-				)
-				subCfgValue.FieldByName("AnchorClient").Set(
-					reflect.ValueOf(anchorTowerClient),
+				subCfgValue.FieldByName("ClientMgr").Set(
+					reflect.ValueOf(towerClientMgr),
 				)
 			}
 			subCfgValue.FieldByName("Resolver").Set(
@@ -313,6 +345,10 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 
 			subCfgValue.FieldByName("GraphDB").Set(
 				reflect.ValueOf(graphDB),
+			)
+
+			subCfgValue.FieldByName("Switch").Set(
+				reflect.ValueOf(htlcSwitch),
 			)
 
 		case *peersrpc.Config:

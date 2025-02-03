@@ -254,7 +254,7 @@ func BenchmarkReadMessage(b *testing.B) {
 // type.
 //
 // TODO(yy): the following testing messages are created somewhat arbitrary. We
-// should standardlize each of the testing messages so that a better baseline
+// should standardize each of the testing messages so that a better baseline
 // can be used.
 func makeAllMessages(t testing.TB, r *rand.Rand) []lnwire.Message {
 	msgAll := []lnwire.Message{}
@@ -268,7 +268,7 @@ func makeAllMessages(t testing.TB, r *rand.Rand) []lnwire.Message {
 	msgAll = append(msgAll, newMsgAcceptChannel(t, r))
 	msgAll = append(msgAll, newMsgFundingCreated(t, r))
 	msgAll = append(msgAll, newMsgFundingSigned(t, r))
-	msgAll = append(msgAll, newMsgFundingLocked(t, r))
+	msgAll = append(msgAll, newMsgChannelReady(t, r))
 	msgAll = append(msgAll, newMsgShutdown(t, r))
 	msgAll = append(msgAll, newMsgClosingSigned(t, r))
 	msgAll = append(msgAll, newMsgUpdateAddHTLC(t, r))
@@ -442,7 +442,7 @@ func newMsgFundingSigned(t testing.TB, r io.Reader) *lnwire.FundingSigned {
 	return msg
 }
 
-func newMsgFundingLocked(t testing.TB, r io.Reader) *lnwire.FundingLocked {
+func newMsgChannelReady(t testing.TB, r io.Reader) *lnwire.ChannelReady {
 	t.Helper()
 
 	var c [32]byte
@@ -452,8 +452,20 @@ func newMsgFundingLocked(t testing.TB, r io.Reader) *lnwire.FundingLocked {
 
 	pubKey := randPubKey(t)
 
-	msg := lnwire.NewFundingLocked(lnwire.ChannelID(c), pubKey)
-	msg.ExtraData = createExtraData(t, r)
+	// When testing the ChannelReady msg type in the WriteMessage
+	// function we need to populate the alias here to test the encoding
+	// of the TLV stream.
+	aliasScid := lnwire.NewShortChanIDFromInt(rand.Uint64())
+	msg := &lnwire.ChannelReady{
+		ChanID:                 lnwire.ChannelID(c),
+		NextPerCommitmentPoint: pubKey,
+		AliasScid:              &aliasScid,
+		ExtraData:              make([]byte, 0),
+	}
+
+	// We do not include the TLV record (aliasScid) into the ExtraData
+	// because when the msg is encoded the ExtraData is overwritten
+	// with the current aliasScid value.
 
 	return msg
 }
@@ -633,11 +645,11 @@ func newMsgChannelReestablish(t testing.TB,
 }
 
 func newMsgChannelAnnouncement(t testing.TB,
-	r *rand.Rand) *lnwire.ChannelAnnouncement {
+	r *rand.Rand) *lnwire.ChannelAnnouncement1 {
 
 	t.Helper()
 
-	msg := &lnwire.ChannelAnnouncement{
+	msg := &lnwire.ChannelAnnouncement1{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(uint64(r.Int63())),
 		Features:        rawFeatureVector(),
 		NodeID1:         randRawKey(t),
@@ -680,7 +692,7 @@ func newMsgNodeAnnouncement(t testing.TB,
 	return msg
 }
 
-func newMsgChannelUpdate(t testing.TB, r *rand.Rand) *lnwire.ChannelUpdate {
+func newMsgChannelUpdate(t testing.TB, r *rand.Rand) *lnwire.ChannelUpdate1 {
 	t.Helper()
 
 	msgFlags := lnwire.ChanUpdateMsgFlags(r.Int31())
@@ -690,11 +702,11 @@ func newMsgChannelUpdate(t testing.TB, r *rand.Rand) *lnwire.ChannelUpdate {
 	// as being part of the ChannelUpdate, to pass
 	// serialization tests, as it will be ignored if the bit
 	// is not set.
-	if msgFlags&lnwire.ChanUpdateOptionMaxHtlc == 0 {
+	if msgFlags&lnwire.ChanUpdateRequiredMaxHtlc == 0 {
 		maxHtlc = 0
 	}
 
-	msg := &lnwire.ChannelUpdate{
+	msg := &lnwire.ChannelUpdate1{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(r.Uint64()),
 		Timestamp:       uint32(r.Int31()),
 		MessageFlags:    msgFlags,
@@ -715,11 +727,11 @@ func newMsgChannelUpdate(t testing.TB, r *rand.Rand) *lnwire.ChannelUpdate {
 }
 
 func newMsgAnnounceSignatures(t testing.TB,
-	r *rand.Rand) *lnwire.AnnounceSignatures {
+	r *rand.Rand) *lnwire.AnnounceSignatures1 {
 
 	t.Helper()
 
-	msg := &lnwire.AnnounceSignatures{
+	msg := &lnwire.AnnounceSignatures1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(
 			uint64(r.Int63()),
 		),

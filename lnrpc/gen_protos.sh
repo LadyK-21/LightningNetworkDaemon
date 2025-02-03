@@ -50,24 +50,13 @@ function generate() {
   
   PACKAGES="autopilotrpc chainrpc invoicesrpc neutrinorpc peersrpc routerrpc signrpc verrpc walletrpc watchtowerrpc wtclientrpc devrpc"
   for package in $PACKAGES; do
-    # Special import for the wallet kit.
-    manual_import=""
-    if [[ "$package" == "walletrpc" ]]; then
-      manual_import="github.com/lightningnetwork/lnd/lnrpc/signrpc"
-    fi
-
-    # Special import for devrpc.
-    if [[ "$package" == "devrpc" ]]; then
-        manual_import="github.com/lightningnetwork/lnd/lnrpc"
-    fi
-
-    opts="package_name=$package,manual_import=$manual_import,js_stubs=1"
+    opts="package_name=$package,js_stubs=1"
     pushd $package
     protoc -I/usr/local/include -I. -I.. \
       --plugin=protoc-gen-custom=$falafel\
       --custom_out=. \
       --custom_opt="$opts" \
-      "$(find . -name '*.proto')"
+      $(find . -name '*.proto')
     popd
   done
 }

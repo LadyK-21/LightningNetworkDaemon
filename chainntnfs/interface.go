@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/fn/v2"
 )
 
 var (
@@ -257,6 +258,9 @@ type ConfirmationEvent struct {
 // channels.
 func NewConfirmationEvent(numConfs uint32, cancel func()) *ConfirmationEvent {
 	return &ConfirmationEvent{
+		// We cannot rely on the subscriber to immediately read from
+		// the channel so we need to create a larger buffer to avoid
+		// blocking the notifier.
 		Confirmed:    make(chan *TxConfirmation, 1),
 		Updates:      make(chan uint32, numConfs),
 		NegativeConf: make(chan int32, 1),
@@ -276,6 +280,34 @@ type SpendDetail struct {
 	SpendingTx        *wire.MsgTx
 	SpenderInputIndex uint32
 	SpendingHeight    int32
+}
+
+// HasSpenderWitness returns true if the spending transaction has non-empty
+// witness.
+func (s *SpendDetail) HasSpenderWitness() bool {
+	tx := s.SpendingTx
+
+	// If there are no inputs, then there is no witness.
+	if len(tx.TxIn) == 0 {
+		return false
+	}
+
+	// If the spender input index is larger than the number of inputs, then
+	// we don't have a witness and this is an error case so we log it.
+	if uint32(len(tx.TxIn)) <= s.SpenderInputIndex {
+		Log.Errorf("SpenderInputIndex %d is out of range for tx %v",
+			s.SpenderInputIndex, tx.TxHash())
+
+		return false
+	}
+
+	// If the witness is empty, then there is no witness.
+	if len(tx.TxIn[s.SpenderInputIndex].Witness) == 0 {
+		return false
+	}
+
+	// If the witness is non-empty, then we have a witness.
+	return true
 }
 
 // String returns a string representation of SpendDetail.
@@ -455,13 +487,13 @@ func GetCommonBlockAncestorHeight(chainConn ChainConn, reorgHash,
 	for reorgHash != chainHash {
 		reorgHeader, err := chainConn.GetBlockHeader(&reorgHash)
 		if err != nil {
-			return 0, fmt.Errorf("unable to get header for hash=%v: %v",
-				reorgHash, err)
+			return 0, fmt.Errorf("unable to get header for "+
+				"hash=%v: %w", reorgHash, err)
 		}
 		chainHeader, err := chainConn.GetBlockHeader(&chainHash)
 		if err != nil {
-			return 0, fmt.Errorf("unable to get header for hash=%v: %v",
-				chainHash, err)
+			return 0, fmt.Errorf("unable to get header for "+
+				"hash=%v: %w", chainHash, err)
 		}
 		reorgHash = reorgHeader.PrevBlock
 		chainHash = chainHeader.PrevBlock
@@ -469,8 +501,8 @@ func GetCommonBlockAncestorHeight(chainConn ChainConn, reorgHash,
 
 	verboseHeader, err := chainConn.GetBlockHeaderVerbose(&chainHash)
 	if err != nil {
-		return 0, fmt.Errorf("unable to get verbose header for hash=%v: %v",
-			chainHash, err)
+		return 0, fmt.Errorf("unable to get verbose header for "+
+			"hash=%v: %w", chainHash, err)
 	}
 
 	return verboseHeader.Height, nil
@@ -513,7 +545,7 @@ func GetClientMissedBlocks(chainConn ChainConn, clientBestBlock *BlockEpoch,
 		chainConn, startingHeight+1, notifierBestHeight+1,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to get missed blocks: %v", err)
+		return nil, fmt.Errorf("unable to get missed blocks: %w", err)
 	}
 
 	return missedBlocks, nil
@@ -691,7 +723,7 @@ func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
 		}
 
 		return nil, TxNotFoundIndex,
-			fmt.Errorf("unable to query for txid %v: %v",
+			fmt.Errorf("unable to query for txid %v: %w",
 				r.TxID, err)
 	}
 
@@ -700,13 +732,13 @@ func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
 	rawTx, err := hex.DecodeString(rawTxRes.Hex)
 	if err != nil {
 		return nil, TxNotFoundIndex,
-			fmt.Errorf("unable to deserialize tx %v: %v",
+			fmt.Errorf("unable to deserialize tx %v: %w",
 				r.TxID, err)
 	}
 	var tx wire.MsgTx
 	if err := tx.Deserialize(bytes.NewReader(rawTx)); err != nil {
 		return nil, TxNotFoundIndex,
-			fmt.Errorf("unable to deserialize tx %v: %v",
+			fmt.Errorf("unable to deserialize tx %v: %w",
 				r.TxID, err)
 	}
 
@@ -731,13 +763,14 @@ func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
 	if err != nil {
 		return nil, TxNotFoundIndex,
 			fmt.Errorf("unable to get block hash %v for "+
-				"historical dispatch: %v", rawTxRes.BlockHash, err)
+				"historical dispatch: %w", rawTxRes.BlockHash,
+				err)
 	}
 	block, err := chainConn.GetBlock(blockHash)
 	if err != nil {
 		return nil, TxNotFoundIndex,
 			fmt.Errorf("unable to get block with hash %v for "+
-				"historical dispatch: %v", blockHash, err)
+				"historical dispatch: %w", blockHash, err)
 	}
 
 	// In the modern chain (the only one we really care about for LN), the
@@ -760,7 +793,7 @@ func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
 		}
 
 		return &TxConfirmation{
-			Tx:          &tx,
+			Tx:          tx.Copy(),
 			BlockHash:   blockHash,
 			BlockHeight: uint32(blockHeight),
 			TxIndex:     uint32(txIndex),
@@ -772,4 +805,57 @@ func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
 	// within the block, but didn't.
 	return nil, TxNotFoundIndex, fmt.Errorf("unable to locate "+
 		"tx %v in block %v", r.TxID, blockHash)
+}
+
+// SpendHintCache is an interface whose duty is to cache spend hints for
+// outpoints. A spend hint is defined as the earliest height in the chain at
+// which an outpoint could have been spent within.
+type SpendHintCache interface {
+	// CommitSpendHint commits a spend hint for the outpoints to the cache.
+	CommitSpendHint(height uint32, spendRequests ...SpendRequest) error
+
+	// QuerySpendHint returns the latest spend hint for an outpoint.
+	// ErrSpendHintNotFound is returned if a spend hint does not exist
+	// within the cache for the outpoint.
+	QuerySpendHint(spendRequest SpendRequest) (uint32, error)
+
+	// PurgeSpendHint removes the spend hint for the outpoints from the
+	// cache.
+	PurgeSpendHint(spendRequests ...SpendRequest) error
+}
+
+// ConfirmHintCache is an interface whose duty is to cache confirm hints for
+// transactions. A confirm hint is defined as the earliest height in the chain
+// at which a transaction could have been included in a block.
+type ConfirmHintCache interface {
+	// CommitConfirmHint commits a confirm hint for the transactions to the
+	// cache.
+	CommitConfirmHint(height uint32, confRequests ...ConfRequest) error
+
+	// QueryConfirmHint returns the latest confirm hint for a transaction
+	// hash. ErrConfirmHintNotFound is returned if a confirm hint does not
+	// exist within the cache for the transaction hash.
+	QueryConfirmHint(confRequest ConfRequest) (uint32, error)
+
+	// PurgeConfirmHint removes the confirm hint for the transactions from
+	// the cache.
+	PurgeConfirmHint(confRequests ...ConfRequest) error
+}
+
+// MempoolWatcher defines an interface that allows the caller to query
+// information in the mempool.
+type MempoolWatcher interface {
+	// SubscribeMempoolSpent allows the caller to register a subscription
+	// to watch for a spend of an outpoint in the mempool.The event will be
+	// dispatched once the outpoint is spent in the mempool.
+	SubscribeMempoolSpent(op wire.OutPoint) (*MempoolSpendEvent, error)
+
+	// CancelMempoolSpendEvent allows the caller to cancel a subscription to
+	// watch for a spend of an outpoint in the mempool.
+	CancelMempoolSpendEvent(sub *MempoolSpendEvent)
+
+	// LookupInputMempoolSpend looks up the mempool to find a spending tx
+	// which spends the given outpoint. A fn.None is returned if it's not
+	// found.
+	LookupInputMempoolSpend(op wire.OutPoint) fn.Option[wire.MsgTx]
 }

@@ -2,9 +2,12 @@ package lnwire
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"image/color"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -16,28 +19,112 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/tor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 var (
-	shaHash1Bytes, _ = hex.DecodeString("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	shaHash1, _      = chainhash.NewHash(shaHash1Bytes)
-	outpoint1        = wire.NewOutPoint(shaHash1, 0)
+	shaHash1Bytes, _ = hex.DecodeString("e3b0c44298fc1c149afbf4c8996fb" +
+		"92427ae41e4649b934ca495991b7852b855")
 
-	testRBytes, _ = hex.DecodeString("8ce2bc69281ce27da07e6683571319d18e949ddfa2965fb6caa1bf0314f882d7")
-	testSBytes, _ = hex.DecodeString("299105481d63e0f4bc2a88121167221b6700d72a0ead154c03be696a292d24ae")
-	testRScalar   = new(btcec.ModNScalar)
-	testSScalar   = new(btcec.ModNScalar)
-	_             = testRScalar.SetByteSlice(testRBytes)
-	_             = testSScalar.SetByteSlice(testSBytes)
-	testSig       = ecdsa.NewSignature(testRScalar, testSScalar)
+	shaHash1, _ = chainhash.NewHash(shaHash1Bytes)
+	outpoint1   = wire.NewOutPoint(shaHash1, 0)
+
+	testRBytes, _ = hex.DecodeString("8ce2bc69281ce27da07e6683571" +
+		"319d18e949ddfa2965fb6caa1bf0314f882d7")
+	testSBytes, _ = hex.DecodeString("299105481d63e0f4bc2a" +
+		"88121167221b6700d72a0ead154c03be696a292d24ae")
+	testRScalar          = new(btcec.ModNScalar)
+	testSScalar          = new(btcec.ModNScalar)
+	_                    = testRScalar.SetByteSlice(testRBytes)
+	_                    = testSScalar.SetByteSlice(testSBytes)
+	testSig              = ecdsa.NewSignature(testRScalar, testSScalar)
+	testSchnorrSigStr, _ = hex.DecodeString("04E7F9037658A92AFEB4F2" +
+		"5BAE5339E3DDCA81A353493827D26F16D92308E49E2A25E9220867" +
+		"8A2DF86970DA91B03A8AF8815A8A60498B358DAF560B347AA557")
+	testSchnorrSig, _ = NewSigFromSchnorrRawSignature(testSchnorrSigStr)
 )
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func randLocalNonce(r *rand.Rand) Musig2Nonce {
+	var nonce Musig2Nonce
+	_, _ = io.ReadFull(r, nonce[:])
+
+	return nonce
+}
+
+func someLocalNonce[T tlv.TlvType](
+	r *rand.Rand) tlv.OptionalRecordT[T, Musig2Nonce] {
+
+	return tlv.SomeRecordT(tlv.NewRecordT[T, Musig2Nonce](
+		randLocalNonce(r),
+	))
+}
+
+func randPartialSig(r *rand.Rand) (*PartialSig, error) {
+	var sigBytes [32]byte
+	if _, err := r.Read(sigBytes[:]); err != nil {
+		return nil, fmt.Errorf("unable to generate sig: %w", err)
+	}
+
+	var s btcec.ModNScalar
+	s.SetByteSlice(sigBytes[:])
+
+	return &PartialSig{
+		Sig: s,
+	}, nil
+}
+
+func somePartialSig(t *testing.T,
+	r *rand.Rand) tlv.OptionalRecordT[PartialSigType, PartialSig] {
+
+	sig, err := randPartialSig(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return tlv.SomeRecordT(tlv.NewRecordT[PartialSigType, PartialSig](
+		*sig,
+	))
+}
+
+func randPartialSigWithNonce(r *rand.Rand) (*PartialSigWithNonce, error) {
+	var sigBytes [32]byte
+	if _, err := r.Read(sigBytes[:]); err != nil {
+		return nil, fmt.Errorf("unable to generate sig: %w", err)
+	}
+
+	var s btcec.ModNScalar
+	s.SetByteSlice(sigBytes[:])
+
+	return &PartialSigWithNonce{
+		PartialSig: NewPartialSig(s),
+		Nonce:      randLocalNonce(r),
+	}, nil
+}
+
+func somePartialSigWithNonce(t *testing.T,
+	r *rand.Rand) OptPartialSigWithNonceTLV {
+
+	sig, err := randPartialSigWithNonce(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return tlv.SomeRecordT(
+		tlv.NewRecordT[PartialSigWithNonceType, PartialSigWithNonce](
+			*sig,
+		),
+	)
+}
 
 func randAlias(r *rand.Rand) NodeAlias {
 	var a NodeAlias
@@ -57,17 +144,36 @@ func randPubKey() (*btcec.PublicKey, error) {
 	return priv.PubKey(), nil
 }
 
-func randRawKey() ([33]byte, error) {
+// pubkeyFromHex parses a Bitcoin public key from a hex encoded string.
+func pubkeyFromHex(keyHex string) (*btcec.PublicKey, error) {
+	pubKeyBytes, err := hex.DecodeString(keyHex)
+	if err != nil {
+		return nil, err
+	}
+
+	return btcec.ParsePubKey(pubKeyBytes)
+}
+
+// generateRandomBytes returns a slice of n random bytes.
+func generateRandomBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	_, err := crand.Read(b)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func randRawKey(t *testing.T) [33]byte {
 	var n [33]byte
 
 	priv, err := btcec.NewPrivateKey()
-	if err != nil {
-		return n, err
-	}
+	require.NoError(t, err)
 
 	copy(n[:], priv.PubKey().SerializeCompressed())
 
-	return n, nil
+	return n
 }
 
 func randDeliveryAddress(r *rand.Rand) (DeliveryAddress, error) {
@@ -312,6 +418,37 @@ func TestEmptyMessageUnknownType(t *testing.T) {
 	}
 }
 
+// randCustomRecords generates a random set of custom records for testing.
+func randCustomRecords(t *testing.T, r *rand.Rand) CustomRecords {
+	var (
+		customRecords = CustomRecords{}
+
+		// We'll generate a random number of records, between 1 and 10.
+		numRecords = r.Intn(9) + 1
+	)
+
+	// For each record, we'll generate a random key and value.
+	for i := 0; i < numRecords; i++ {
+		// Keys must be equal to or greater than
+		// MinCustomRecordsTlvType.
+		keyOffset := uint64(r.Intn(100))
+		key := MinCustomRecordsTlvType + keyOffset
+
+		// Values are byte slices of any length.
+		value := make([]byte, r.Intn(10))
+		_, err := r.Read(value)
+		require.NoError(t, err)
+
+		customRecords[key] = value
+	}
+
+	// Validate the custom records as a sanity check.
+	err := customRecords.Validate()
+	require.NoError(t, err)
+
+	return customRecords
+}
+
 // TestLightningWireProtocol uses the testing/quick package to create a series
 // of fuzz tests to attempt to break a primary scenario which is implemented as
 // property based testing scenario.
@@ -361,6 +498,22 @@ func TestLightningWireProtocol(t *testing.T) {
 	// are too complex for the testing/quick package to automatically
 	// generate.
 	customTypeGen := map[MessageType]func([]reflect.Value, *rand.Rand){
+		MsgStfu: func(v []reflect.Value, r *rand.Rand) {
+			req := Stfu{}
+			if _, err := r.Read(req.ChanID[:]); err != nil {
+				t.Fatalf("unable to generate ChanID: %v", err)
+			}
+
+			// 1/2 chance of being initiator
+			req.Initiator = r.Intn(2) == 1
+
+			// 1/2 chance additional TLV data.
+			if r.Intn(2) == 0 {
+				req.ExtraData = []byte{0xfd, 0x00, 0xff, 0x00}
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
 		MsgInit: func(v []reflect.Value, r *rand.Rand) {
 			req := NewInitMessage(
 				randRawFeatureVector(r),
@@ -438,6 +591,9 @@ func TestLightningWireProtocol(t *testing.T) {
 
 				req.LeaseExpiry = new(LeaseExpiry)
 				*req.LeaseExpiry = LeaseExpiry(1337)
+
+				//nolint:ll
+				req.LocalNonce = someLocalNonce[NonceRecordTypeT](r)
 			} else {
 				req.UpfrontShutdownScript = []byte{}
 			}
@@ -510,6 +666,9 @@ func TestLightningWireProtocol(t *testing.T) {
 
 				req.LeaseExpiry = new(LeaseExpiry)
 				*req.LeaseExpiry = LeaseExpiry(1337)
+
+				//nolint:ll
+				req.LocalNonce = someLocalNonce[NonceRecordTypeT](r)
 			} else {
 				req.UpfrontShutdownScript = []byte{}
 			}
@@ -544,6 +703,11 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			// 1/2 chance to attach a partial sig.
+			if r.Intn(2) == 0 {
+				req.PartialSig = somePartialSigWithNonce(t, r)
+			}
+
 			v[0] = reflect.ValueOf(req)
 		},
 		MsgFundingSigned: func(v []reflect.Value, r *rand.Rand) {
@@ -564,25 +728,77 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			// 1/2 chance to attach a partial sig.
+			if r.Intn(2) == 0 {
+				req.PartialSig = somePartialSigWithNonce(t, r)
+			}
+
 			v[0] = reflect.ValueOf(req)
 		},
-		MsgFundingLocked: func(v []reflect.Value, r *rand.Rand) {
-
+		MsgChannelReady: func(v []reflect.Value, r *rand.Rand) {
 			var c [32]byte
-			if _, err := r.Read(c[:]); err != nil {
+			_, err := r.Read(c[:])
+			require.NoError(t, err)
+
+			pubKey, err := randPubKey()
+			require.NoError(t, err)
+
+			req := NewChannelReady(c, pubKey)
+
+			if r.Int31()%2 == 0 {
+				scid := NewShortChanIDFromInt(uint64(r.Int63()))
+				req.AliasScid = &scid
+
+				//nolint:ll
+				req.NextLocalNonce = someLocalNonce[NonceRecordTypeT](r)
+			}
+
+			if r.Int31()%2 == 0 {
+				nodeNonce := tlv.ZeroRecordT[
+					tlv.TlvType0, Musig2Nonce,
+				]()
+				nodeNonce.Val = randLocalNonce(r)
+				req.AnnouncementNodeNonce = tlv.SomeRecordT(
+					nodeNonce,
+				)
+
+				btcNonce := tlv.ZeroRecordT[
+					tlv.TlvType2, Musig2Nonce,
+				]()
+				btcNonce.Val = randLocalNonce(r)
+				req.AnnouncementBitcoinNonce = tlv.SomeRecordT(
+					btcNonce,
+				)
+			}
+
+			v[0] = reflect.ValueOf(*req)
+		},
+		MsgShutdown: func(v []reflect.Value, r *rand.Rand) {
+			var c [32]byte
+			_, err := r.Read(c[:])
+			if err != nil {
 				t.Fatalf("unable to generate chan id: %v", err)
 				return
 			}
 
-			pubKey, err := randPubKey()
+			shutdownAddr, err := randDeliveryAddress(r)
 			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
+				t.Fatalf("unable to generate delivery "+
+					"address: %v", err)
 				return
 			}
 
-			req := NewFundingLocked(ChannelID(c), pubKey)
+			req := Shutdown{
+				ChannelID: ChannelID(c),
+				Address:   shutdownAddr,
+			}
 
-			v[0] = reflect.ValueOf(*req)
+			if r.Int31()%2 == 0 {
+				//nolint:ll
+				req.ShutdownNonce = someLocalNonce[ShutdownNonceType](r)
+			}
+
+			v[0] = reflect.ValueOf(req)
 		},
 		MsgClosingSigned: func(v []reflect.Value, r *rand.Rand) {
 			req := ClosingSigned{
@@ -601,7 +817,123 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			if r.Int31()%2 == 0 {
+				req.PartialSig = somePartialSig(t, r)
+			}
+
 			v[0] = reflect.ValueOf(req)
+		},
+		MsgDynPropose: func(v []reflect.Value, r *rand.Rand) {
+			var dp DynPropose
+			rand.Read(dp.ChanID[:])
+
+			if rand.Uint32()%2 == 0 {
+				v := btcutil.Amount(rand.Uint32())
+				dp.DustLimit = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := MilliSatoshi(rand.Uint32())
+				dp.MaxValueInFlight = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := btcutil.Amount(rand.Uint32())
+				dp.ChannelReserve = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := uint16(rand.Uint32())
+				dp.CsvDelay = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := uint16(rand.Uint32())
+				dp.MaxAcceptedHTLCs = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v, _ := btcec.NewPrivateKey()
+				dp.FundingKey = fn.Some(*v.PubKey())
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := ChannelType(*NewRawFeatureVector())
+				dp.ChannelType = fn.Some(v)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				v := chainfee.SatPerKWeight(rand.Uint32())
+				dp.KickoffFeerate = fn.Some(v)
+			}
+
+			v[0] = reflect.ValueOf(dp)
+		},
+		MsgDynReject: func(v []reflect.Value, r *rand.Rand) {
+			var dr DynReject
+			rand.Read(dr.ChanID[:])
+
+			features := NewRawFeatureVector()
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPDustLimitSatoshis))
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(
+					FeatureBit(DPMaxHtlcValueInFlightMsat),
+				)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(
+					FeatureBit(DPChannelReserveSatoshis),
+				)
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPToSelfDelay))
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPMaxAcceptedHtlcs))
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPFundingPubkey))
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPChannelType))
+			}
+
+			if rand.Uint32()%2 == 0 {
+				features.Set(FeatureBit(DPKickoffFeerate))
+			}
+			dr.UpdateRejections = *features
+
+			v[0] = reflect.ValueOf(dr)
+		},
+		MsgDynAck: func(v []reflect.Value, r *rand.Rand) {
+			var da DynAck
+
+			rand.Read(da.ChanID[:])
+			if rand.Uint32()%2 == 0 {
+				var nonce Musig2Nonce
+				rand.Read(nonce[:])
+				da.LocalNonce = fn.Some(nonce)
+			}
+
+			v[0] = reflect.ValueOf(da)
+		},
+		MsgKickoffSig: func(v []reflect.Value, r *rand.Rand) {
+			ks := KickoffSig{
+				ExtraData: make([]byte, 0),
+			}
+
+			rand.Read(ks.ChanID[:])
+			rand.Read(ks.Signature.bytes[:])
+
+			v[0] = reflect.ValueOf(ks)
 		},
 		MsgCommitSig: func(v []reflect.Value, r *rand.Rand) {
 			req := NewCommitSig()
@@ -620,16 +952,25 @@ func TestLightningWireProtocol(t *testing.T) {
 			// Only create the slice if there will be any signatures
 			// in it to prevent false positive test failures due to
 			// an empty slice versus a nil slice.
-			numSigs := uint16(r.Int31n(1020))
+			numSigs := uint16(r.Int31n(500))
 			if numSigs > 0 {
 				req.HtlcSigs = make([]Sig, numSigs)
 			}
 			for i := 0; i < int(numSigs); i++ {
-				req.HtlcSigs[i], err = NewSigFromSignature(testSig)
+				req.HtlcSigs[i], err = NewSigFromSignature(
+					testSig,
+				)
 				if err != nil {
 					t.Fatalf("unable to parse sig: %v", err)
 					return
 				}
+			}
+
+			req.CustomRecords = randCustomRecords(t, r)
+
+			// 50/50 chance to attach a partial sig.
+			if r.Int31()%2 == 0 {
+				req.PartialSig = somePartialSigWithNonce(t, r)
 			}
 
 			v[0] = reflect.ValueOf(*req)
@@ -651,12 +992,24 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
+			// 50/50 chance to attach a local nonce.
+			if r.Int31()%2 == 0 {
+				//nolint:ll
+				req.LocalNonce = someLocalNonce[NonceRecordTypeT](r)
+			}
+
 			v[0] = reflect.ValueOf(*req)
 		},
 		MsgChannelAnnouncement: func(v []reflect.Value, r *rand.Rand) {
 			var err error
-			req := ChannelAnnouncement{
-				ShortChannelID:  NewShortChanIDFromInt(uint64(r.Int63())),
+			req := ChannelAnnouncement1{
+				ShortChannelID: NewShortChanIDFromInt(
+					uint64(r.Int63()),
+				),
+				NodeID1:         randRawKey(t),
+				NodeID2:         randRawKey(t),
+				BitcoinKey1:     randRawKey(t),
+				BitcoinKey2:     randRawKey(t),
 				Features:        randRawFeatureVector(r),
 				ExtraOpaqueData: make([]byte, 0),
 			}
@@ -681,26 +1034,6 @@ func TestLightningWireProtocol(t *testing.T) {
 				return
 			}
 
-			req.NodeID1, err = randRawKey()
-			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
-				return
-			}
-			req.NodeID2, err = randRawKey()
-			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
-				return
-			}
-			req.BitcoinKey1, err = randRawKey()
-			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
-				return
-			}
-			req.BitcoinKey2, err = randRawKey()
-			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
-				return
-			}
 			if _, err := r.Read(req.ChainHash[:]); err != nil {
 				t.Fatalf("unable to generate chain hash: %v", err)
 				return
@@ -722,6 +1055,7 @@ func TestLightningWireProtocol(t *testing.T) {
 		MsgNodeAnnouncement: func(v []reflect.Value, r *rand.Rand) {
 			var err error
 			req := NodeAnnouncement{
+				NodeID:    randRawKey(t),
 				Features:  randRawFeatureVector(r),
 				Timestamp: uint32(r.Int31()),
 				Alias:     randAlias(r),
@@ -735,12 +1069,6 @@ func TestLightningWireProtocol(t *testing.T) {
 			req.Signature, err = NewSigFromSignature(testSig)
 			if err != nil {
 				t.Fatalf("unable to parse sig: %v", err)
-				return
-			}
-
-			req.NodeID, err = randRawKey()
-			if err != nil {
-				t.Fatalf("unable to generate key: %v", err)
 				return
 			}
 
@@ -772,12 +1100,14 @@ func TestLightningWireProtocol(t *testing.T) {
 			// as being part of the ChannelUpdate, to pass
 			// serialization tests, as it will be ignored if the bit
 			// is not set.
-			if msgFlags&ChanUpdateOptionMaxHtlc == 0 {
+			if msgFlags&ChanUpdateRequiredMaxHtlc == 0 {
 				maxHtlc = 0
 			}
 
-			req := ChannelUpdate{
-				ShortChannelID:  NewShortChanIDFromInt(uint64(r.Int63())),
+			req := ChannelUpdate1{
+				ShortChannelID: NewShortChanIDFromInt(
+					uint64(r.Int63()),
+				),
 				Timestamp:       uint32(r.Int31()),
 				MessageFlags:    msgFlags,
 				ChannelFlags:    ChanUpdateChanFlags(r.Int31()),
@@ -814,7 +1144,7 @@ func TestLightningWireProtocol(t *testing.T) {
 		},
 		MsgAnnounceSignatures: func(v []reflect.Value, r *rand.Rand) {
 			var err error
-			req := AnnounceSignatures{
+			req := AnnounceSignatures1{
 				ShortChannelID:  NewShortChanIDFromInt(uint64(r.Int63())),
 				ExtraOpaqueData: make([]byte, 0),
 			}
@@ -871,6 +1201,38 @@ func TestLightningWireProtocol(t *testing.T) {
 					t.Fatalf("unable to generate key: %v", err)
 					return
 				}
+
+				//nolint:ll
+				req.LocalNonce = someLocalNonce[NonceRecordTypeT](r)
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgGossipTimestampRange: func(v []reflect.Value, r *rand.Rand) {
+			req := GossipTimestampRange{
+				FirstTimestamp: rand.Uint32(),
+				TimestampRange: rand.Uint32(),
+				ExtraData:      make([]byte, 0),
+			}
+
+			_, err := rand.Read(req.ChainHash[:])
+			require.NoError(t, err)
+
+			// Sometimes add a block range.
+			if r.Int31()%2 == 0 {
+				firstBlock := tlv.ZeroRecordT[
+					tlv.TlvType2, uint32,
+				]()
+				firstBlock.Val = rand.Uint32()
+				req.FirstBlockHeight = tlv.SomeRecordT(
+					firstBlock,
+				)
+
+				blockRange := tlv.ZeroRecordT[
+					tlv.TlvType4, uint32,
+				]()
+				blockRange.Val = rand.Uint32()
+				req.BlockRange = tlv.SomeRecordT(blockRange)
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -923,10 +1285,40 @@ func TestLightningWireProtocol(t *testing.T) {
 				req.EncodingType = EncodingSortedPlain
 			}
 
-			numChanIDs := rand.Int31n(5000)
+			numChanIDs := rand.Int31n(4000)
 			for i := int32(0); i < numChanIDs; i++ {
 				req.ShortChanIDs = append(req.ShortChanIDs,
 					NewShortChanIDFromInt(uint64(r.Int63())))
+			}
+
+			// With a 50/50 chance, add some timestamps.
+			if r.Int31()%2 == 0 {
+				for i := int32(0); i < numChanIDs; i++ {
+					timestamps := ChanUpdateTimestamps{
+						Timestamp1: rand.Uint32(),
+						Timestamp2: rand.Uint32(),
+					}
+					req.Timestamps = append(
+						req.Timestamps, timestamps,
+					)
+				}
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgQueryChannelRange: func(v []reflect.Value, r *rand.Rand) {
+			req := QueryChannelRange{
+				FirstBlockHeight: uint32(r.Int31()),
+				NumBlocks:        uint32(r.Int31()),
+				ExtraData:        make([]byte, 0),
+			}
+
+			_, err := rand.Read(req.ChainHash[:])
+			require.NoError(t, err)
+
+			// With a 50/50 change, we'll set a query option.
+			if r.Int31()%2 == 0 {
+				req.QueryOptions = NewTimestampQueryOption()
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -938,11 +1330,344 @@ func TestLightningWireProtocol(t *testing.T) {
 			//
 			// We'll allow the test to generate padding bytes up to
 			// the max message limit, factoring in the 2 bytes for
-			// the num pong bytes.
-			paddingBytes := make([]byte, r.Intn(MaxMsgBody-1))
+			// the num pong bytes and 2 bytes for encoding the
+			// length of the padding bytes.
+			paddingBytes := make([]byte, rand.Intn(MaxMsgBody-3))
 			req := Ping{
 				NumPongBytes: uint16(r.Intn(MaxPongBytes + 1)),
 				PaddingBytes: paddingBytes,
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgClosingComplete: func(v []reflect.Value, r *rand.Rand) {
+			var c [32]byte
+			_, err := r.Read(c[:])
+			if err != nil {
+				t.Fatalf("unable to generate chan id: %v",
+					err)
+				return
+			}
+
+			req := ClosingComplete{
+				ChannelID:   ChannelID(c),
+				FeeSatoshis: btcutil.Amount(r.Int63()),
+				LockTime:    uint32(r.Int63()),
+				ClosingSigs: ClosingSigs{},
+			}
+
+			if r.Intn(2) == 0 {
+				sig := req.CloserNoClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.CloserNoClosee = tlv.SomeRecordT(sig)
+			}
+			if r.Intn(2) == 0 {
+				sig := req.NoCloserClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.NoCloserClosee = tlv.SomeRecordT(sig)
+			}
+			if r.Intn(2) == 0 {
+				sig := req.CloserAndClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.CloserAndClosee = tlv.SomeRecordT(sig)
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgClosingSig: func(v []reflect.Value, r *rand.Rand) {
+			var c [32]byte
+			_, err := r.Read(c[:])
+			if err != nil {
+				t.Fatalf("unable to generate chan id: %v", err)
+				return
+			}
+
+			req := ClosingSig{
+				ChannelID:   ChannelID(c),
+				ClosingSigs: ClosingSigs{},
+			}
+
+			if r.Intn(2) == 0 {
+				sig := req.CloserNoClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.CloserNoClosee = tlv.SomeRecordT(sig)
+			}
+			if r.Intn(2) == 0 {
+				sig := req.NoCloserClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.NoCloserClosee = tlv.SomeRecordT(sig)
+			}
+			if r.Intn(2) == 0 {
+				sig := req.CloserAndClosee.Zero()
+				_, err := r.Read(sig.Val.bytes[:])
+				if err != nil {
+					t.Fatalf("unable to generate sig: %v",
+						err)
+					return
+				}
+
+				req.CloserAndClosee = tlv.SomeRecordT(sig)
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgUpdateAddHTLC: func(v []reflect.Value, r *rand.Rand) {
+			req := &UpdateAddHTLC{
+				ID:     r.Uint64(),
+				Amount: MilliSatoshi(r.Uint64()),
+				Expiry: r.Uint32(),
+			}
+
+			_, err := r.Read(req.ChanID[:])
+			require.NoError(t, err)
+
+			_, err = r.Read(req.PaymentHash[:])
+			require.NoError(t, err)
+
+			_, err = r.Read(req.OnionBlob[:])
+			require.NoError(t, err)
+
+			req.CustomRecords = randCustomRecords(t, r)
+
+			// Generate a blinding point 50% of the time, since not
+			// all update adds will use route blinding.
+			if r.Int31()%2 == 0 {
+				pubkey, err := randPubKey()
+				if err != nil {
+					t.Fatalf("unable to generate key: %v",
+						err)
+
+					return
+				}
+
+				req.BlindingPoint = tlv.SomeRecordT(
+					tlv.NewPrimitiveRecord[tlv.TlvType0](
+						pubkey,
+					),
+				)
+			}
+
+			v[0] = reflect.ValueOf(*req)
+		},
+		MsgUpdateFulfillHTLC: func(v []reflect.Value, r *rand.Rand) {
+			req := &UpdateFulfillHTLC{
+				ID: r.Uint64(),
+			}
+
+			_, err := r.Read(req.ChanID[:])
+			require.NoError(t, err)
+
+			_, err = r.Read(req.PaymentPreimage[:])
+			require.NoError(t, err)
+
+			req.CustomRecords = randCustomRecords(t, r)
+
+			// Generate some random TLV records 50% of the time.
+			if r.Int31()%2 == 0 {
+				req.ExtraData = []byte{
+					0x01, 0x03, 1, 2, 3,
+					0x02, 0x03, 4, 5, 6,
+				}
+			}
+
+			v[0] = reflect.ValueOf(*req)
+		},
+		MsgAnnounceSignatures2: func(v []reflect.Value,
+			r *rand.Rand) {
+
+			req := AnnounceSignatures2{
+				ShortChannelID: NewShortChanIDFromInt(
+					uint64(r.Int63()),
+				),
+				ExtraOpaqueData: make([]byte, 0),
+			}
+
+			_, err := r.Read(req.ChannelID[:])
+			require.NoError(t, err)
+
+			partialSig, err := randPartialSig(r)
+			require.NoError(t, err)
+
+			req.PartialSignature = *partialSig
+
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make(
+					[]byte, numExtraBytes,
+				)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				require.NoError(t, err)
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgChannelAnnouncement2: func(v []reflect.Value, r *rand.Rand) {
+			req := ChannelAnnouncement2{
+				Signature:       testSchnorrSig,
+				ExtraOpaqueData: make([]byte, 0),
+			}
+
+			req.ShortChannelID.Val = NewShortChanIDFromInt(
+				uint64(r.Int63()),
+			)
+			req.Capacity.Val = rand.Uint64()
+
+			req.Features.Val = *randRawFeatureVector(r)
+
+			req.NodeID1.Val = randRawKey(t)
+			req.NodeID2.Val = randRawKey(t)
+
+			// Sometimes set chain hash to bitcoin mainnet genesis
+			// hash.
+			req.ChainHash.Val = *chaincfg.MainNetParams.GenesisHash
+			if r.Int31()%2 == 0 {
+				_, err := r.Read(req.ChainHash.Val[:])
+				require.NoError(t, err)
+			}
+
+			// Sometimes set the bitcoin keys.
+			if r.Int31()%2 == 0 {
+				btcKey1 := tlv.ZeroRecordT[
+					tlv.TlvType12, [33]byte,
+				]()
+				btcKey1.Val = randRawKey(t)
+				req.BitcoinKey1 = tlv.SomeRecordT(btcKey1)
+
+				btcKey2 := tlv.ZeroRecordT[
+					tlv.TlvType14, [33]byte,
+				]()
+				btcKey2.Val = randRawKey(t)
+				req.BitcoinKey2 = tlv.SomeRecordT(btcKey2)
+
+				// Occasionally also set the merkle root hash.
+				if r.Int31()%2 == 0 {
+					hash := tlv.ZeroRecordT[
+						tlv.TlvType16, [32]byte,
+					]()
+
+					_, err := r.Read(hash.Val[:])
+					require.NoError(t, err)
+
+					req.MerkleRootHash = tlv.SomeRecordT(
+						hash,
+					)
+				}
+			}
+
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make(
+					[]byte, numExtraBytes,
+				)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				require.NoError(t, err)
+			}
+
+			v[0] = reflect.ValueOf(req)
+		},
+		MsgChannelUpdate2: func(v []reflect.Value, r *rand.Rand) {
+			req := ChannelUpdate2{
+				Signature:       testSchnorrSig,
+				ExtraOpaqueData: make([]byte, 0),
+			}
+
+			req.ShortChannelID.Val = NewShortChanIDFromInt(
+				uint64(r.Int63()),
+			)
+			req.BlockHeight.Val = r.Uint32()
+			req.HTLCMaximumMsat.Val = MilliSatoshi(r.Uint64())
+
+			// Sometimes set chain hash to bitcoin mainnet genesis
+			// hash.
+			req.ChainHash.Val = *chaincfg.MainNetParams.GenesisHash
+			if r.Int31()%2 == 0 {
+				_, err := r.Read(req.ChainHash.Val[:])
+				require.NoError(t, err)
+			}
+
+			// Sometimes use default htlc min msat.
+			req.HTLCMinimumMsat.Val = defaultHtlcMinMsat
+			if r.Int31()%2 == 0 {
+				req.HTLCMinimumMsat.Val = MilliSatoshi(
+					r.Uint64(),
+				)
+			}
+
+			// Sometimes set the cltv expiry delta to the default.
+			req.CLTVExpiryDelta.Val = defaultCltvExpiryDelta
+			if r.Int31()%2 == 0 {
+				req.CLTVExpiryDelta.Val = uint16(r.Int31())
+			}
+
+			// Sometimes use default fee base.
+			req.FeeBaseMsat.Val = defaultFeeBaseMsat
+			if r.Int31()%2 == 0 {
+				req.FeeBaseMsat.Val = r.Uint32()
+			}
+
+			// Sometimes use default proportional fee.
+			req.FeeProportionalMillionths.Val =
+				defaultFeeProportionalMillionths
+			if r.Int31()%2 == 0 {
+				req.FeeProportionalMillionths.Val = r.Uint32()
+			}
+
+			// Alternate between the two direction possibilities.
+			if r.Int31()%2 == 0 {
+				req.SecondPeer = tlv.SomeRecordT(
+					tlv.ZeroRecordT[tlv.TlvType8, TrueBoolean](), //nolint:ll
+				)
+			}
+
+			// Sometimes set the incoming disabled flag.
+			if r.Int31()%2 == 0 {
+				req.DisabledFlags.Val |=
+					ChanUpdateDisableIncoming
+			}
+
+			// Sometimes set the outgoing disabled flag.
+			if r.Int31()%2 == 0 {
+				req.DisabledFlags.Val |=
+					ChanUpdateDisableOutgoing
+			}
+
+			numExtraBytes := r.Int31n(1000)
+			if numExtraBytes > 0 {
+				req.ExtraOpaqueData = make(
+					[]byte, numExtraBytes,
+				)
+				_, err := r.Read(req.ExtraOpaqueData[:])
+				require.NoError(t, err)
 			}
 
 			v[0] = reflect.ValueOf(req)
@@ -958,6 +1683,12 @@ func TestLightningWireProtocol(t *testing.T) {
 		msgType  MessageType
 		scenario interface{}
 	}{
+		{
+			msgType: MsgStfu,
+			scenario: func(m Stfu) bool {
+				return mainScenario(&m)
+			},
+		},
 		{
 			msgType: MsgInit,
 			scenario: func(m Init) bool {
@@ -1013,8 +1744,8 @@ func TestLightningWireProtocol(t *testing.T) {
 			},
 		},
 		{
-			msgType: MsgFundingLocked,
-			scenario: func(m FundingLocked) bool {
+			msgType: MsgChannelReady,
+			scenario: func(m ChannelReady) bool {
 				return mainScenario(&m)
 			},
 		},
@@ -1027,6 +1758,30 @@ func TestLightningWireProtocol(t *testing.T) {
 		{
 			msgType: MsgClosingSigned,
 			scenario: func(m ClosingSigned) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgDynPropose,
+			scenario: func(m DynPropose) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgDynReject,
+			scenario: func(m DynReject) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgDynAck,
+			scenario: func(m DynAck) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgKickoffSig,
+			scenario: func(m KickoffSig) bool {
 				return mainScenario(&m)
 			},
 		},
@@ -1081,7 +1836,7 @@ func TestLightningWireProtocol(t *testing.T) {
 		},
 		{
 			msgType: MsgChannelAnnouncement,
-			scenario: func(m ChannelAnnouncement) bool {
+			scenario: func(m ChannelAnnouncement1) bool {
 				return mainScenario(&m)
 			},
 		},
@@ -1093,13 +1848,13 @@ func TestLightningWireProtocol(t *testing.T) {
 		},
 		{
 			msgType: MsgChannelUpdate,
-			scenario: func(m ChannelUpdate) bool {
+			scenario: func(m ChannelUpdate1) bool {
 				return mainScenario(&m)
 			},
 		},
 		{
 			msgType: MsgAnnounceSignatures,
-			scenario: func(m AnnounceSignatures) bool {
+			scenario: func(m AnnounceSignatures1) bool {
 				return mainScenario(&m)
 			},
 		},
@@ -1133,24 +1888,60 @@ func TestLightningWireProtocol(t *testing.T) {
 				return mainScenario(&m)
 			},
 		},
+		{
+			msgType: MsgClosingComplete,
+			scenario: func(m ClosingComplete) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgClosingSig,
+			scenario: func(m ClosingSig) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgAnnounceSignatures2,
+			scenario: func(m AnnounceSignatures2) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgChannelAnnouncement2,
+			scenario: func(m ChannelAnnouncement2) bool {
+				return mainScenario(&m)
+			},
+		},
+		{
+			msgType: MsgChannelUpdate2,
+			scenario: func(m ChannelUpdate2) bool {
+				return mainScenario(&m)
+			},
+		},
 	}
 	for _, test := range tests {
-		var config *quick.Config
+		t.Run(test.msgType.String(), func(t *testing.T) {
+			var config *quick.Config
 
-		// If the type defined is within the custom type gen map above,
-		// then we'll modify the default config to use this Value
-		// function that knows how to generate the proper types.
-		if valueGen, ok := customTypeGen[test.msgType]; ok {
-			config = &quick.Config{
-				Values: valueGen,
+			// If the type defined is within the custom type gen
+			// map above, then we'll modify the default config to
+			// use this Value function that knows how to generate
+			// the proper types.
+			if valueGen, ok := customTypeGen[test.msgType]; ok {
+				config = &quick.Config{
+					Values: valueGen,
+				}
 			}
-		}
 
-		t.Logf("Running fuzz tests for msgType=%v", test.msgType)
-		if err := quick.Check(test.scenario, config); err != nil {
-			t.Fatalf("fuzz checks for msg=%v failed: %v",
-				test.msgType, err)
-		}
+			t.Logf("Running fuzz tests for msgType=%v",
+				test.msgType)
+
+			err := quick.Check(test.scenario, config)
+			if err != nil {
+				t.Fatalf("fuzz checks for msg=%v failed: %v",
+					test.msgType, err)
+			}
+		})
 	}
 
 }

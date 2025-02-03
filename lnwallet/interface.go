@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
@@ -18,8 +19,11 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 const (
@@ -69,6 +73,12 @@ var (
 	// ErrNotMine is an error denoting that a WalletController instance is
 	// unable to spend a specified output.
 	ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
+
+	// ErrMempoolFee is returned from PublishTransaction in case the tx
+	// being published is not accepted into mempool because the fee
+	// requirements of the mempool backend are not met.
+	ErrMempoolFee = errors.New("transaction rejected by the mempool " +
+		"because of low fees")
 )
 
 // ErrNoOutputs is returned if we try to create a transaction with no outputs
@@ -90,6 +100,12 @@ type AddressProperty struct {
 
 	// Balance returns the total balance of an address.
 	Balance btcutil.Amount
+
+	// DerivationPath is the derivation path of the address.
+	DerivationPath string
+
+	// PublicKey is the public key of the address.
+	PublicKey *btcec.PublicKey
 }
 
 // AccountIdentifier contains information to uniquely identify an account.
@@ -113,8 +129,7 @@ type Utxo struct {
 	Confirmations int64
 	PkScript      []byte
 	wire.OutPoint
-	Derivation *psbt.Bip32Derivation
-	PrevTx     *wire.MsgTx
+	PrevTx *wire.MsgTx
 }
 
 // OutputDetail contains additional information on a destination address.
@@ -214,11 +229,16 @@ type TransactionSubscription interface {
 // behavior of all interface methods in order to ensure identical behavior
 // across all concrete implementations.
 type WalletController interface {
-	// FetchInputInfo queries for the WalletController's knowledge of the
-	// passed outpoint. If the base wallet determines this output is under
-	// its control, then the original txout should be returned.  Otherwise,
-	// a non-nil error value of ErrNotMine should be returned instead.
-	FetchInputInfo(prevOut *wire.OutPoint) (*Utxo, error)
+	// FetchOutpointInfo queries for the WalletController's knowledge of
+	// the passed outpoint. If the base wallet determines this output is
+	// under its control, then the original txout should be returned.
+	// Otherwise, a non-nil error value of ErrNotMine should be returned
+	// instead.
+	FetchOutpointInfo(prevOut *wire.OutPoint) (*Utxo, error)
+
+	// FetchDerivationInfo queries for the wallet's knowledge of the passed
+	// pkScript and constructs the derivation info and returns it.
+	FetchDerivationInfo(pkScript []byte) (*psbt.Bip32Derivation, error)
 
 	// ScriptForOutput returns the address, witness program and redeem
 	// script for a given UTXO. An error is returned if the UTXO does not
@@ -332,8 +352,9 @@ type WalletController interface {
 	// be used when crafting the transaction.
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
-	SendOutputs(outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
-		minConfs int32, label string) (*wire.MsgTx, error)
+	SendOutputs(inputs fn.Set[wire.OutPoint], outputs []*wire.TxOut,
+		feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+		strategy base.CoinSelectionStrategy) (*wire.MsgTx, error)
 
 	// CreateSimpleTx creates a Bitcoin transaction paying to the specified
 	// outputs. The transaction is not broadcasted to the network. In the
@@ -347,8 +368,15 @@ type WalletController interface {
 	// SHOULD NOT be broadcasted.
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
-	CreateSimpleTx(outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
-		minConfs int32, dryRun bool) (*txauthor.AuthoredTx, error)
+	CreateSimpleTx(inputs fn.Set[wire.OutPoint], outputs []*wire.TxOut,
+		feeRate chainfee.SatPerKWeight, minConfs int32,
+		strategy base.CoinSelectionStrategy, dryRun bool) (
+		*txauthor.AuthoredTx, error)
+
+	// GetTransactionDetails returns a detailed description of a transaction
+	// given its transaction hash.
+	GetTransactionDetails(txHash *chainhash.Hash) (
+		*TransactionDetail, error)
 
 	// ListUnspentWitness returns all unspent outputs which are version 0
 	// witness programs. The 'minConfs' and 'maxConfs' parameters
@@ -374,21 +402,9 @@ type WalletController interface {
 	// retrieve the transactions relevant to a specific account. When
 	// empty, transactions of all wallet accounts are returned.
 	ListTransactionDetails(startHeight, endHeight int32,
-		accountFilter string) ([]*TransactionDetail, error)
-
-	// LockOutpoint marks an outpoint as locked meaning it will no longer
-	// be deemed as eligible for coin selection. Locking outputs are
-	// utilized in order to avoid race conditions when selecting inputs for
-	// usage when funding a channel.
-	//
-	// NOTE: This method requires the global coin selection lock to be held.
-	LockOutpoint(o wire.OutPoint)
-
-	// UnlockOutpoint unlocks a previously locked output, marking it
-	// eligible for coin selection.
-	//
-	// NOTE: This method requires the global coin selection lock to be held.
-	UnlockOutpoint(o wire.OutPoint)
+		accountFilter string, indexOffset uint32,
+		maxTransactions uint32) ([]*TransactionDetail, uint64, uint64,
+		error)
 
 	// LeaseOutput locks an output to the given ID, preventing it from being
 	// available for any future coin selection attempts. The absolute time
@@ -402,8 +418,7 @@ type WalletController interface {
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
 	LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
-		duration time.Duration) (time.Time, []byte, btcutil.Amount,
-		error)
+		duration time.Duration) (time.Time, error)
 
 	// ReleaseOutput unlocks an output, allowing it to be available for coin
 	// selection if it remains unspent. The ID should match the one used to
@@ -446,7 +461,10 @@ type WalletController interface {
 	// specified fee rate. If there is change left, a change output from the
 	// internal wallet is added and the index of the change output is
 	// returned. Otherwise no additional output is created and the index -1
-	// is returned.
+	// is returned. If no custom change scope is specified, the BIP0084 will
+	// be used for default accounts and single imported public keys. For
+	// custom account, no key scope should be provided as the coin selection
+	// key scope will always be used to generate the change address.
 	//
 	// NOTE: If the packet doesn't contain any inputs, coin selection is
 	// performed automatically. The account parameter must be non-empty as
@@ -458,7 +476,10 @@ type WalletController interface {
 	// the selected/validated inputs. It is in the caller's responsibility
 	// to lock the inputs before handing them out.
 	FundPsbt(packet *psbt.Packet, minConfs int32,
-		feeRate chainfee.SatPerKWeight, account string) (int32, error)
+		feeRate chainfee.SatPerKWeight, account string,
+		changeScope *waddrmgr.KeyScope,
+		strategy base.CoinSelectionStrategy,
+		allowUtxo func(wtxmgr.Credit) bool) (int32, error)
 
 	// SignPsbt expects a partial transaction with all inputs and outputs
 	// fully declared and tries to sign all unsigned inputs that have all
@@ -485,6 +506,12 @@ type WalletController interface {
 	// NOTE: This method does NOT publish the transaction after it's been
 	// finalized successfully.
 	FinalizePsbt(packet *psbt.Packet, account string) error
+
+	// DecorateInputs fetches the UTXO information of all inputs it can
+	// identify and adds the required information to the package's inputs.
+	// The failOnUnknown boolean controls whether the method should return
+	// an error if it cannot identify an input or if it should just skip it.
+	DecorateInputs(packet *psbt.Packet, failOnUnknown bool) error
 
 	// SubscribeTransactions returns a TransactionSubscription client which
 	// is capable of receiving async notifications as new transactions
@@ -520,6 +547,11 @@ type WalletController interface {
 	// which could be e.g. btcd, bitcoind, neutrino, or another consensus
 	// service.
 	BackEnd() string
+
+	// CheckMempoolAcceptance checks whether a transaction follows mempool
+	// policies and returns an error if it cannot be accepted into the
+	// mempool.
+	CheckMempoolAcceptance(tx *wire.MsgTx) error
 }
 
 // BlockChainIO is a dedicated source which will be used to obtain queries
@@ -552,6 +584,9 @@ type BlockChainIO interface {
 	// GetBlock returns the block in the main chain identified by the given
 	// hash.
 	GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error)
+
+	// GetBlockHeader returns the block header for the given block hash.
+	GetBlockHeader(blockHash *chainhash.Hash) (*wire.BlockHeader, error)
 }
 
 // MessageSigner represents an abstract object capable of signing arbitrary
@@ -565,6 +600,81 @@ type MessageSigner interface {
 	// the single or double SHA-256 of the passed message.
 	SignMessage(keyLoc keychain.KeyLocator, msg []byte,
 		doubleHash bool) (*ecdsa.Signature, error)
+}
+
+// AddrWithKey wraps a normal addr, but also includes the internal key for the
+// delivery addr if known.
+type AddrWithKey struct {
+	lnwire.DeliveryAddress
+
+	InternalKey fn.Option[keychain.KeyDescriptor]
+
+	// TODO(roasbeef): consolidate w/ instance in chan closer
+}
+
+// InternalKeyForAddr returns the internal key associated with a taproot
+// address.
+func InternalKeyForAddr(wallet WalletController, netParams *chaincfg.Params,
+	deliveryScript []byte) (fn.Option[keychain.KeyDescriptor], error) {
+
+	none := fn.None[keychain.KeyDescriptor]()
+
+	pkScript, err := txscript.ParsePkScript(deliveryScript)
+	if err != nil {
+		return none, err
+	}
+	addr, err := pkScript.Address(netParams)
+	if err != nil {
+		return none, err
+	}
+
+	// If it's not a taproot address, we don't require to know the internal
+	// key in the first place. So we don't return an error here, but also no
+	// internal key.
+	_, isTaproot := addr.(*btcutil.AddressTaproot)
+	if !isTaproot {
+		return none, nil
+	}
+
+	walletAddr, err := wallet.AddressInfo(addr)
+	if err != nil {
+		// If the error is that the address can't be found, it is not
+		// an error. This happens when any channel which is not a custom
+		// taproot channel is cooperatively closed to an external P2TR
+		// address. In this case there is no internal key associated
+		// with the address. Callers can use the .Option() method to get
+		// an option value.
+		var managerErr waddrmgr.ManagerError
+		if errors.As(err, &managerErr) &&
+			managerErr.ErrorCode == waddrmgr.ErrAddressNotFound {
+
+			return none, nil
+		}
+
+		return none, err
+	}
+
+	// No wallet addr. No error, but we'll return an nil error value here,
+	// as callers can use the .Option() method to get an option value.
+	if walletAddr == nil {
+		return none, nil
+	}
+
+	pubKeyAddr, ok := walletAddr.(waddrmgr.ManagedPubKeyAddress)
+	if !ok {
+		return none, fmt.Errorf("expected pubkey addr, got %T",
+			pubKeyAddr)
+	}
+
+	_, derivationPath, _ := pubKeyAddr.DerivationInfo()
+
+	return fn.Some[keychain.KeyDescriptor](keychain.KeyDescriptor{
+		KeyLocator: keychain.KeyLocator{
+			Family: keychain.KeyFamily(derivationPath.Account),
+			Index:  derivationPath.Index,
+		},
+		PubKey: pubKeyAddr.PubKey(),
+	}), nil
 }
 
 // WalletDriver represents a "driver" for a particular concrete
@@ -640,4 +750,92 @@ func SupportedWallets() []string {
 	}
 
 	return supportedWallets
+}
+
+// FetchFundingTxWrapper is a wrapper around FetchFundingTx, except that it will
+// exit when the supplied quit channel is closed.
+func FetchFundingTxWrapper(chain BlockChainIO, chanID *lnwire.ShortChannelID,
+	quit chan struct{}) (*wire.MsgTx, error) {
+
+	txChan := make(chan *wire.MsgTx, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		tx, err := FetchFundingTx(chain, chanID)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		txChan <- tx
+	}()
+
+	select {
+	case tx := <-txChan:
+		return tx, nil
+
+	case err := <-errChan:
+		return nil, err
+
+	case <-quit:
+		return nil, fmt.Errorf("quit channel passed to " +
+			"lnwallet.FetchFundingTxWrapper has been closed")
+	}
+}
+
+// FetchFundingTx uses the given BlockChainIO to fetch and return the funding
+// transaction identified by the passed short channel ID.
+//
+// TODO(roasbeef): replace with call to GetBlockTransaction? (would allow to
+// later use getblocktxn).
+func FetchFundingTx(chain BlockChainIO,
+	chanID *lnwire.ShortChannelID) (*wire.MsgTx, error) {
+
+	// First fetch the block hash by the block number encoded, then use
+	// that hash to fetch the block itself.
+	blockNum := int64(chanID.BlockHeight)
+	blockHash, err := chain.GetBlockHash(blockNum)
+	if err != nil {
+		return nil, err
+	}
+
+	fundingBlock, err := chain.GetBlock(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// As a sanity check, ensure that the advertised transaction index is
+	// within the bounds of the total number of transactions within a
+	// block.
+	numTxns := uint32(len(fundingBlock.Transactions))
+	if chanID.TxIndex > numTxns-1 {
+		return nil, fmt.Errorf("tx_index=#%v "+
+			"is out of range (max_index=%v), network_chan_id=%v",
+			chanID.TxIndex, numTxns-1, chanID)
+	}
+
+	return fundingBlock.Transactions[chanID.TxIndex].Copy(), nil
+}
+
+// FetchPKScriptWithQuit fetches the output script for the given SCID and exits
+// early with an error if the provided quit channel is closed before
+// completion.
+func FetchPKScriptWithQuit(chain BlockChainIO, chanID *lnwire.ShortChannelID,
+	quit chan struct{}) ([]byte, error) {
+
+	tx, err := FetchFundingTxWrapper(chain, chanID, quit)
+	if err != nil {
+		return nil, err
+	}
+
+	outputLocator := chanvalidate.ShortChanIDChanLocator{
+		ID: *chanID,
+	}
+
+	output, _, err := outputLocator.Locate(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	return output.PkScript, nil
 }

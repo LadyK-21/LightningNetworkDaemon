@@ -9,7 +9,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
@@ -24,7 +23,7 @@ var (
 	serialNumberLimit = new(big.Int).Lsh(big.NewInt(1), 128)
 )
 
-// ipAddresses returns the parserd IP addresses to use when creating the TLS
+// ipAddresses returns the parsed IP addresses to use when creating the TLS
 // certificate. If tlsDisableAutofill is true, we don't include interface
 // addresses to protect users privacy.
 func ipAddresses(tlsExtraIPs []string, tlsDisableAutofill bool) ([]net.IP,
@@ -72,7 +71,7 @@ func ipAddresses(tlsExtraIPs []string, tlsDisableAutofill bool) ([]net.IP,
 }
 
 // dnsNames returns the host and DNS names to use when creating the TLS
-// ceftificate.
+// certificate.
 func dnsNames(tlsExtraDomains []string, tlsDisableAutofill bool) (string,
 	[]string) {
 
@@ -200,9 +199,9 @@ func IsOutdated(cert *x509.Certificate, tlsExtraIPs,
 //
 // This function is adapted from https://github.com/btcsuite/btcd and
 // https://github.com/btcsuite/btcd/btcutil
-func GenCertPair(org, certFile, keyFile string, tlsExtraIPs,
-	tlsExtraDomains []string, tlsDisableAutofill bool,
-	certValidity time.Duration) ([]byte, []byte, error) {
+func GenCertPair(org string, tlsExtraIPs, tlsExtraDomains []string,
+	tlsDisableAutofill bool, certValidity time.Duration) (
+	[]byte, []byte, error) {
 
 	now := time.Now()
 	validUntil := now.Add(certValidity)
@@ -261,7 +260,7 @@ func GenCertPair(org, certFile, keyFile string, tlsExtraIPs,
 		&template, &priv.PublicKey, priv,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create certificate: %v",
+		return nil, nil, fmt.Errorf("failed to create certificate: %w",
 			err)
 	}
 
@@ -270,13 +269,13 @@ func GenCertPair(org, certFile, keyFile string, tlsExtraIPs,
 		certBuf, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes},
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode certificate: %v",
+		return nil, nil, fmt.Errorf("failed to encode certificate: %w",
 			err)
 	}
 
 	keybytes, err := x509.MarshalECPrivateKey(priv)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to encode privkey: %v",
+		return nil, nil, fmt.Errorf("unable to encode privkey: %w",
 			err)
 	}
 	keyBuf := &bytes.Buffer{}
@@ -284,7 +283,7 @@ func GenCertPair(org, certFile, keyFile string, tlsExtraIPs,
 		keyBuf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keybytes},
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode private key: %v",
+		return nil, nil, fmt.Errorf("failed to encode private key: %w",
 			err)
 	}
 
@@ -295,14 +294,14 @@ func GenCertPair(org, certFile, keyFile string, tlsExtraIPs,
 func WriteCertPair(certFile, keyFile string, certBytes, keyBytes []byte) error {
 	// Write cert and key files.
 	if certFile != "" {
-		err := ioutil.WriteFile(certFile, certBytes, 0644)
+		err := os.WriteFile(certFile, certBytes, 0644)
 		if err != nil {
 			return err
 		}
 	}
 
 	if keyFile != "" {
-		err := ioutil.WriteFile(keyFile, keyBytes, 0600)
+		err := os.WriteFile(keyFile, keyBytes, 0600)
 		if err != nil {
 			os.Remove(certFile)
 			return err

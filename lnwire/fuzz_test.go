@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // prefixWithMsgType takes []byte and adds a wire protocol prefix
@@ -18,12 +19,18 @@ func prefixWithMsgType(data []byte, prefix MessageType) []byte {
 	return data
 }
 
-// harness performs the actual fuzz testing of the appropriate wire message.
-// This function will check that the passed-in message passes wire length
-// checks, is a valid message once deserialized, and passes a sequence of
+// assertEqualFunc is a function used to assert that two deserialized messages
+// are equivalent.
+type assertEqualFunc func(t *testing.T, x, y any)
+
+// wireMsgHarnessCustom performs the actual fuzz testing of the appropriate wire
+// message. This function will check that the passed-in message passes wire
+// length checks, is a valid message once deserialized, and passes a sequence of
 // serialization and deserialization checks.
-func harness(t *testing.T, data []byte) {
-	t.Helper()
+func wireMsgHarnessCustom(t *testing.T, data []byte, msgType MessageType,
+	assertEqual assertEqualFunc) {
+
+	data = prefixWithMsgType(data, msgType)
 
 	// Create a reader with the byte array.
 	r := bytes.NewReader(data)
@@ -41,576 +48,243 @@ func harness(t *testing.T, data []byte) {
 
 	// We will serialize the message into a new bytes buffer.
 	var b bytes.Buffer
-	if _, err := WriteMessage(&b, msg, 0); err != nil {
-		// Could not serialize message into bytes buffer, panic
-		t.Fatal(err)
-	}
+	_, err = WriteMessage(&b, msg, 0)
+	require.NoError(t, err)
 
 	// Deserialize the message from the serialized bytes buffer, and then
 	// assert that the original message is equal to the newly deserialized
 	// message.
 	newMsg, err := ReadMessage(&b, 0)
-	if err != nil {
-		// Could not deserialize message from bytes buffer, panic
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	if !reflect.DeepEqual(msg, newMsg) {
-		// Deserialized message and original message are not deeply
-		// equal.
-		t.Fatal("original message and deserialized message are not " +
-			"deeply equal")
+	assertEqual(t, msg, newMsg)
+}
+
+func wireMsgHarness(t *testing.T, data []byte, msgType MessageType) {
+	t.Helper()
+	assertEq := func(t *testing.T, x, y any) {
+		require.Equal(t, x, y)
 	}
+	wireMsgHarnessCustom(t, data, msgType, assertEq)
 }
 
 func FuzzAcceptChannel(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		data = prefixWithMsgType(data, MsgAcceptChannel)
-		// Create a reader with the byte array.
-		r := bytes.NewReader(data)
+		// We can't use require.Equal for UpfrontShutdownScript, since
+		// we consider the empty slice and nil to be equivalent.
+		assertEq := func(t *testing.T, x, y any) {
+			require.IsType(t, &AcceptChannel{}, x)
+			first, _ := x.(*AcceptChannel)
+			require.IsType(t, &AcceptChannel{}, y)
+			second, _ := y.(*AcceptChannel)
 
-		// Make sure byte array length (excluding 2 bytes for message
-		// type) is less than max payload size for the wire message.
-		payloadLen := uint32(len(data)) - 2
-		if payloadLen > MaxMsgBody {
-			return
+			require.True(
+				t, bytes.Equal(
+					first.UpfrontShutdownScript,
+					second.UpfrontShutdownScript,
+				),
+			)
+			first.UpfrontShutdownScript = nil
+			second.UpfrontShutdownScript = nil
+
+			require.Equal(t, first, second)
 		}
 
-		msg, err := ReadMessage(r, 0)
-		if err != nil {
-			return
-		}
-
-		// We will serialize the message into a new bytes buffer.
-		var b bytes.Buffer
-		if _, err := WriteMessage(&b, msg, 0); err != nil {
-			// Could not serialize message into bytes buffer, panic
-			t.Fatal(err)
-		}
-
-		// Deserialize the message from the serialized bytes buffer, and
-		// then assert that the original message is equal to the newly
-		// deserialized message.
-		newMsg, err := ReadMessage(&b, 0)
-		if err != nil {
-			// Could not deserialize message from bytes buffer,
-			// panic
-			t.Fatal(err)
-		}
-
-		// Now compare every field instead of using reflect.DeepEqual.
-		// For UpfrontShutdownScript, we only compare bytes. This
-		// probably takes up more branches than necessary, but that's
-		// fine for now.
-		var shouldPanic bool
-		first, ok := msg.(*AcceptChannel)
-		if !ok {
-			t.Fatal("message was not AcceptChannel")
-		}
-		second, ok := newMsg.(*AcceptChannel)
-		if !ok {
-			t.Fatal("new message was not AcceptChannel")
-		}
-
-		if !bytes.Equal(first.PendingChannelID[:],
-			second.PendingChannelID[:]) {
-
-			shouldPanic = true
-		}
-
-		if first.DustLimit != second.DustLimit {
-			shouldPanic = true
-		}
-
-		if first.MaxValueInFlight != second.MaxValueInFlight {
-			shouldPanic = true
-		}
-
-		if first.ChannelReserve != second.ChannelReserve {
-			shouldPanic = true
-		}
-
-		if first.HtlcMinimum != second.HtlcMinimum {
-			shouldPanic = true
-		}
-
-		if first.MinAcceptDepth != second.MinAcceptDepth {
-			shouldPanic = true
-		}
-
-		if first.CsvDelay != second.CsvDelay {
-			shouldPanic = true
-		}
-
-		if first.MaxAcceptedHTLCs != second.MaxAcceptedHTLCs {
-			shouldPanic = true
-		}
-
-		if !first.FundingKey.IsEqual(second.FundingKey) {
-			shouldPanic = true
-		}
-
-		if !first.RevocationPoint.IsEqual(second.RevocationPoint) {
-			shouldPanic = true
-		}
-
-		if !first.PaymentPoint.IsEqual(second.PaymentPoint) {
-			shouldPanic = true
-		}
-
-		if !first.DelayedPaymentPoint.IsEqual(
-			second.DelayedPaymentPoint) {
-
-			shouldPanic = true
-		}
-
-		if !first.HtlcPoint.IsEqual(second.HtlcPoint) {
-			shouldPanic = true
-		}
-
-		if !first.FirstCommitmentPoint.IsEqual(
-			second.FirstCommitmentPoint) {
-
-			shouldPanic = true
-		}
-
-		if !bytes.Equal(first.UpfrontShutdownScript,
-			second.UpfrontShutdownScript) {
-
-			shouldPanic = true
-		}
-
-		if shouldPanic {
-			t.Fatal("original message and deseralized message " +
-				"are not equal")
-		}
+		wireMsgHarnessCustom(t, data, MsgAcceptChannel, assertEq)
 	})
 }
 
 func FuzzAnnounceSignatures(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgAnnounceSignatures.
-		data = prefixWithMsgType(data, MsgAnnounceSignatures)
+		wireMsgHarness(t, data, MsgAnnounceSignatures)
+	})
+}
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+func FuzzAnnounceSignatures2(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgAnnounceSignatures2)
 	})
 }
 
 func FuzzChannelAnnouncement(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgChannelAnnouncement.
-		data = prefixWithMsgType(data, MsgChannelAnnouncement)
+		wireMsgHarness(t, data, MsgChannelAnnouncement)
+	})
+}
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+func FuzzChannelAnnouncement2(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// We can't use require.Equal for Features, since we consider
+		// the empty map and nil to be equivalent.
+		assertEq := func(t *testing.T, x, y any) {
+			require.IsType(t, &ChannelAnnouncement2{}, x)
+			first, _ := x.(*ChannelAnnouncement2)
+			require.IsType(t, &ChannelAnnouncement2{}, y)
+			second, _ := y.(*ChannelAnnouncement2)
+
+			require.True(
+				t,
+				first.Features.Val.Equals(&second.Features.Val),
+			)
+			first.Features.Val = *NewRawFeatureVector()
+			second.Features.Val = *NewRawFeatureVector()
+
+			require.Equal(t, first, second)
+		}
+
+		wireMsgHarnessCustom(t, data, MsgChannelAnnouncement2, assertEq)
 	})
 }
 
 func FuzzChannelReestablish(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgChannelReestablish.
-		data = prefixWithMsgType(data, MsgChannelReestablish)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgChannelReestablish)
 	})
 }
 
 func FuzzChannelUpdate(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgChannelUpdate.
-		data = prefixWithMsgType(data, MsgChannelUpdate)
+		wireMsgHarness(t, data, MsgChannelUpdate)
+	})
+}
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+func FuzzChannelUpdate2(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgChannelUpdate2)
 	})
 }
 
 func FuzzClosingSigned(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgClosingSigned.
-		data = prefixWithMsgType(data, MsgClosingSigned)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgClosingSigned)
 	})
 }
 
 func FuzzCommitSig(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgCommitSig.
-		data = prefixWithMsgType(data, MsgCommitSig)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgCommitSig)
 	})
 }
 
 func FuzzError(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgError.
-		data = prefixWithMsgType(data, MsgError)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgError)
 	})
 }
 
 func FuzzWarning(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgWarning.
-		data = prefixWithMsgType(data, MsgWarning)
+		wireMsgHarness(t, data, MsgWarning)
+	})
+}
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+func FuzzStfu(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgStfu)
 	})
 }
 
 func FuzzFundingCreated(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgFundingCreated.
-		data = prefixWithMsgType(data, MsgFundingCreated)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgFundingCreated)
 	})
 }
 
-func FuzzFundingLocked(f *testing.F) {
+func FuzzChannelReady(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgFundingLocked.
-		data = prefixWithMsgType(data, MsgFundingLocked)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgChannelReady)
 	})
 }
 
 func FuzzFundingSigned(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgFundingSigned.
-		data = prefixWithMsgType(data, MsgFundingSigned)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgFundingSigned)
 	})
 }
 
 func FuzzGossipTimestampRange(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgGossipTimestampRange.
-		data = prefixWithMsgType(data, MsgGossipTimestampRange)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgGossipTimestampRange)
 	})
 }
 
 func FuzzInit(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgInit.
-		data = prefixWithMsgType(data, MsgInit)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgInit)
 	})
 }
 
 func FuzzNodeAnnouncement(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgNodeAnnouncement.
-		data = prefixWithMsgType(data, MsgNodeAnnouncement)
+		// We can't use require.Equal for Addresses, since the same IP
+		// can be represented by different underlying bytes. Instead, we
+		// compare the normalized string representation of each address.
+		assertEq := func(t *testing.T, x, y any) {
+			require.IsType(t, &NodeAnnouncement{}, x)
+			first, _ := x.(*NodeAnnouncement)
+			require.IsType(t, &NodeAnnouncement{}, y)
+			second, _ := y.(*NodeAnnouncement)
 
-		// We have to do this here instead of in harness so that
-		// reflect.DeepEqual isn't called. Address (de)serialization
-		// messes up the fuzzing assertions.
-
-		// Create a reader with the byte array.
-		r := bytes.NewReader(data)
-
-		// Make sure byte array length (excluding 2 bytes for message
-		// type) is less than max payload size for the wire message.
-		payloadLen := uint32(len(data)) - 2
-		if payloadLen > MaxMsgBody {
-			return
-		}
-
-		msg, err := ReadMessage(r, 0)
-		if err != nil {
-			return
-		}
-
-		// We will serialize the message into a new bytes buffer.
-		var b bytes.Buffer
-		if _, err := WriteMessage(&b, msg, 0); err != nil {
-			// Could not serialize message into bytes buffer, panic
-			t.Fatal(err)
-		}
-
-		// Deserialize the message from the serialized bytes buffer, and
-		// then assert that the original message is equal to the newly
-		// deserialized message.
-		newMsg, err := ReadMessage(&b, 0)
-		if err != nil {
-			// Could not deserialize message from bytes buffer,
-			// panic
-			t.Fatal(err)
-		}
-
-		// Now compare every field instead of using reflect.DeepEqual
-		// for the Addresses field.
-		var shouldPanic bool
-		first, ok := msg.(*NodeAnnouncement)
-		if !ok {
-			t.Fatal("message was not NodeAnnouncement")
-		}
-		second, ok := newMsg.(*NodeAnnouncement)
-		if !ok {
-			t.Fatal("new message was not NodeAnnouncement")
-		}
-
-		if !bytes.Equal(first.Signature[:], second.Signature[:]) {
-			shouldPanic = true
-		}
-
-		if !reflect.DeepEqual(first.Features, second.Features) {
-			shouldPanic = true
-		}
-
-		if first.Timestamp != second.Timestamp {
-			shouldPanic = true
-		}
-
-		if !bytes.Equal(first.NodeID[:], second.NodeID[:]) {
-			shouldPanic = true
-		}
-
-		if !reflect.DeepEqual(first.RGBColor, second.RGBColor) {
-			shouldPanic = true
-		}
-
-		if !bytes.Equal(first.Alias[:], second.Alias[:]) {
-			shouldPanic = true
-		}
-
-		if len(first.Addresses) != len(second.Addresses) {
-			shouldPanic = true
-		}
-
-		for i := range first.Addresses {
-			if first.Addresses[i].String() !=
-				second.Addresses[i].String() {
-
-				shouldPanic = true
-				break
+			require.Equal(
+				t, len(first.Addresses), len(second.Addresses),
+			)
+			for i := range first.Addresses {
+				require.Equal(
+					t, first.Addresses[i].String(),
+					second.Addresses[i].String(),
+				)
 			}
+			first.Addresses = nil
+			second.Addresses = nil
+
+			require.Equal(t, first, second)
 		}
 
-		if !reflect.DeepEqual(first.ExtraOpaqueData,
-			second.ExtraOpaqueData) {
-
-			shouldPanic = true
-		}
-
-		if shouldPanic {
-			t.Fatal("original message and deserialized message " +
-				"are not equal")
-		}
+		wireMsgHarnessCustom(t, data, MsgNodeAnnouncement, assertEq)
 	})
 }
 
 func FuzzOpenChannel(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgOpenChannel.
-		data = prefixWithMsgType(data, MsgOpenChannel)
+		// We can't use require.Equal for UpfrontShutdownScript, since
+		// we consider the empty slice and nil to be equivalent.
+		assertEq := func(t *testing.T, x, y any) {
+			require.IsType(t, &OpenChannel{}, x)
+			first, _ := x.(*OpenChannel)
+			require.IsType(t, &OpenChannel{}, y)
+			second, _ := y.(*OpenChannel)
 
-		// We have to do this here instead of in harness so that
-		// reflect.DeepEqual isn't called. Because of the
-		// UpfrontShutdownScript encoding, the first message and second
-		// message aren't deeply equal since the first has a nil slice
-		// and the other has an empty slice.
+			require.True(
+				t, bytes.Equal(
+					first.UpfrontShutdownScript,
+					second.UpfrontShutdownScript,
+				),
+			)
+			first.UpfrontShutdownScript = nil
+			second.UpfrontShutdownScript = nil
 
-		// Create a reader with the byte array.
-		r := bytes.NewReader(data)
-
-		// Make sure byte array length (excluding 2 bytes for message
-		// type) is less than max payload size for the wire message.
-		payloadLen := uint32(len(data)) - 2
-		if payloadLen > MaxMsgBody {
-			return
+			require.Equal(t, first, second)
 		}
 
-		msg, err := ReadMessage(r, 0)
-		if err != nil {
-			return
-		}
-
-		// We will serialize the message into a new bytes buffer.
-		var b bytes.Buffer
-		if _, err := WriteMessage(&b, msg, 0); err != nil {
-			// Could not serialize message into bytes buffer, panic
-			t.Fatal(err)
-		}
-
-		// Deserialize the message from the serialized bytes buffer, and
-		// then assert that the original message is equal to the newly
-		// deserialized message.
-		newMsg, err := ReadMessage(&b, 0)
-		if err != nil {
-			// Could not deserialize message from bytes buffer,
-			// panic
-			t.Fatal(err)
-		}
-
-		// Now compare every field instead of using reflect.DeepEqual.
-		// For UpfrontShutdownScript, we only compare bytes. This
-		// probably takes up more branches than necessary, but that's
-		// fine for now.
-		var shouldPanic bool
-		first, ok := msg.(*OpenChannel)
-		if !ok {
-			t.Fatal("message was not OpenChannel")
-		}
-		second, ok := newMsg.(*OpenChannel)
-		if !ok {
-			t.Fatal("new message was not OpenChannel")
-		}
-
-		if !first.ChainHash.IsEqual(&second.ChainHash) {
-			shouldPanic = true
-		}
-
-		if !bytes.Equal(first.PendingChannelID[:],
-			second.PendingChannelID[:]) {
-
-			shouldPanic = true
-		}
-
-		if first.FundingAmount != second.FundingAmount {
-			shouldPanic = true
-		}
-
-		if first.PushAmount != second.PushAmount {
-			shouldPanic = true
-		}
-
-		if first.DustLimit != second.DustLimit {
-			shouldPanic = true
-		}
-
-		if first.MaxValueInFlight != second.MaxValueInFlight {
-			shouldPanic = true
-		}
-
-		if first.ChannelReserve != second.ChannelReserve {
-			shouldPanic = true
-		}
-
-		if first.HtlcMinimum != second.HtlcMinimum {
-			shouldPanic = true
-		}
-
-		if first.FeePerKiloWeight != second.FeePerKiloWeight {
-			shouldPanic = true
-		}
-
-		if first.CsvDelay != second.CsvDelay {
-			shouldPanic = true
-		}
-
-		if first.MaxAcceptedHTLCs != second.MaxAcceptedHTLCs {
-			shouldPanic = true
-		}
-
-		if !first.FundingKey.IsEqual(second.FundingKey) {
-			shouldPanic = true
-		}
-
-		if !first.RevocationPoint.IsEqual(second.RevocationPoint) {
-			shouldPanic = true
-		}
-
-		if !first.PaymentPoint.IsEqual(second.PaymentPoint) {
-			shouldPanic = true
-		}
-
-		if !first.DelayedPaymentPoint.IsEqual(
-			second.DelayedPaymentPoint) {
-
-			shouldPanic = true
-		}
-
-		if !first.HtlcPoint.IsEqual(second.HtlcPoint) {
-			shouldPanic = true
-		}
-
-		if !first.FirstCommitmentPoint.IsEqual(
-			second.FirstCommitmentPoint) {
-
-			shouldPanic = true
-		}
-
-		if first.ChannelFlags != second.ChannelFlags {
-			shouldPanic = true
-		}
-
-		if !bytes.Equal(first.UpfrontShutdownScript,
-			second.UpfrontShutdownScript) {
-
-			shouldPanic = true
-		}
-
-		if shouldPanic {
-			t.Fatal("original message and deserialized message " +
-				"are not equal")
-		}
+		wireMsgHarnessCustom(t, data, MsgOpenChannel, assertEq)
 	})
 }
 
 func FuzzPing(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgPing.
-		data = prefixWithMsgType(data, MsgPing)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgPing)
 	})
 }
 
 func FuzzPong(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgPong.
-		data = prefixWithMsgType(data, MsgPong)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgPong)
 	})
 }
 
 func FuzzQueryChannelRange(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgQueryChannelRange.
-		data = prefixWithMsgType(data, MsgQueryChannelRange)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgQueryChannelRange)
 	})
 }
 
@@ -619,15 +293,10 @@ func FuzzZlibQueryShortChanIDs(f *testing.F) {
 		var buf bytes.Buffer
 		zlibWriter := zlib.NewWriter(&buf)
 		_, err := zlibWriter.Write(data)
-		if err != nil {
-			// Zlib bug?
-			t.Fatal(err)
-		}
+		require.NoError(t, err) // Zlib bug?
 
-		if err := zlibWriter.Close(); err != nil {
-			// Zlib bug?
-			t.Fatal(err)
-		}
+		err = zlibWriter.Close()
+		require.NoError(t, err) // Zlib bug?
 
 		compressedPayload := buf.Bytes()
 
@@ -643,23 +312,13 @@ func FuzzZlibQueryShortChanIDs(f *testing.F) {
 		payload = append(payload, zlibByte...)
 		payload = append(payload, compressedPayload...)
 
-		// Prefix with MsgQueryShortChanIDs.
-		payload = prefixWithMsgType(payload, MsgQueryShortChanIDs)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, payload)
+		wireMsgHarness(t, payload, MsgQueryShortChanIDs)
 	})
 }
 
 func FuzzQueryShortChanIDs(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgQueryShortChanIDs.
-		data = prefixWithMsgType(data, MsgQueryShortChanIDs)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgQueryShortChanIDs)
 	})
 }
 
@@ -668,15 +327,10 @@ func FuzzZlibReplyChannelRange(f *testing.F) {
 		var buf bytes.Buffer
 		zlibWriter := zlib.NewWriter(&buf)
 		_, err := zlibWriter.Write(data)
-		if err != nil {
-			// Zlib bug?
-			t.Fatal(err)
-		}
+		require.NoError(t, err) // Zlib bug?
 
-		if err := zlibWriter.Close(); err != nil {
-			// Zlib bug?
-			t.Fatal(err)
-		}
+		err = zlibWriter.Close()
+		require.NoError(t, err) // Zlib bug?
 
 		compressedPayload := buf.Bytes()
 
@@ -700,110 +354,426 @@ func FuzzZlibReplyChannelRange(f *testing.F) {
 		payload = append(payload, zlibByte...)
 		payload = append(payload, compressedPayload...)
 
-		// Prefix with MsgReplyChannelRange.
-		payload = prefixWithMsgType(payload, MsgReplyChannelRange)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, payload)
+		wireMsgHarness(t, payload, MsgReplyChannelRange)
 	})
 }
 
 func FuzzReplyChannelRange(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgReplyChannelRange.
-		data = prefixWithMsgType(data, MsgReplyChannelRange)
+		// We can't use require.Equal for Timestamps, since we consider
+		// the empty slice and nil to be equivalent.
+		assertEq := func(t *testing.T, x, y any) {
+			require.IsType(t, &ReplyChannelRange{}, x)
+			first, _ := x.(*ReplyChannelRange)
+			require.IsType(t, &ReplyChannelRange{}, y)
+			second, _ := y.(*ReplyChannelRange)
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+			require.Equal(
+				t, len(first.Timestamps),
+				len(second.Timestamps),
+			)
+			for i, ts1 := range first.Timestamps {
+				ts2 := second.Timestamps[i]
+				require.Equal(t, ts1, ts2)
+			}
+			first.Timestamps = nil
+			second.Timestamps = nil
+
+			require.Equal(t, first, second)
+		}
+
+		wireMsgHarnessCustom(t, data, MsgReplyChannelRange, assertEq)
 	})
 }
 
 func FuzzReplyShortChanIDsEnd(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgReplyShortChanIDsEnd.
-		data = prefixWithMsgType(data, MsgReplyShortChanIDsEnd)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgReplyShortChanIDsEnd)
 	})
 }
 
 func FuzzRevokeAndAck(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgRevokeAndAck.
-		data = prefixWithMsgType(data, MsgRevokeAndAck)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgRevokeAndAck)
 	})
 }
 
 func FuzzShutdown(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgShutdown.
-		data = prefixWithMsgType(data, MsgShutdown)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgShutdown)
 	})
 }
 
 func FuzzUpdateAddHTLC(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgUpdateAddHTLC.
-		data = prefixWithMsgType(data, MsgUpdateAddHTLC)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgUpdateAddHTLC)
 	})
 }
 
 func FuzzUpdateFailHTLC(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgUpdateFailHTLC.
-		data = prefixWithMsgType(data, MsgUpdateFailHTLC)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgUpdateFailHTLC)
 	})
 }
 
 func FuzzUpdateFailMalformedHTLC(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgUpdateFailMalformedHTLC.
-		data = prefixWithMsgType(data, MsgUpdateFailMalformedHTLC)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgUpdateFailMalformedHTLC)
 	})
 }
 
 func FuzzUpdateFee(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgUpdateFee.
-		data = prefixWithMsgType(data, MsgUpdateFee)
-
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+		wireMsgHarness(t, data, MsgUpdateFee)
 	})
 }
 
 func FuzzUpdateFulfillHTLC(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Prefix with MsgUpdateFulFillHTLC.
-		data = prefixWithMsgType(data, MsgUpdateFulfillHTLC)
+		wireMsgHarness(t, data, MsgUpdateFulfillHTLC)
+	})
+}
 
-		// Pass the message into our general fuzz harness for wire
-		// messages!
-		harness(t, data)
+func FuzzDynPropose(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgDynPropose)
+	})
+}
+
+func FuzzDynReject(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgDynReject)
+	})
+}
+
+func FuzzDynAck(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgDynAck)
+	})
+}
+
+func FuzzKickoffSig(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgKickoffSig)
+	})
+}
+
+func FuzzCustomMessage(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte, customMessageType uint16) {
+		if customMessageType < uint16(CustomTypeStart) {
+			customMessageType += uint16(CustomTypeStart)
+		}
+
+		wireMsgHarness(t, data, MessageType(customMessageType))
+	})
+}
+
+// FuzzParseRawSignature tests that our DER-encoded signature parsing does not
+// panic for arbitrary inputs and that serializing and reparsing the signatures
+// does not mutate them.
+func FuzzParseRawSignature(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		sig, err := NewSigFromECDSARawSignature(data)
+		if err != nil {
+			return
+		}
+
+		sig2, err := NewSigFromECDSARawSignature(sig.ToSignatureBytes())
+		require.NoError(t, err, "failed to reparse signature")
+
+		require.Equal(t, sig, sig2, "signature mismatch")
+	})
+}
+
+// FuzzConvertFixedSignature tests that conversion of fixed 64-byte signatures
+// to DER-encoded signatures does not panic and that parsing and reconverting
+// the signatures does not mutate them.
+func FuzzConvertFixedSignature(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var sig Sig
+		if len(data) > len(sig.bytes[:]) {
+			return
+		}
+		copy(sig.bytes[:], data)
+
+		derSig, err := sig.ToSignature()
+		if err != nil {
+			return
+		}
+
+		sig2, err := NewSigFromSignature(derSig)
+		require.NoError(t, err, "failed to parse signature")
+
+		derSig2, err := sig2.ToSignature()
+		require.NoError(t, err, "failed to reconvert signature to DER")
+
+		derBytes := derSig.Serialize()
+		derBytes2 := derSig2.Serialize()
+		require.Equal(t, derBytes, derBytes2, "signature mismatch")
+	})
+}
+
+// FuzzConvertFixedSchnorrSignature tests that conversion of fixed 64-byte
+// Schnorr signatures to and from the btcec format does not panic or mutate the
+// signatures.
+func FuzzConvertFixedSchnorrSignature(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var sig Sig
+		if len(data) > len(sig.bytes[:]) {
+			return
+		}
+		copy(sig.bytes[:], data)
+		sig.ForceSchnorr()
+
+		btcecSig, err := sig.ToSignature()
+		if err != nil {
+			return
+		}
+
+		sig2, err := NewSigFromSignature(btcecSig)
+		require.NoError(t, err, "failed to parse signature")
+
+		btcecSig2, err := sig2.ToSignature()
+		require.NoError(
+			t, err, "failed to reconvert signature to btcec format",
+		)
+
+		btcecBytes := btcecSig.Serialize()
+		btcecBytes2 := btcecSig2.Serialize()
+		require.Equal(t, btcecBytes, btcecBytes2, "signature mismatch")
+	})
+}
+
+// prefixWithFailCode adds a failure code prefix to data.
+func prefixWithFailCode(data []byte, code FailCode) []byte {
+	var codeBytes [2]byte
+	binary.BigEndian.PutUint16(codeBytes[:], uint16(code))
+	data = append(codeBytes[:], data...)
+
+	return data
+}
+
+// onionFailureHarnessCustom performs the actual fuzz testing of the appropriate
+// onion failure message. This function will check that the passed-in message
+// passes wire length checks, is a valid message once deserialized, and passes a
+// sequence of serialization and deserialization checks.
+func onionFailureHarnessCustom(t *testing.T, data []byte, code FailCode,
+	assertEqual assertEqualFunc) {
+
+	data = prefixWithFailCode(data, code)
+
+	// Don't waste time fuzzing messages larger than we'll ever accept.
+	if len(data) > MaxSliceLength {
+		return
+	}
+
+	// First check whether the failure message can be decoded.
+	r := bytes.NewReader(data)
+	msg, err := DecodeFailureMessage(r, 0)
+	if err != nil {
+		return
+	}
+
+	// We now have a valid decoded message. Verify that encoding and
+	// decoding the message does not mutate it.
+
+	var b bytes.Buffer
+	err = EncodeFailureMessage(&b, msg, 0)
+	require.NoError(t, err, "failed to encode failure message")
+
+	newMsg, err := DecodeFailureMessage(&b, 0)
+	require.NoError(t, err, "failed to decode serialized failure message")
+
+	assertEqual(t, msg, newMsg)
+
+	// Now verify that encoding/decoding full packets works as expected.
+
+	var pktBuf bytes.Buffer
+	if err := EncodeFailure(&pktBuf, msg, 0); err != nil {
+		// EncodeFailure returns an error if the encoded message would
+		// exceed FailureMessageLength bytes, as LND always encodes
+		// fixed-size packets for privacy. But it is valid to decode
+		// messages longer than this, so we should not report an error
+		// if the original message was longer.
+		//
+		// We add 2 to the length of the original message since it may
+		// have omitted a channel_update type prefix of 2 bytes. When
+		// we re-encode such a message, we will add the 2-byte prefix
+		// as prescribed by the spec.
+		if len(data)+2 > FailureMessageLength {
+			return
+		}
+
+		t.Fatalf("failed to encode failure packet: %v", err)
+	}
+
+	// We should use FailureMessageLength sized packets plus 2 bytes to
+	// encode the message length and 2 bytes to encode the padding length,
+	// as recommended by the spec.
+	require.Equal(
+		t, pktBuf.Len(), FailureMessageLength+4,
+		"wrong failure message length",
+	)
+
+	pktMsg, err := DecodeFailure(&pktBuf, 0)
+	require.NoError(t, err, "failed to decode failure packet")
+
+	assertEqual(t, msg, pktMsg)
+}
+
+func onionFailureHarness(t *testing.T, data []byte, code FailCode) {
+	t.Helper()
+	assertEq := func(t *testing.T, x, y any) {
+		require.Equal(t, x, y)
+	}
+	onionFailureHarnessCustom(t, data, code, assertEq)
+}
+
+func FuzzFailIncorrectDetails(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Since FailIncorrectDetails.Decode can leave extraOpaqueData
+		// as nil while FailIncorrectDetails.Encode writes an empty
+		// slice, we need to use a custom equality function.
+		assertEq := func(t *testing.T, x, y any) {
+			msg1, ok := x.(*FailIncorrectDetails)
+			require.True(
+				t, ok, "msg1 was not FailIncorrectDetails",
+			)
+
+			msg2, ok := y.(*FailIncorrectDetails)
+			require.True(
+				t, ok, "msg2 was not FailIncorrectDetails",
+			)
+
+			require.Equal(t, msg1.amount, msg2.amount)
+			require.Equal(t, msg1.height, msg2.height)
+			require.True(
+				t, bytes.Equal(
+					msg1.extraOpaqueData,
+					msg2.extraOpaqueData,
+				),
+			)
+		}
+
+		onionFailureHarnessCustom(
+			t, data, CodeIncorrectOrUnknownPaymentDetails, assertEq,
+		)
+	})
+}
+
+func FuzzFailInvalidOnionVersion(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeInvalidOnionVersion)
+	})
+}
+
+func FuzzFailInvalidOnionHmac(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeInvalidOnionHmac)
+	})
+}
+
+func FuzzFailInvalidOnionKey(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeInvalidOnionKey)
+	})
+}
+
+func FuzzFailTemporaryChannelFailure(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeTemporaryChannelFailure)
+	})
+}
+
+func FuzzFailAmountBelowMinimum(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeAmountBelowMinimum)
+	})
+}
+
+func FuzzFailFeeInsufficient(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeFeeInsufficient)
+	})
+}
+
+func FuzzFailIncorrectCltvExpiry(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeIncorrectCltvExpiry)
+	})
+}
+
+func FuzzFailExpiryTooSoon(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeExpiryTooSoon)
+	})
+}
+
+func FuzzFailChannelDisabled(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeChannelDisabled)
+	})
+}
+
+func FuzzFailFinalIncorrectCltvExpiry(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeFinalIncorrectCltvExpiry)
+	})
+}
+
+func FuzzFailFinalIncorrectHtlcAmount(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeFinalIncorrectHtlcAmount)
+	})
+}
+
+func FuzzInvalidOnionPayload(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeInvalidOnionPayload)
+	})
+}
+
+func FuzzFailInvalidBlinding(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		onionFailureHarness(t, data, CodeInvalidBlinding)
+	})
+}
+
+func FuzzClosingSig(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgClosingSig)
+	})
+}
+
+func FuzzClosingComplete(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		wireMsgHarness(t, data, MsgClosingComplete)
+	})
+}
+
+// FuzzFee tests that decoding and re-encoding a Fee TLV does not mutate it.
+func FuzzFee(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8 {
+			return
+		}
+
+		var fee Fee
+		var buf [8]byte
+		r := bytes.NewReader(data)
+
+		if err := feeDecoder(r, &fee, &buf, 8); err != nil {
+			return
+		}
+
+		var b bytes.Buffer
+		require.NoError(t, feeEncoder(&b, &fee, &buf))
+
+		// Use bytes.Equal instead of require.Equal so that nil and
+		// empty slices are considered equal.
+		require.True(
+			t, bytes.Equal(data, b.Bytes()), "%v != %v", data,
+			b.Bytes(),
+		)
 	})
 }

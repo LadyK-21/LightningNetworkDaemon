@@ -6,9 +6,9 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing"
 )
 
 // ManagerCfg houses a set of values and methods that is passed to the Manager
@@ -36,7 +36,7 @@ type ManagerCfg struct {
 
 	// SubscribeTopology is used to get a subscription for topology changes
 	// on the network.
-	SubscribeTopology func() (*routing.TopologyClient, error)
+	SubscribeTopology func() (*graph.TopologyClient, error)
 }
 
 // Manager is struct that manages an autopilot agent, making it possible to
@@ -293,7 +293,7 @@ func (m *Manager) queryHeuristics(nodes map[NodeID]struct{}, localState bool) (
 	HeuristicScores, error) {
 
 	// If we want to take the local state into action when querying the
-	// heuristics, we fetch it. If not we'll just pass an emply slice to
+	// heuristics, we fetch it. If not we'll just pass an empty slice to
 	// the heuristic.
 	var totalChans []LocalChannel
 	var err error
@@ -341,7 +341,7 @@ func (m *Manager) queryHeuristics(nodes map[NodeID]struct{}, localState bool) (
 			m.cfg.PilotCfg.Graph, totalChans, chanSize, nodes,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to get sub score: %v",
+			return nil, fmt.Errorf("unable to get sub score: %w",
 				err)
 		}
 

@@ -6,7 +6,9 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // htlcLeaseResolver is a struct that houses the lease specific HTLC resolution
@@ -52,24 +54,28 @@ func (h *htlcLeaseResolver) deriveWaitHeight(csvDelay uint32,
 // send to the sweeper so the output can ultimately be swept.
 func (h *htlcLeaseResolver) makeSweepInput(op *wire.OutPoint,
 	wType, cltvWtype input.StandardWitnessType,
-	signDesc *input.SignDescriptor,
-	csvDelay, broadcastHeight uint32, payHash [32]byte) *input.BaseInput {
+	signDesc *input.SignDescriptor, csvDelay, broadcastHeight uint32,
+	payHash [32]byte, resBlob fn.Option[tlv.Blob]) *input.BaseInput {
+
+	log.Infof("%T(%x): offering second-layer output to sweeper: %v", h,
+		payHash, op)
 
 	if h.hasCLTV() {
-		log.Infof("%T(%x): CSV and CLTV locks expired, offering "+
-			"second-layer output to sweeper: %v", h, payHash, op)
-
 		return input.NewCsvInputWithCltv(
 			op, cltvWtype, signDesc,
 			broadcastHeight, csvDelay,
 			h.leaseExpiry,
+			input.WithResolutionBlob(resBlob),
 		)
 	}
 
 	log.Infof("%T(%x): CSV lock expired, offering second-layer output to "+
 		"sweeper: %v", h, payHash, op)
 
-	return input.NewCsvInput(op, wType, signDesc, broadcastHeight, csvDelay)
+	return input.NewCsvInput(
+		op, wType, signDesc, broadcastHeight, csvDelay,
+		input.WithResolutionBlob(resBlob),
+	)
 }
 
 // SupplementState allows the user of a ContractResolver to supplement it with

@@ -23,20 +23,21 @@ type Controller interface {
 // aliasHandler is an interface that abstracts the managing of aliases.
 type aliasHandler interface {
 	// RequestAlias lets the funding manager request a unique SCID alias to
-	// use in the funding_locked message.
+	// use in the channel_ready message.
 	RequestAlias() (lnwire.ShortChannelID, error)
 
 	// PutPeerAlias lets the funding manager store the received alias SCID
-	// in the funding_locked message.
+	// in the channel_ready message.
 	PutPeerAlias(lnwire.ChannelID, lnwire.ShortChannelID) error
 
 	// GetPeerAlias lets the funding manager lookup the received alias SCID
-	// from the funding_locked message. This is not the same as GetAliases
+	// from the channel_ready message. This is not the same as GetAliases
 	// which retrieves OUR aliases for a given channel.
 	GetPeerAlias(lnwire.ChannelID) (lnwire.ShortChannelID, error)
 
 	// AddLocalAlias persists an alias to an underlying alias store.
-	AddLocalAlias(lnwire.ShortChannelID, lnwire.ShortChannelID, bool) error
+	AddLocalAlias(lnwire.ShortChannelID, lnwire.ShortChannelID, bool,
+		bool) error
 
 	// GetAliases returns the set of aliases given the main SCID of a
 	// channel. This SCID will be an alias for zero-conf channels and will

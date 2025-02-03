@@ -23,10 +23,31 @@ import (
 // indexes.
 const recordsPerTx = 20_000
 
+// MigrateRevLogConfig is an interface that defines the config that should be
+// passed to the MigrateRevocationLog function.
+type MigrateRevLogConfig interface {
+	// GetNoAmountData returns true if the amount data of revoked commitment
+	// transactions should not be stored in the revocation log.
+	GetNoAmountData() bool
+}
+
+// MigrateRevLogConfigImpl implements the MigrationRevLogConfig interface.
+type MigrateRevLogConfigImpl struct {
+	// NoAmountData if set to true will result in the amount data of revoked
+	// commitment transactions not being stored in the revocation log.
+	NoAmountData bool
+}
+
+// GetNoAmountData returns true if the amount data of revoked commitment
+// transactions should not be stored in the revocation log.
+func (c *MigrateRevLogConfigImpl) GetNoAmountData() bool {
+	return c.NoAmountData
+}
+
 // MigrateRevocationLog migrates the old revocation logs into the newer format
 // and deletes them once finished, with the deletion only happens once ALL the
 // old logs have been migrates.
-func MigrateRevocationLog(db kvdb.Backend) error {
+func MigrateRevocationLog(db kvdb.Backend, cfg MigrateRevLogConfig) error {
 	log.Infof("Migrating revocation logs, might take a while...")
 
 	var (
@@ -64,7 +85,7 @@ func MigrateRevocationLog(db kvdb.Backend) error {
 
 		// Process the migration.
 		err = kvdb.Update(db, func(tx kvdb.RwTx) error {
-			finished, err = processMigration(tx)
+			finished, err = processMigration(tx, cfg)
 			if err != nil {
 				return err
 			}
@@ -96,7 +117,7 @@ func MigrateRevocationLog(db kvdb.Backend) error {
 	// make sure the logs are migrated as expected.
 	err = kvdb.Update(db, validateMigration, func() {})
 	if err != nil {
-		return fmt.Errorf("validate migration failed: %v", err)
+		return fmt.Errorf("validate migration failed: %w", err)
 	}
 
 	log.Info("Migration check passed, now deleting the old logs...")
@@ -104,7 +125,7 @@ func MigrateRevocationLog(db kvdb.Backend) error {
 	// Once the migration completes, we can now safety delete the old
 	// revocation logs.
 	if err := deleteOldBuckets(db); err != nil {
-		return fmt.Errorf("deleteOldBuckets err: %v", err)
+		return fmt.Errorf("deleteOldBuckets err: %w", err)
 	}
 
 	log.Info("Old revocation log buckets removed!")
@@ -114,7 +135,7 @@ func MigrateRevocationLog(db kvdb.Backend) error {
 // processMigration finds the next un-migrated revocation logs, reads a max
 // number of `recordsPerTx` records, converts them into the new revocation logs
 // and save them to disk.
-func processMigration(tx kvdb.RwTx) (bool, error) {
+func processMigration(tx kvdb.RwTx, cfg MigrateRevLogConfig) (bool, error) {
 	openChanBucket := tx.ReadWriteBucket(openChannelBucket)
 
 	// If no bucket is found, we can exit early.
@@ -125,7 +146,7 @@ func processMigration(tx kvdb.RwTx) (bool, error) {
 	// Locate the next migration height.
 	locator, err := locateNextUpdateNum(openChanBucket)
 	if err != nil {
-		return false, fmt.Errorf("locator got error: %v", err)
+		return false, fmt.Errorf("locator got error: %w", err)
 	}
 
 	// If the returned locator is nil, we've done migrating the logs.
@@ -134,9 +155,9 @@ func processMigration(tx kvdb.RwTx) (bool, error) {
 	}
 
 	// Read a list of old revocation logs.
-	entryMap, err := readOldRevocationLogs(openChanBucket, locator)
+	entryMap, err := readOldRevocationLogs(openChanBucket, locator, cfg)
 	if err != nil {
-		return false, fmt.Errorf("read old logs err: %v", err)
+		return false, fmt.Errorf("read old logs err: %w", err)
 	}
 
 	// Migrate the revocation logs.
@@ -211,7 +232,7 @@ func writeRevocationLogs(openChanBucket kvdb.RwBucket,
 		// Find the channel bucket.
 		chanBucket, err := locator.locateChanBucket(openChanBucket)
 		if err != nil {
-			return fmt.Errorf("locateChanBucket err: %v", err)
+			return fmt.Errorf("locateChanBucket err: %w", err)
 		}
 
 		// Create the new log bucket.
@@ -219,7 +240,7 @@ func writeRevocationLogs(openChanBucket kvdb.RwBucket,
 			revocationLogBucket,
 		)
 		if err != nil {
-			return fmt.Errorf("create log bucket err: %v", err)
+			return fmt.Errorf("create log bucket err: %w", err)
 		}
 
 		// Write the new logs.
@@ -233,7 +254,7 @@ func writeRevocationLogs(openChanBucket kvdb.RwBucket,
 			logEntrykey := mig24.MakeLogKey(entry.commitHeight)
 			err = logBucket.Put(logEntrykey[:], b.Bytes())
 			if err != nil {
-				return fmt.Errorf("putRevocationLog err: %v",
+				return fmt.Errorf("putRevocationLog err: %w",
 					err)
 			}
 		}
@@ -324,7 +345,7 @@ func fetchLogStats(tx kvdb.RwTx) (uint64, uint64, error) {
 	// Locate the next migration height.
 	locator, err := locateNextUpdateNum(openChanBucket)
 	if err != nil {
-		return 0, 0, fmt.Errorf("locator got error: %v", err)
+		return 0, 0, fmt.Errorf("locator got error: %w", err)
 	}
 
 	// If the returned locator is not nil, we still have un-migrated
@@ -368,7 +389,7 @@ type result struct {
 // readOldRevocationLogs finds a list of old revocation logs and converts them
 // into the new revocation logs.
 func readOldRevocationLogs(openChanBucket kvdb.RwBucket,
-	locator *updateLocator) (logEntries, error) {
+	locator *updateLocator, cfg MigrateRevLogConfig) (logEntries, error) {
 
 	entries := make(logEntries)
 	results := make([]*result, 0)
@@ -415,7 +436,9 @@ func readOldRevocationLogs(openChanBucket kvdb.RwBucket,
 		// Convert the old logs into the new logs. We do this early in
 		// the read tx so the old large revocation log can be set to
 		// nil here so save us some memory space.
-		newLog, err := convertRevocationLog(&c, ourIndex, theirIndex)
+		newLog, err := convertRevocationLog(
+			&c, ourIndex, theirIndex, cfg.GetNoAmountData(),
+		)
 		if err != nil {
 			r.errChan <- err
 		}
@@ -468,7 +491,7 @@ func readOldRevocationLogs(openChanBucket kvdb.RwBucket,
 		c := &mig26.OpenChannel{}
 		err := mig26.FetchChanInfo(chanBucket, c, false)
 		if err != nil {
-			return fmt.Errorf("unable to fetch chan info: %v", err)
+			return fmt.Errorf("unable to fetch chan info: %w", err)
 		}
 
 		err = fetchChanRevocationState(chanBucket, c)
@@ -519,7 +542,8 @@ func readOldRevocationLogs(openChanBucket kvdb.RwBucket,
 // convertRevocationLog uses the fields `CommitTx` and `Htlcs` from a
 // ChannelCommitment to construct a revocation log entry.
 func convertRevocationLog(commit *mig.ChannelCommitment,
-	ourOutputIndex, theirOutputIndex uint32) (*RevocationLog, error) {
+	ourOutputIndex, theirOutputIndex uint32,
+	noAmtData bool) (*RevocationLog, error) {
 
 	// Sanity check that the output indexes can be safely converted.
 	if ourOutputIndex > math.MaxUint16 {
@@ -534,6 +558,11 @@ func convertRevocationLog(commit *mig.ChannelCommitment,
 		TheirOutputIndex: uint16(theirOutputIndex),
 		CommitTxHash:     commit.CommitTx.TxHash(),
 		HTLCEntries:      make([]*HTLCEntry, 0, len(commit.Htlcs)),
+	}
+
+	if !noAmtData {
+		rl.TheirBalance = &commit.RemoteBalance
+		rl.OurBalance = &commit.LocalBalance
 	}
 
 	for _, htlc := range commit.Htlcs {

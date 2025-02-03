@@ -16,7 +16,7 @@
     - [Starting btcd](#starting-btcd)
     - [Running lnd using the btcd backend](#running-lnd-using-the-btcd-backend)
   - [Using Neutrino](#using-neutrino)
-  - [Using bitcoind or litecoind](#using-bitcoind-or-litecoind)
+  - [Using bitcoind ](#using-bitcoind)
 - [Creating a wallet](#creating-a-wallet)
 - [Macaroons](#macaroons)
 - [Network Reachability](#network-reachability)
@@ -39,7 +39,7 @@ are released by the team. See
 [release.md for more information about reproducible builds](release.md).
 
 Finally, there is the option to build `lnd` fully manually. This requires more
-tooling to be set up first but allows to produce non-production (debug,
+tooling to be set up first but allows producing non-production (debug,
 development) builds.
 
 ## Installing a binary release
@@ -93,23 +93,24 @@ following build dependencies are required:
 
 ### Installing Go
 
-`lnd` is written in Go, with a minimum version of 1.18. To install, run one of 
-the following commands for your OS:
+`lnd` is written in Go, with a minimum version of `1.22.6` (or, in case this
+document gets out of date, whatever the Go version in the main `go.mod` file
+requires). To install, run one of the following commands for your OS:
 
 <details>
   <summary>Linux (x86-64)</summary>
   
   ```
-  wget https://dl.google.com/go/go1.18.linux-amd64.tar.gz
-  sha256sum go1.18.linux-amd64.tar.gz | awk -F " " '{ print $1 }'
+  wget https://dl.google.com/go/go1.22.6.linux-amd64.tar.gz
+  sha256sum go1.22.6.linux-amd64.tar.gz | awk -F " " '{ print $1 }'
   ```
 
   The final output of the command above should be
-  `e85278e98f57cdb150fe8409e6e5df5343ecb13cebf03a5d5ff12bd55a80264f`. If it
+  `999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616`. If it
   isn't, then the target REPO HAS BEEN MODIFIED, and you shouldn't install
   this version of Go. If it matches, then proceed to install Go:
   ```
-  sudo tar -C /usr/local -xzf go1.18.linux-amd64.tar.gz
+  sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.22.6.linux-amd64.tar.gz
   export PATH=$PATH:/usr/local/go/bin
   ```
 </details>
@@ -118,16 +119,16 @@ the following commands for your OS:
   <summary>Linux (ARMv6)</summary>
   
   ```
-  wget https://dl.google.com/go/go1.18.linux-armv6l.tar.gz
-  sha256sum go1.18.linux-armv6l.tar.gz | awk -F " " '{ print $1 }'
+  wget https://dl.google.com/go/go1.22.6.linux-armv6l.tar.gz
+  sha256sum go1.22.6.linux-armv6l.tar.gz | awk -F " " '{ print $1 }'
   ```
 
   The final output of the command above should be
-  `a80fa43d1f4575fb030adbfbaa94acd860c6847820764eecb06c63b7c103612b`. If it
+  `b566484fe89a54c525dd1a4cbfec903c1f6e8f0b7b3dbaf94c79bc9145391083`. If it
   isn't, then the target REPO HAS BEEN MODIFIED, and you shouldn't install
   this version of Go. If it matches, then proceed to install Go:
   ```
-  tar -C /usr/local -xzf go1.18.linux-armv6l.tar.gz
+  sudo rm -rf /usr/local/go && tar -C /usr/local -xzf go1.22.6.linux-armv6l.tar.gz
   export PATH=$PATH:/usr/local/go/bin
   ```  
   
@@ -136,7 +137,7 @@ the following commands for your OS:
 <details>
   <summary>macOS</summary>
   
-  First, install [Homebrew](https://brew.sh) if you don‘t already have it.
+  First, install [Homebrew](https://brew.sh) if you don't already have it.
 
   Then
 
@@ -205,7 +206,7 @@ make install
 
 The command above will install the current _master_ branch of `lnd`. If you
 wish to install a tagged release of `lnd` (as the master branch can at times be
-unstable), then [visit then release page to locate the latest
+unstable), then [visit the release page to locate the latest
 release](https://github.com/lightningnetwork/lnd/releases). Assuming the name
 of the release is `v0.x.x`, then you can compile this release from source with
 a small modification to the above command: 
@@ -254,6 +255,7 @@ will have the following tags:
 - [monitoring](/monitoring) (for Prometheus integration)
 - [peersrpc](/lnrpc/peersrpc/peers.proto)
 - [kvdb_postrgres](/docs/postgres.md)
+- [kvdb_sqlite](/docs/sqlite.md)
 - [kvdb_etcd](/docs/etcd.md)
 
 The `dev` tag is used for development builds, and is not included in the
@@ -293,7 +295,7 @@ To check that `lnd` was installed properly run the following command:
 ```
 
 This command requires `bitcoind` (almost any version should do) to be available
-in the system's `$PATH` variable. Otherwise some of the tests will fail.
+in the system's `$PATH` variable. Otherwise, some tests will fail.
 
 **Command-line completion for `lncli`**
 
@@ -307,7 +309,7 @@ time of writing of this document, there are three available chain backends:
 `btcd`, `neutrino`, `bitcoind`. All including neutrino can run on mainnet with
 an out of the box `lnd` instance. We don't require `--txindex` when running
 with `bitcoind` or `btcd` but activating the `txindex` will generally make
-`lnd` run faster. Note that since version 0.13 pruned nodes are supported
+`lnd` run faster. Note that since version 0.13 pruned nodes are supported, 
 although they cause performance penalty and higher network usage.
 
 The set of arguments for each of the backend modes is as follows:
@@ -315,11 +317,11 @@ The set of arguments for each of the backend modes is as follows:
 ## btcd Options
 ```text
 btcd:
-      --btcd.dir=                                             The base directory that contains the node's data, logs, configuration file, etc. (default: /Users/roasbeef/Library/Application Support/Btcd)
+      --btcd.dir=                                             The base directory that contains the node's data, logs, configuration file, etc. (default: /Users/<username>/Library/Application Support/Btcd)
       --btcd.rpchost=                                         The daemon's rpc listening address. If a port is omitted, then the default port for the selected chain parameters will be used. (default: localhost)
       --btcd.rpcuser=                                         Username for RPC connections
       --btcd.rpcpass=                                         Password for RPC connections
-      --btcd.rpccert=                                         File containing the daemon's certificate file (default: /Users/roasbeef/Library/Application Support/Btcd/rpc.cert)
+      --btcd.rpccert=                                         File containing the daemon's certificate file (default: /Users/<username>/Library/Application Support/Btcd/rpc.cert)
       --btcd.rawrpccert=                                      The raw bytes of the daemon's PEM-encoded certificate chain which will be used to authenticate the RPC connection.
 ```
 
@@ -338,7 +340,7 @@ neutrino:
 ## Bitcoind Options
 ```text
 bitcoind:
-      --bitcoind.dir=                                         The base directory that contains the node's data, logs, configuration file, etc. (default: /Users/roasbeef/Library/Application Support/Bitcoin)
+      --bitcoind.dir=                                         The base directory that contains the node's data, logs, configuration file, etc. (default: /Users/<username>/Library/Application Support/Bitcoin)
       --bitcoind.rpchost=                                     The daemon's rpc listening address. If a port is omitted, then the default port for the selected chain parameters will be used. (default: localhost)
       --bitcoind.rpcuser=                                     Username for RPC connections
       --bitcoind.rpcpass=                                     Password for RPC connections
@@ -354,7 +356,7 @@ bitcoind:
 On FreeBSD, use gmake instead of make.
 
 In order to be able to utilize the latest Taproot features, [`btcd` version
-`v0.23.1`](https://github.com/btcsuite/btcd/releases/tag/v0.23.1) MUST be used.
+`v0.23.5`](https://github.com/btcsuite/btcd/releases/tag/v0.23.5) MUST be used.
 
 To install btcd, run the following commands:
 
@@ -435,16 +437,11 @@ in `--bitcoin.simnet` if needed), and also your own `btcd` node if available:
 ```
 
 
-## Using bitcoind or litecoind
+## Using bitcoind
 
-The configuration for bitcoind and litecoind are nearly identical, the
-following steps can be mirrored without loss of generality to enable a litecoind
-backend.  Setup will be described in regards to `bitcoind`, but note that `lnd`
-uses a distinct `litecoin.node=litecoind` argument and analogous
-subconfigurations prefixed by `litecoind`. Note that adding `--txindex` is
-optional, as it will take longer to sync the node, but then `lnd` will
-generally operate faster as it can hit the index directly, rather than scanning
-blocks or BIP 158 filters for relevant items.
+Note that adding `-txindex` is optional, as it will take longer to sync the 
+node, but then `lnd` will generally operate faster as it can hit the index 
+directly, rather than scanning blocks or BIP 158 filters for relevant items.
 
 To configure your bitcoind backend for use with lnd, first complete and verify
 the following:
@@ -457,11 +454,17 @@ the following:
   If you installed `bitcoind` via Homebrew in the past ZMQ may not be included 
   ([this has now been fixed](https://github.com/Homebrew/homebrew-core/pull/23088) 
   in the latest Homebrew recipe for bitcoin)
-- Configure the `bitcoind` instance for ZMQ with `--zmqpubrawblock` and
-  `--zmqpubrawtx`. These options must each use their own unique address in order
+- Configure the `bitcoind` instance for ZMQ with `-zmqpubrawblock` and
+  `-zmqpubrawtx`. These options must each use their own unique address in order
   to provide a reliable delivery of notifications (e.g.
-  `--zmqpubrawblock=tcp://127.0.0.1:28332` and
-  `--zmqpubrawtx=tcp://127.0.0.1:28333`).
+  `-zmqpubrawblock=tcp://127.0.0.1:28332` and
+  `-zmqpubrawtx=tcp://127.0.0.1:28333`).
+- Make sure the config setting `-rpcserialversion` in `bitcoind` is either set
+  to 1 or NOT used because bitcoind's default behaviour is already correct
+  (see [bitcoin/issues/28730](https://github.com/bitcoin/bitcoin/issues/28730) 
+  for more info). Lightning depends on segwit transactions therefore we need 
+  the witness data when querying the bitcoind backend for transaction details.
+  
 - Start `bitcoind` running against testnet, and let it complete a full sync with
   the testnet chain (alternatively, use `--bitcoind.regtest` instead).
 
@@ -539,7 +542,7 @@ document](wallet.md).
 `lnd`'s authentication system is called **macaroons**, which are decentralized
 bearer credentials allowing for delegation, attenuation, and other cool
 features. You can learn more about them in Alex Akselrod's [writeup on
-Github](https://github.com/lightningnetwork/lnd/issues/20).
+GitHub](https://github.com/lightningnetwork/lnd/issues/20).
 
 Running `lncli create` to create a wallet, will by default generate 
 the `admin.macaroon`, `read_only.macaroon`, and `macaroons.db` 
@@ -582,14 +585,20 @@ There are currently two primary ways to run `lnd`: one requires a local `btcd`
 instance with the RPC service exposed, and the other uses a fully integrated
 light client powered by [neutrino](https://github.com/lightninglabs/neutrino).
 
+For testing scenarios like integration tests where wallet security is not
+important, the `itest/lnd-itest` binary can be used which uses very weak
+password stretching for the wallet encryption and therefore starts up faster
+than a production/mainnet/release build. The binary can be built by running
+`make build-itest`.
+
 # Creating an lnd.conf (Optional)
 
 Optionally, if you'd like to have a persistent configuration between `lnd`
 launches, allowing you to simply type `lnd --bitcoin.testnet --bitcoin.active`
 at the command line, you can create an `lnd.conf`.
 
-**On MacOS, located at:**
-`/Users/[username]/Library/Application Support/Lnd/lnd.conf`
+**On macOS, located at:**
+`/Users/<username>/Library/Application Support/Lnd/lnd.conf`
 
 **On Linux, located at:**
 `~/.lnd/lnd.conf`
@@ -605,10 +614,8 @@ bitcoin.active=1
 ```
 
 Notice the `[Bitcoin]` section. This section houses the parameters for the
-Bitcoin chain. `lnd` also supports Litecoin testnet4 (but not both BTC and LTC
-at the same time), so when working with Litecoin be sure to set to parameters
-for Litecoin accordingly. See a more detailed sample config file available
+Bitcoin chain. See a more detailed sample config file available
 [here](https://github.com/lightningnetwork/lnd/blob/master/sample-lnd.conf)
 and explore the other sections for node configuration, including `[Btcd]`,
-`[Bitcoind]`, `[Neutrino]`, `[Ltcd]`, and `[Litecoind]` depending on which
-chain and node type you're using.
+`[Bitcoind]` and `[Neutrino]` depending on which chain and node type you're 
+using.

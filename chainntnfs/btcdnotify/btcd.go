@@ -14,8 +14,10 @@ import (
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/queue"
 )
 
@@ -58,7 +60,7 @@ type BtcdNotifier struct {
 	active  int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
-	chainConn   *rpcclient.Client
+	chainConn   *chain.RPCClient
 	chainParams *chaincfg.Params
 
 	notificationCancels  chan interface{}
@@ -86,12 +88,18 @@ type BtcdNotifier struct {
 	// which the transaction could have confirmed within the chain.
 	confirmHintCache chainntnfs.ConfirmHintCache
 
+	// memNotifier notifies clients of events related to the mempool.
+	memNotifier *chainntnfs.MempoolNotifier
+
 	wg   sync.WaitGroup
 	quit chan struct{}
 }
 
 // Ensure BtcdNotifier implements the ChainNotifier interface at compile time.
 var _ chainntnfs.ChainNotifier = (*BtcdNotifier)(nil)
+
+// Ensure BtcdNotifier implements the MempoolWatcher interface at compile time.
+var _ chainntnfs.MempoolWatcher = (*BtcdNotifier)(nil)
 
 // New returns a new BtcdNotifier instance. This function assumes the btcd node
 // detailed in the passed configuration is already running, and willing to
@@ -115,7 +123,8 @@ func New(config *rpcclient.ConnConfig, chainParams *chaincfg.Params,
 		spendHintCache:   spendHintCache,
 		confirmHintCache: confirmHintCache,
 
-		blockCache: blockCache,
+		blockCache:  blockCache,
+		memNotifier: chainntnfs.NewMempoolNotifier(),
 
 		quit: make(chan struct{}),
 	}
@@ -126,15 +135,19 @@ func New(config *rpcclient.ConnConfig, chainParams *chaincfg.Params,
 		OnRedeemingTx:       notifier.onRedeemingTx,
 	}
 
-	// Disable connecting to btcd within the rpcclient.New method. We
-	// defer establishing the connection to our .Start() method.
-	config.DisableConnectOnNew = true
-	config.DisableAutoReconnect = false
-	chainConn, err := rpcclient.New(config, ntfnCallbacks)
+	rpcCfg := &chain.RPCClientConfig{
+		ReconnectAttempts:    20,
+		Conn:                 config,
+		Chain:                chainParams,
+		NotificationHandlers: ntfnCallbacks,
+	}
+
+	chainRPC, err := chain.NewRPCClientWithConfig(rpcCfg)
 	if err != nil {
 		return nil, err
 	}
-	notifier.chainConn = chainConn
+
+	notifier.chainConn = chainRPC
 
 	return notifier, nil
 }
@@ -146,6 +159,7 @@ func (b *BtcdNotifier) Start() error {
 	b.start.Do(func() {
 		startErr = b.startNotifier()
 	})
+
 	return startErr
 }
 
@@ -161,11 +175,12 @@ func (b *BtcdNotifier) Stop() error {
 		return nil
 	}
 
-	chainntnfs.Log.Info("btcd notifier shutting down")
+	chainntnfs.Log.Info("btcd notifier shutting down...")
+	defer chainntnfs.Log.Debug("btcd notifier shutdown complete")
 
 	// Shutdown the rpc client, this gracefully disconnects from btcd, and
 	// cleans up all related resources.
-	b.chainConn.Shutdown()
+	b.chainConn.Stop()
 
 	close(b.quit)
 	b.wg.Wait()
@@ -182,6 +197,9 @@ func (b *BtcdNotifier) Stop() error {
 		close(epochClient.epochChan)
 	}
 	b.txNotifier.TearDown()
+
+	// Stop the mempool notifier.
+	b.memNotifier.TearDown()
 
 	return nil
 }
@@ -347,7 +365,9 @@ out:
 				//
 				// TODO(wilmer): add retry logic if rescan fails?
 				b.wg.Add(1)
-				go func() {
+
+				//nolint:ll
+				go func(msg *chainntnfs.HistoricalConfDispatch) {
 					defer b.wg.Done()
 
 					confDetails, _, err := b.historicalConfDetails(
@@ -372,7 +392,7 @@ out:
 					if err != nil {
 						chainntnfs.Log.Error(err)
 					}
-				}()
+				}(msg)
 
 			case *blockEpochRegistration:
 				chainntnfs.Log.Infof("New block epoch subscription")
@@ -490,27 +510,64 @@ out:
 
 		case item := <-b.txUpdates.ChanOut():
 			newSpend := item.(*txUpdate)
+			tx := newSpend.tx
 
-			// We only care about notifying on confirmed spends, so
-			// if this is a mempool spend, we can ignore it and wait
-			// for the spend to appear in on-chain.
+			// Init values.
+			isMempool := false
+			height := uint32(0)
+
+			// Unwrap values.
 			if newSpend.details == nil {
-				continue
+				isMempool = true
+			} else {
+				height = uint32(newSpend.details.Height)
 			}
 
-			err := b.txNotifier.ProcessRelevantSpendTx(
-				newSpend.tx, uint32(newSpend.details.Height),
-			)
-			if err != nil {
-				chainntnfs.Log.Errorf("Unable to process "+
-					"transaction %v: %v",
-					newSpend.tx.Hash(), err)
-			}
+			// Handle the transaction.
+			b.handleRelevantTx(tx, isMempool, height)
 
 		case <-b.quit:
 			break out
 		}
 	}
+}
+
+// handleRelevantTx handles a new transaction that has been seen either in a
+// block or in the mempool. If in mempool, it will ask the mempool notifier to
+// handle it. If in a block, it will ask the txNotifier to handle it, and
+// cancel any relevant subscriptions made in the mempool.
+func (b *BtcdNotifier) handleRelevantTx(tx *btcutil.Tx,
+	mempool bool, height uint32) {
+
+	// If this is a mempool spend, we'll ask the mempool notifier to handle
+	// it.
+	if mempool {
+		err := b.memNotifier.ProcessRelevantSpendTx(tx)
+		if err != nil {
+			chainntnfs.Log.Errorf("Unable to process transaction "+
+				"%v: %v", tx.Hash(), err)
+		}
+
+		return
+	}
+
+	// Otherwise this is a confirmed spend, and we'll ask the tx notifier
+	// to handle it.
+	err := b.txNotifier.ProcessRelevantSpendTx(tx, height)
+	if err != nil {
+		chainntnfs.Log.Errorf("Unable to process transaction %v: %v",
+			tx.Hash(), err)
+
+		return
+	}
+
+	// Once the tx is processed, we will ask the memNotifier to unsubscribe
+	// the input.
+	//
+	// NOTE(yy): we could build it into txNotifier.ProcessRelevantSpendTx,
+	// but choose to implement it here so we can easily decouple the two
+	// notifiers in the future.
+	b.memNotifier.UnsubsribeConfirmedSpentTx(tx)
 }
 
 // historicalConfDetails looks up whether a confirmation request (txid/output
@@ -616,7 +673,7 @@ func (b *BtcdNotifier) confDetailsManually(confRequest chainntnfs.ConfRequest,
 			}
 
 			return &chainntnfs.TxConfirmation{
-				Tx:          tx,
+				Tx:          tx.Copy(),
 				BlockHash:   blockHash,
 				BlockHeight: height,
 				TxIndex:     uint32(txIndex),
@@ -641,7 +698,7 @@ func (b *BtcdNotifier) handleBlockConnected(epoch chainntnfs.BlockEpoch) error {
 	// clients.
 	rawBlock, err := b.GetBlock(epoch.Hash)
 	if err != nil {
-		return fmt.Errorf("unable to get block: %v", err)
+		return fmt.Errorf("unable to get block: %w", err)
 	}
 	newBlock := &filteredBlock{
 		hash:    *epoch.Hash,
@@ -655,7 +712,7 @@ func (b *BtcdNotifier) handleBlockConnected(epoch chainntnfs.BlockEpoch) error {
 	// us.
 	err = b.txNotifier.ConnectTip(newBlock.block, newBlock.height)
 	if err != nil {
-		return fmt.Errorf("unable to connect tip: %v", err)
+		return fmt.Errorf("unable to connect tip: %w", err)
 	}
 
 	chainntnfs.Log.Infof("New block: height=%v, sha=%v", epoch.Height,
@@ -668,11 +725,16 @@ func (b *BtcdNotifier) handleBlockConnected(epoch chainntnfs.BlockEpoch) error {
 	// satisfy any client requests based upon the new block.
 	b.bestBlock = epoch
 
+	err = b.txNotifier.NotifyHeight(uint32(epoch.Height))
+	if err != nil {
+		return fmt.Errorf("unable to notify height: %w", err)
+	}
+
 	b.notifyBlockEpochs(
 		epoch.Height, epoch.Hash, epoch.BlockHeader,
 	)
 
-	return b.txNotifier.NotifyHeight(uint32(epoch.Height))
+	return nil
 }
 
 // notifyBlockEpochs notifies all registered block epoch clients of the newly
@@ -734,7 +796,8 @@ func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 			pkScript, b.chainParams,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse script: %v", err)
+			return nil, fmt.Errorf("unable to parse script: %w",
+				err)
 		}
 		if err := b.chainConn.NotifyReceived(addrs); err != nil {
 			return nil, err
@@ -772,7 +835,8 @@ func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 			pkScript, b.chainParams,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse address: %v", err)
+			return nil, fmt.Errorf("unable to parse address: %w",
+				err)
 		}
 
 		asyncResult := b.chainConn.RescanAsync(startHash, addrs, nil)
@@ -833,8 +897,8 @@ func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 		// proceed with fallback methods.
 		jsonErr, ok := err.(*btcjson.RPCError)
 		if !ok || jsonErr.Code != btcjson.ErrRPCNoTxInfo {
-			return nil, fmt.Errorf("unable to query for txid %v: %v",
-				outpoint.Hash, err)
+			return nil, fmt.Errorf("unable to query for txid %v: "+
+				"%w", outpoint.Hash, err)
 		}
 	}
 
@@ -1048,4 +1112,52 @@ func (b *BtcdNotifier) GetBlock(hash *chainhash.Hash) (*wire.MsgBlock,
 	error) {
 
 	return b.blockCache.GetBlock(hash, b.chainConn.GetBlock)
+}
+
+// SubscribeMempoolSpent allows the caller to register a subscription to watch
+// for a spend of an outpoint in the mempool.The event will be dispatched once
+// the outpoint is spent in the mempool.
+//
+// NOTE: part of the MempoolWatcher interface.
+func (b *BtcdNotifier) SubscribeMempoolSpent(
+	outpoint wire.OutPoint) (*chainntnfs.MempoolSpendEvent, error) {
+
+	event := b.memNotifier.SubscribeInput(outpoint)
+
+	ops := []*wire.OutPoint{&outpoint}
+
+	return event, b.chainConn.NotifySpent(ops)
+}
+
+// CancelMempoolSpendEvent allows the caller to cancel a subscription to watch
+// for a spend of an outpoint in the mempool.
+//
+// NOTE: part of the MempoolWatcher interface.
+func (b *BtcdNotifier) CancelMempoolSpendEvent(
+	sub *chainntnfs.MempoolSpendEvent) {
+
+	b.memNotifier.UnsubscribeEvent(sub)
+}
+
+// LookupInputMempoolSpend takes an outpoint and queries the mempool to find
+// its spending tx. Returns the tx if found, otherwise fn.None.
+//
+// NOTE: part of the MempoolWatcher interface.
+func (b *BtcdNotifier) LookupInputMempoolSpend(
+	op wire.OutPoint) fn.Option[wire.MsgTx] {
+
+	// Find the spending txid.
+	txid, found := b.chainConn.LookupInputMempoolSpend(op)
+	if !found {
+		return fn.None[wire.MsgTx]()
+	}
+
+	// Query the spending tx using the id.
+	tx, err := b.chainConn.GetRawTransaction(&txid)
+	if err != nil {
+		// TODO(yy): enable logging errors in this package.
+		return fn.None[wire.MsgTx]()
+	}
+
+	return fn.Some(*tx.MsgTx().Copy())
 }

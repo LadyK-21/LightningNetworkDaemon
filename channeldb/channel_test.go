@@ -2,24 +2,33 @@ package channeldb
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math/rand"
 	"net"
 	"reflect"
 	"runtime"
+	"sync/atomic"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/channels"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/shachain"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +46,19 @@ var (
 	}
 	privKey, pubKey = btcec.PrivKeyFromBytes(key[:])
 
+	testRBytes, _ = hex.DecodeString("8ce2bc69281ce27da07e6683571319d18e" +
+		"949ddfa2965fb6caa1bf0314f882d7")
+	testSBytes, _ = hex.DecodeString("299105481d63e0f4bc2a88121167221b67" +
+		"00d72a0ead154c03be696a292d24ae")
+	testRScalar = new(btcec.ModNScalar)
+	testSScalar = new(btcec.ModNScalar)
+	_           = testRScalar.SetByteSlice(testRBytes)
+	_           = testSScalar.SetByteSlice(testSBytes)
+	testSig     = ecdsa.NewSignature(testRScalar, testSScalar)
+
 	wireSig, _ = lnwire.NewSigFromSignature(testSig)
+
+	testPub = route.Vertex{2, 202, 4}
 
 	testClock = clock.NewTestClock(testNow)
 
@@ -63,6 +84,11 @@ var (
 	// dummyRemoteOutIndex specifics a default value for their output index
 	// in this test.
 	dummyRemoteOutIndex = uint32(1)
+
+	// uniqueOutputIndex is used to create a unique funding outpoint.
+	//
+	// NOTE: must be incremented when used.
+	uniqueOutputIndex = atomic.Uint32{}
 )
 
 // testChannelParams is a struct which details the specifics of how a channel
@@ -163,7 +189,7 @@ func fundingPointOption(chanPoint wire.OutPoint) testChannelOption {
 }
 
 // channelIDOption is an option which sets the short channel ID of the channel.
-var channelIDOption = func(chanID lnwire.ShortChannelID) testChannelOption {
+func channelIDOption(chanID lnwire.ShortChannelID) testChannelOption {
 	return func(params *testChannelParams) {
 		params.channel.ShortChannelID = chanID
 	}
@@ -225,15 +251,21 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 		}
 	}
 
+	localStateBounds := ChannelStateBounds{
+		MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
+		ChanReserve:      btcutil.Amount(rand.Int63()),
+		MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
+		MaxAcceptedHtlcs: uint16(rand.Int31()),
+	}
+
+	localRenderingParams := CommitmentParams{
+		DustLimit: btcutil.Amount(rand.Int63()),
+		CsvDelay:  uint16(rand.Int31()),
+	}
+
 	localCfg := ChannelConfig{
-		ChannelConstraints: ChannelConstraints{
-			DustLimit:        btcutil.Amount(rand.Int63()),
-			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
-			ChanReserve:      btcutil.Amount(rand.Int63()),
-			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
-			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(rand.Int31()),
-		},
+		ChannelStateBounds: localStateBounds,
+		CommitmentParams:   localRenderingParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: privKey.PubKey(),
 		},
@@ -250,15 +282,22 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 			PubKey: privKey.PubKey(),
 		},
 	}
+
+	remoteStateBounds := ChannelStateBounds{
+		MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
+		ChanReserve:      btcutil.Amount(rand.Int63()),
+		MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
+		MaxAcceptedHtlcs: uint16(rand.Int31()),
+	}
+
+	remoteRenderingParams := CommitmentParams{
+		DustLimit: btcutil.Amount(rand.Int63()),
+		CsvDelay:  uint16(rand.Int31()),
+	}
+
 	remoteCfg := ChannelConfig{
-		ChannelConstraints: ChannelConstraints{
-			DustLimit:        btcutil.Amount(rand.Int63()),
-			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
-			ChanReserve:      btcutil.Amount(rand.Int63()),
-			MinHTLC:          lnwire.MilliSatoshi(rand.Int63()),
-			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(rand.Int31()),
-		},
+		ChannelStateBounds: remoteStateBounds,
+		CommitmentParams:   remoteRenderingParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: privKey.PubKey(),
 			KeyLocator: keychain.KeyLocator{
@@ -298,10 +337,18 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 
 	chanID := lnwire.NewShortChanIDFromInt(uint64(rand.Int63()))
 
+	// Increment the uniqueOutputIndex so we always get a unique value for
+	// the funding outpoint.
+	uniqueOutputIndex.Add(1)
+	op := wire.OutPoint{Hash: key, Index: uniqueOutputIndex.Load()}
+
+	var tapscriptRoot chainhash.Hash
+	copy(tapscriptRoot[:], bytes.Repeat([]byte{1}, 32))
+
 	return &OpenChannel{
 		ChanType:          SingleFunderBit | FrozenBit,
 		ChainHash:         key,
-		FundingOutpoint:   wire.OutPoint{Hash: key, Index: rand.Uint32()},
+		FundingOutpoint:   op,
 		ShortChannelID:    chanID,
 		IsInitiator:       true,
 		IsPending:         true,
@@ -319,6 +366,7 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 			FeePerKw:      btcutil.Amount(5000),
 			CommitTx:      channels.TestFundingTx,
 			CommitSig:     bytes.Repeat([]byte{1}, 71),
+			CustomBlob:    fn.Some([]byte{1, 2, 3}),
 		},
 		RemoteCommitment: ChannelCommitment{
 			CommitHeight:  0,
@@ -328,6 +376,7 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 			FeePerKw:      btcutil.Amount(5000),
 			CommitTx:      channels.TestFundingTx,
 			CommitSig:     bytes.Repeat([]byte{1}, 71),
+			CustomBlob:    fn.Some([]byte{4, 5, 6}),
 		},
 		NumConfsRequired:        4,
 		RemoteCurrentRevocation: privKey.PubKey(),
@@ -340,6 +389,9 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 		ThawHeight:              uint32(defaultPendingHeight),
 		InitialLocalBalance:     lnwire.MilliSatoshi(9000),
 		InitialRemoteBalance:    lnwire.MilliSatoshi(3000),
+		Memo:                    []byte("test"),
+		TapscriptRoot:           fn.Some(tapscriptRoot),
+		CustomBlob:              fn.Some([]byte{1, 2, 3}),
 	}
 }
 
@@ -354,12 +406,13 @@ func TestOpenChannelPutGetDelete(t *testing.T) {
 	// Create the test channel state, with additional htlcs on the local
 	// and remote commitment.
 	localHtlcs := []HTLC{
-		{Signature: testSig.Serialize(),
+		{
+			Signature:     testSig.Serialize(),
 			Incoming:      true,
 			Amt:           10,
 			RHash:         key,
 			RefundTimeout: 1,
-			OnionBlob:     []byte("onionblob"),
+			OnionBlob:     lnmock.MockOnion(),
 		},
 	}
 
@@ -370,7 +423,7 @@ func TestOpenChannelPutGetDelete(t *testing.T) {
 			Amt:           10,
 			RHash:         key,
 			RefundTimeout: 1,
-			OnionBlob:     []byte("onionblob"),
+			OnionBlob:     lnmock.MockOnion(),
 		},
 	}
 
@@ -546,24 +599,32 @@ func assertCommitmentEqual(t *testing.T, a, b *ChannelCommitment) {
 func assertRevocationLogEntryEqual(t *testing.T, c *ChannelCommitment,
 	r *RevocationLog) {
 
+	t.Helper()
+
 	// Check the common fields.
 	require.EqualValues(
-		t, r.CommitTxHash, c.CommitTx.TxHash(), "CommitTx mismatch",
+		t, r.CommitTxHash.Val, c.CommitTx.TxHash(), "CommitTx mismatch",
 	)
 
 	// Now check the common fields from the HTLCs.
 	require.Equal(t, len(r.HTLCEntries), len(c.Htlcs), "HTLCs len mismatch")
 	for i, rHtlc := range r.HTLCEntries {
 		cHtlc := c.Htlcs[i]
-		require.Equal(t, rHtlc.RHash, cHtlc.RHash, "RHash mismatch")
-		require.Equal(t, rHtlc.Amt, cHtlc.Amt.ToSatoshis(),
-			"Amt mismatch")
-		require.Equal(t, rHtlc.RefundTimeout, cHtlc.RefundTimeout,
-			"RefundTimeout mismatch")
-		require.EqualValues(t, rHtlc.OutputIndex, cHtlc.OutputIndex,
-			"OutputIndex mismatch")
-		require.Equal(t, rHtlc.Incoming, cHtlc.Incoming,
-			"Incoming mismatch")
+		require.Equal(t, rHtlc.RHash.Val[:], cHtlc.RHash[:], "RHash")
+		require.Equal(
+			t, rHtlc.Amt.Val.Int(), cHtlc.Amt.ToSatoshis(), "Amt",
+		)
+		require.Equal(
+			t, rHtlc.RefundTimeout.Val, cHtlc.RefundTimeout,
+			"RefundTimeout",
+		)
+		require.EqualValues(
+			t, rHtlc.OutputIndex.Val, cHtlc.OutputIndex,
+			"OutputIndex",
+		)
+		require.Equal(
+			t, rHtlc.Incoming.Val, cHtlc.Incoming, "Incoming",
+		)
 	}
 }
 
@@ -600,8 +661,10 @@ func TestChannelStateTransition(t *testing.T) {
 			LogIndex:      uint64(i * 2),
 			HtlcIndex:     uint64(i),
 		}
-		htlc.OnionBlob = make([]byte, 10)
-		copy(htlc.OnionBlob[:], bytes.Repeat([]byte{2}, 10))
+		copy(
+			htlc.OnionBlob[:],
+			bytes.Repeat([]byte{2}, lnwire.OnionPacketSize),
+		)
 		htlcs = append(htlcs, htlc)
 		htlcAmt += htlc.Amt
 	}
@@ -626,6 +689,7 @@ func TestChannelStateTransition(t *testing.T) {
 		CommitTx:        newTx,
 		CommitSig:       newSig,
 		Htlcs:           htlcs,
+		CustomBlob:      fn.Some([]byte{4, 5, 6}),
 	}
 
 	// First update the local node's broadcastable state and also add a
@@ -635,8 +699,7 @@ func TestChannelStateTransition(t *testing.T) {
 		{
 			LogIndex: 2,
 			UpdateMsg: &lnwire.UpdateAddHTLC{
-				ChanID:    lnwire.ChannelID{1, 2, 3},
-				ExtraData: make([]byte, 0),
+				ChanID: lnwire.ChannelID{1, 2, 3},
 			},
 		},
 	}
@@ -664,9 +727,14 @@ func TestChannelStateTransition(t *testing.T) {
 	// have been updated.
 	updatedChannel, err := cdb.FetchOpenChannels(channel.IdentityPub)
 	require.NoError(t, err, "unable to fetch updated channel")
-	assertCommitmentEqual(t, &commitment, &updatedChannel[0].LocalCommitment)
+
+	assertCommitmentEqual(
+		t, &commitment, &updatedChannel[0].LocalCommitment,
+	)
+
 	numDiskUpdates, err := updatedChannel[0].CommitmentHeight()
 	require.NoError(t, err, "unable to read commitment height from disk")
+
 	if numDiskUpdates != uint64(commitment.CommitHeight) {
 		t.Fatalf("num disk updates doesn't match: %v vs %v",
 			numDiskUpdates, commitment.CommitHeight)
@@ -694,30 +762,27 @@ func TestChannelStateTransition(t *testing.T) {
 				wireSig,
 				wireSig,
 			},
-			ExtraData: make([]byte, 0),
 		},
 		LogUpdates: []LogUpdate{
 			{
 				LogIndex: 1,
 				UpdateMsg: &lnwire.UpdateAddHTLC{
-					ID:        1,
-					Amount:    lnwire.NewMSatFromSatoshis(100),
-					Expiry:    25,
-					ExtraData: make([]byte, 0),
+					ID:     1,
+					Amount: lnwire.NewMSatFromSatoshis(100),
+					Expiry: 25,
 				},
 			},
 			{
 				LogIndex: 2,
 				UpdateMsg: &lnwire.UpdateAddHTLC{
-					ID:        2,
-					Amount:    lnwire.NewMSatFromSatoshis(200),
-					Expiry:    50,
-					ExtraData: make([]byte, 0),
+					ID:     2,
+					Amount: lnwire.NewMSatFromSatoshis(200),
+					Expiry: 50,
 				},
 			},
 		},
-		OpenedCircuitKeys: []CircuitKey{},
-		ClosedCircuitKeys: []CircuitKey{},
+		OpenedCircuitKeys: []models.CircuitKey{},
+		ClosedCircuitKeys: []models.CircuitKey{},
 	}
 	copy(commitDiff.LogUpdates[0].UpdateMsg.(*lnwire.UpdateAddHTLC).PaymentHash[:],
 		bytes.Repeat([]byte{1}, 32))
@@ -772,10 +837,10 @@ func TestChannelStateTransition(t *testing.T) {
 
 	// Check the output indexes are saved as expected.
 	require.EqualValues(
-		t, dummyLocalOutputIndex, diskPrevCommit.OurOutputIndex,
+		t, dummyLocalOutputIndex, diskPrevCommit.OurOutputIndex.Val,
 	)
 	require.EqualValues(
-		t, dummyRemoteOutIndex, diskPrevCommit.TheirOutputIndex,
+		t, dummyRemoteOutIndex, diskPrevCommit.TheirOutputIndex.Val,
 	)
 
 	// The two deltas (the original vs the on-disk version) should
@@ -817,10 +882,10 @@ func TestChannelStateTransition(t *testing.T) {
 
 	// Check the output indexes are saved as expected.
 	require.EqualValues(
-		t, dummyLocalOutputIndex, diskPrevCommit.OurOutputIndex,
+		t, dummyLocalOutputIndex, diskPrevCommit.OurOutputIndex.Val,
 	)
 	require.EqualValues(
-		t, dummyRemoteOutIndex, diskPrevCommit.TheirOutputIndex,
+		t, dummyRemoteOutIndex, diskPrevCommit.TheirOutputIndex.Val,
 	)
 
 	assertRevocationLogEntryEqual(t, &oldRemoteCommit, prevCommit)
@@ -1071,13 +1136,17 @@ func TestFetchWaitingCloseChannels(t *testing.T) {
 			},
 		)
 
-		if err := channel.MarkCommitmentBroadcasted(closeTx, true); err != nil {
+		if err := channel.MarkCommitmentBroadcasted(
+			closeTx, lntypes.Local,
+		); err != nil {
 			t.Fatalf("unable to mark commitment broadcast: %v", err)
 		}
 
 		// Now try to marking a coop close with a nil tx. This should
 		// succeed, but it shouldn't exit when queried.
-		if err = channel.MarkCoopBroadcasted(nil, true); err != nil {
+		if err = channel.MarkCoopBroadcasted(
+			nil, lntypes.Local,
+		); err != nil {
 			t.Fatalf("unable to mark nil coop broadcast: %v", err)
 		}
 		_, err := channel.BroadcastedCooperative()
@@ -1089,7 +1158,9 @@ func TestFetchWaitingCloseChannels(t *testing.T) {
 		// it as coop closed. Later we will test that distinct
 		// transactions are returned for both coop and force closes.
 		closeTx.TxIn[0].PreviousOutPoint.Index ^= 1
-		if err := channel.MarkCoopBroadcasted(closeTx, true); err != nil {
+		if err := channel.MarkCoopBroadcasted(
+			closeTx, lntypes.Local,
+		); err != nil {
 			t.Fatalf("unable to mark coop broadcast: %v", err)
 		}
 	}
@@ -1140,6 +1211,70 @@ func TestFetchWaitingCloseChannels(t *testing.T) {
 				coopCloseTx.TxIn[0].PreviousOutPoint)
 		}
 	}
+}
+
+// TestShutdownInfo tests that a channel's shutdown info can correctly be
+// persisted and retrieved.
+func TestShutdownInfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		localInit bool
+	}{
+		{
+			name:      "local node initiated",
+			localInit: true,
+		},
+		{
+			name:      "remote node initiated",
+			localInit: false,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			testShutdownInfo(t, test.localInit)
+		})
+	}
+}
+
+func testShutdownInfo(t *testing.T, locallyInitiated bool) {
+	fullDB, err := MakeTestDB(t)
+	require.NoError(t, err, "unable to make test database")
+
+	cdb := fullDB.ChannelStateDB()
+
+	// First a test channel.
+	channel := createTestChannel(t, cdb)
+
+	// We haven't persisted any shutdown info for this channel yet.
+	_, err = channel.ShutdownInfo()
+	require.Error(t, err, ErrNoShutdownInfo)
+
+	// Construct a new delivery script and create a new ShutdownInfo object.
+	script := []byte{1, 3, 4, 5}
+
+	// Create a ShutdownInfo struct.
+	shutdownInfo := NewShutdownInfo(script, locallyInitiated)
+
+	// Persist the shutdown info.
+	require.NoError(t, channel.MarkShutdownSent(shutdownInfo))
+
+	// We should now be able to retrieve the shutdown info.
+	info, err := channel.ShutdownInfo()
+	require.NoError(t, err)
+	require.True(t, info.IsSome())
+
+	// Assert that the decoded values of the shutdown info are correct.
+	info.WhenSome(func(info ShutdownInfo) {
+		require.EqualValues(t, script, info.DeliveryScript.Val)
+		require.Equal(t, locallyInitiated, info.LocalInitiator.Val)
+	})
 }
 
 // TestRefresh asserts that Refresh updates the in-memory state of another
@@ -1247,7 +1382,7 @@ func TestCloseInitiator(t *testing.T) {
 			// by the local party.
 			updateChannel: func(c *OpenChannel) error {
 				return c.MarkCoopBroadcasted(
-					&wire.MsgTx{}, true,
+					&wire.MsgTx{}, lntypes.Local,
 				)
 			},
 			expectedStatuses: []ChannelStatus{
@@ -1261,7 +1396,7 @@ func TestCloseInitiator(t *testing.T) {
 			// by the remote party.
 			updateChannel: func(c *OpenChannel) error {
 				return c.MarkCoopBroadcasted(
-					&wire.MsgTx{}, false,
+					&wire.MsgTx{}, lntypes.Remote,
 				)
 			},
 			expectedStatuses: []ChannelStatus{
@@ -1275,7 +1410,7 @@ func TestCloseInitiator(t *testing.T) {
 			// local initiator.
 			updateChannel: func(c *OpenChannel) error {
 				return c.MarkCommitmentBroadcasted(
-					&wire.MsgTx{}, true,
+					&wire.MsgTx{}, lntypes.Local,
 				)
 			},
 			expectedStatuses: []ChannelStatus{
@@ -1462,7 +1597,7 @@ func TestKeyLocatorEncoding(t *testing.T) {
 func TestFinalHtlcs(t *testing.T) {
 	t.Parallel()
 
-	fullDB, err := MakeTestDB(t)
+	fullDB, err := MakeTestDB(t, OptionStoreFinalHtlcResolutions(true))
 	require.NoError(t, err, "unable to make test database")
 
 	cdb := fullDB.ChannelStateDB()
@@ -1514,4 +1649,131 @@ func TestFinalHtlcs(t *testing.T) {
 	// Test unknown htlc lookup for existing channel.
 	_, err = cdb.LookupFinalHtlc(chanID, unknownHtlcID)
 	require.ErrorIs(t, err, ErrHtlcUnknown)
+}
+
+// TestHTLCsExtraData tests serialization and deserialization of HTLCs
+// combined with extra data.
+func TestHTLCsExtraData(t *testing.T) {
+	t.Parallel()
+
+	mockHtlc := HTLC{
+		Signature:     testSig.Serialize(),
+		Incoming:      false,
+		Amt:           10,
+		RHash:         key,
+		RefundTimeout: 1,
+		OnionBlob:     lnmock.MockOnion(),
+	}
+
+	// Add a blinding point to a htlc.
+	blindingPointHTLC := HTLC{
+		Signature:     testSig.Serialize(),
+		Incoming:      false,
+		Amt:           10,
+		RHash:         key,
+		RefundTimeout: 1,
+		OnionBlob:     lnmock.MockOnion(),
+		BlindingPoint: tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](
+				pubKey,
+			),
+		),
+	}
+
+	// Custom channel data htlc with a blinding point.
+	customDataHTLC := HTLC{
+		Signature:     testSig.Serialize(),
+		Incoming:      false,
+		Amt:           10,
+		RHash:         key,
+		RefundTimeout: 1,
+		OnionBlob:     lnmock.MockOnion(),
+		BlindingPoint: tlv.SomeRecordT(
+			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](
+				pubKey,
+			),
+		),
+		CustomRecords: map[uint64][]byte{
+			uint64(lnwire.MinCustomRecordsTlvType + 3): {1, 2, 3},
+		},
+	}
+
+	testCases := []struct {
+		name        string
+		htlcs       []HTLC
+		blindingIdx int
+	}{
+		{
+			// Serialize multiple HLTCs with no extra data to
+			// assert that there is no regression for HTLCs with
+			// no extra data.
+			name: "no extra data",
+			htlcs: []HTLC{
+				mockHtlc, mockHtlc,
+			},
+		},
+		{
+			// Some HTLCs with extra data, some without.
+			name: "mixed extra data",
+			htlcs: []HTLC{
+				mockHtlc,
+				blindingPointHTLC,
+				mockHtlc,
+				customDataHTLC,
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var b bytes.Buffer
+			err := SerializeHtlcs(&b, testCase.htlcs...)
+			require.NoError(t, err)
+
+			r := bytes.NewReader(b.Bytes())
+			htlcs, err := DeserializeHtlcs(r)
+			require.NoError(t, err)
+
+			require.EqualValues(t, len(testCase.htlcs), len(htlcs))
+			for i, htlc := range htlcs {
+				// We use the extra data field when we
+				// serialize, so we set to nil to be able to
+				// assert on equal for the test.
+				htlc.ExtraData = nil
+				require.Equal(t, testCase.htlcs[i], htlc)
+			}
+		})
+	}
+}
+
+// TestOnionBlobIncorrectLength tests HTLC deserialization in the case where
+// the OnionBlob saved on disk is of an unexpected length. This error case is
+// only expected in the case of database corruption (or some severe protocol
+// breakdown/bug). A HTLC is manually serialized because we cannot force a
+// case where we write an onion blob of incorrect length.
+func TestOnionBlobIncorrectLength(t *testing.T) {
+	t.Parallel()
+
+	var b bytes.Buffer
+
+	var numHtlcs uint16 = 1
+	require.NoError(t, WriteElement(&b, numHtlcs))
+
+	require.NoError(t, WriteElements(
+		&b,
+		// Number of HTLCs.
+		numHtlcs,
+		// Signature, incoming, amount, Rhash, Timeout.
+		testSig.Serialize(), false, lnwire.MilliSatoshi(10), key,
+		uint32(1),
+		// Write an onion blob that is half of our expected size.
+		bytes.Repeat([]byte{1}, lnwire.OnionPacketSize/2),
+	))
+
+	_, err := DeserializeHtlcs(&b)
+	require.ErrorIs(t, err, ErrOnionBlobLength)
 }

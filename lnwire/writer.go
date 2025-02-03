@@ -154,7 +154,7 @@ func WriteShortChannelID(buf *bytes.Buffer, shortChanID ShortChannelID) error {
 
 // WriteSig appends the signature to the provided buffer.
 func WriteSig(buf *bytes.Buffer, sig Sig) error {
-	return WriteBytes(buf, sig[:])
+	return WriteBytes(buf, sig.bytes[:])
 }
 
 // WriteSigs appends the slice of signatures to the provided buffer with its
@@ -205,9 +205,8 @@ func WriteColorRGBA(buf *bytes.Buffer, e color.RGBA) error {
 	return WriteUint8(buf, e.B)
 }
 
-// WriteShortChanIDEncoding appends the ShortChanIDEncoding to the provided
-// buffer.
-func WriteShortChanIDEncoding(buf *bytes.Buffer, e ShortChanIDEncoding) error {
+// WriteQueryEncoding appends the QueryEncoding to the provided buffer.
+func WriteQueryEncoding(buf *bytes.Buffer, e QueryEncoding) error {
 	return WriteUint8(buf, uint8(e))
 }
 

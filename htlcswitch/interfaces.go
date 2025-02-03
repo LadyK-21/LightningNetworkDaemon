@@ -1,15 +1,19 @@
 package htlcswitch
 
 import (
+	"context"
+
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
-	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // InvoiceDatabase is an interface which represents the persistent subsystem
@@ -17,7 +21,7 @@ import (
 type InvoiceDatabase interface {
 	// LookupInvoice attempts to look up an invoice according to its 32
 	// byte payment hash.
-	LookupInvoice(lntypes.Hash) (channeldb.Invoice, error)
+	LookupInvoice(context.Context, lntypes.Hash) (invoices.Invoice, error)
 
 	// NotifyExitHopHtlc attempts to mark an invoice as settled. If the
 	// invoice is a debug invoice, then this method is a noop as debug
@@ -28,15 +32,16 @@ type InvoiceDatabase interface {
 	// for decoding purposes.
 	NotifyExitHopHtlc(payHash lntypes.Hash, paidAmount lnwire.MilliSatoshi,
 		expiry uint32, currentHeight int32,
-		circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+		circuitKey models.CircuitKey, hodlChan chan<- interface{},
+		wireCustomRecords lnwire.CustomRecords,
 		payload invoices.Payload) (invoices.HtlcResolution, error)
 
 	// CancelInvoice attempts to cancel the invoice corresponding to the
 	// passed payment hash.
-	CancelInvoice(payHash lntypes.Hash) error
+	CancelInvoice(ctx context.Context, payHash lntypes.Hash) error
 
 	// SettleHodlInvoice settles a hold invoice.
-	SettleHodlInvoice(preimage lntypes.Preimage) error
+	SettleHodlInvoice(ctx context.Context, preimage lntypes.Preimage) error
 
 	// HodlUnsubscribeAll unsubscribes from all htlc resolutions.
 	HodlUnsubscribeAll(subscriber chan<- interface{})
@@ -58,8 +63,10 @@ type packetHandler interface {
 // whether a link has too much dust exposure.
 type dustHandler interface {
 	// getDustSum returns the dust sum on either the local or remote
-	// commitment.
-	getDustSum(remote bool) lnwire.MilliSatoshi
+	// commitment. An optional fee parameter can be passed in which is used
+	// to calculate the dust sum.
+	getDustSum(whoseCommit lntypes.ChannelParty,
+		fee fn.Option[chainfee.SatPerKWeight]) lnwire.MilliSatoshi
 
 	// getFeeRate returns the current channel feerate.
 	getFeeRate() chainfee.SatPerKWeight
@@ -67,6 +74,10 @@ type dustHandler interface {
 	// getDustClosure returns a closure that can evaluate whether a passed
 	// HTLC is dust.
 	getDustClosure() dustClosure
+
+	// getCommitFee returns the commitment fee in satoshis from either the
+	// local or remote commitment. This does not include dust.
+	getCommitFee(remote bool) btcutil.Amount
 }
 
 // scidAliasHandler is an interface that the ChannelLink implements so it can
@@ -76,7 +87,7 @@ type scidAliasHandler interface {
 	// HTLCs on option_scid_alias channels.
 	attachFailAliasUpdate(failClosure func(
 		sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate)
+		incoming bool) *lnwire.ChannelUpdate1)
 
 	// getAliases fetches the link's underlying aliases. This is used by
 	// the Switch to determine whether to forward an HTLC and where to
@@ -132,11 +143,73 @@ type ChannelUpdateHandler interface {
 	// parameter.
 	MayAddOutgoingHtlc(lnwire.MilliSatoshi) error
 
-	// ShutdownIfChannelClean shuts the link down if the channel state is
-	// clean. This can be used with dynamic commitment negotiation or coop
-	// close negotiation which require a clean channel state.
-	ShutdownIfChannelClean() error
+	// EnableAdds sets the ChannelUpdateHandler state to allow
+	// UpdateAddHtlc's in the specified direction. It returns true if the
+	// state was changed and false if the desired state was already set
+	// before the method was called.
+	EnableAdds(direction LinkDirection) bool
+
+	// DisableAdds sets the ChannelUpdateHandler state to allow
+	// UpdateAddHtlc's in the specified direction. It returns true if the
+	// state was changed and false if the desired state was already set
+	// before the method was called.
+	DisableAdds(direction LinkDirection) bool
+
+	// IsFlushing returns true when UpdateAddHtlc's are disabled in the
+	// direction of the argument.
+	IsFlushing(direction LinkDirection) bool
+
+	// OnFlushedOnce adds a hook that will be called the next time the
+	// channel state reaches zero htlcs. This hook will only ever be called
+	// once. If the channel state already has zero htlcs, then this will be
+	// called immediately.
+	OnFlushedOnce(func())
+
+	// OnCommitOnce adds a hook that will be called the next time a
+	// CommitSig message is sent in the argument's LinkDirection. This hook
+	// will only ever be called once. If no CommitSig is owed in the
+	// argument's LinkDirection, then we will call this hook immediately.
+	OnCommitOnce(LinkDirection, func())
+
+	// InitStfu allows us to initiate quiescence on this link. It returns
+	// a receive only channel that will block until quiescence has been
+	// achieved, or definitively fails. The return value is the
+	// ChannelParty who holds the role of initiator or Err if the operation
+	// fails.
+	//
+	// This operation has been added to allow channels to be quiesced via
+	// RPC. It may be removed or reworked in the future as RPC initiated
+	// quiescence is a holdover until we have downstream protocols that use
+	// it.
+	InitStfu() <-chan fn.Result[lntypes.ChannelParty]
 }
+
+// CommitHookID is a value that is used to uniquely identify hooks in the
+// ChannelUpdateHandler's commitment update lifecycle. You should never need to
+// construct one of these by hand, nor should you try.
+type CommitHookID uint64
+
+// FlushHookID is a value that is used to uniquely identify hooks in the
+// ChannelUpdateHandler's flush lifecycle. You should never need to construct
+// one of these by hand, nor should you try.
+type FlushHookID uint64
+
+// LinkDirection is used to query and change any link state on a per-direction
+// basis.
+type LinkDirection bool
+
+const (
+	// Incoming is the direction from the remote peer to our node.
+	Incoming LinkDirection = false
+
+	// Outgoing is the direction from our node to the remote peer.
+	Outgoing LinkDirection = true
+)
+
+// OptionalBandwidth is a type alias for the result of a bandwidth query that
+// may return a bandwidth value or fn.None if the bandwidth is not available or
+// not applicable.
+type OptionalBandwidth = fn.Option[lnwire.MilliSatoshi]
 
 // ChannelLink is an interface which represents the subsystem for managing the
 // incoming htlc requests, applying the changes to the channel, and also
@@ -175,7 +248,7 @@ type ChannelLink interface {
 	IsUnadvertised() bool
 
 	// ChannelPoint returns the channel outpoint for the channel link.
-	ChannelPoint() *wire.OutPoint
+	ChannelPoint() wire.OutPoint
 
 	// ShortChanID returns the short channel ID for the channel link. The
 	// short channel ID encodes the exact location in the main chain that
@@ -191,7 +264,7 @@ type ChannelLink interface {
 	// UpdateForwardingPolicy updates the forwarding policy for the target
 	// ChannelLink. Once updated, the link will use the new forwarding
 	// policy to govern if it an incoming HTLC should be forwarded or not.
-	UpdateForwardingPolicy(ForwardingPolicy)
+	UpdateForwardingPolicy(models.ForwardingPolicy)
 
 	// CheckHtlcForward should return a nil error if the passed HTLC details
 	// satisfy the current forwarding policy fo the target link. Otherwise,
@@ -199,9 +272,10 @@ type ChannelLink interface {
 	// in order to signal to the source of the HTLC, the policy consistency
 	// issue.
 	CheckHtlcForward(payHash [32]byte, incomingAmt lnwire.MilliSatoshi,
-		amtToForward lnwire.MilliSatoshi,
-		incomingTimeout, outgoingTimeout uint32,
-		heightNow uint32, scid lnwire.ShortChannelID) *LinkError
+		amtToForward lnwire.MilliSatoshi, incomingTimeout,
+		outgoingTimeout uint32, inboundFee models.InboundFee,
+		heightNow uint32, scid lnwire.ShortChannelID,
+		customRecords lnwire.CustomRecords) *LinkError
 
 	// CheckHtlcTransit should return a nil error if the passed HTLC details
 	// satisfy the current channel policy.  Otherwise, a LinkError with a
@@ -209,23 +283,43 @@ type ChannelLink interface {
 	// the violation. This call is intended to be used for locally initiated
 	// payments for which there is no corresponding incoming htlc.
 	CheckHtlcTransit(payHash [32]byte, amt lnwire.MilliSatoshi,
-		timeout uint32, heightNow uint32) *LinkError
+		timeout uint32, heightNow uint32,
+		customRecords lnwire.CustomRecords) *LinkError
 
 	// Stats return the statistics of channel link. Number of updates,
 	// total sent/received milli-satoshis.
 	Stats() (uint64, lnwire.MilliSatoshi, lnwire.MilliSatoshi)
 
-	// Peer returns the representation of remote peer with which we have
-	// the channel link opened.
-	Peer() lnpeer.Peer
+	// PeerPubKey returns the serialized public key of remote peer with
+	// which we have the channel link opened.
+	PeerPubKey() [33]byte
 
 	// AttachMailBox delivers an active MailBox to the link. The MailBox may
 	// have buffered messages.
 	AttachMailBox(MailBox)
 
-	// Start/Stop are used to initiate the start/stop of the channel link
-	// functioning.
+	// FundingCustomBlob returns the custom funding blob of the channel that
+	// this link is associated with. The funding blob represents static
+	// information about the channel that was created at channel funding
+	// time.
+	FundingCustomBlob() fn.Option[tlv.Blob]
+
+	// CommitmentCustomBlob returns the custom blob of the current local
+	// commitment of the channel that this link is associated with.
+	CommitmentCustomBlob() fn.Option[tlv.Blob]
+
+	// AuxBandwidth returns the bandwidth that can be used for a channel,
+	// expressed in milli-satoshi. This might be different from the regular
+	// BTC bandwidth for custom channels. This will always return fn.None()
+	// for a regular (non-custom) channel.
+	AuxBandwidth(amount lnwire.MilliSatoshi, cid lnwire.ShortChannelID,
+		htlcBlob fn.Option[tlv.Blob],
+		ts AuxTrafficShaper) fn.Result[OptionalBandwidth]
+
+	// Start starts the channel link.
 	Start() error
+
+	// Stop requests the channel link to be shut down.
 	Stop()
 }
 
@@ -248,17 +342,13 @@ type TowerClient interface {
 	// parameters within the client. This should be called during link
 	// startup to ensure that the client is able to support the link during
 	// operation.
-	RegisterChannel(lnwire.ChannelID) error
+	RegisterChannel(lnwire.ChannelID, channeldb.ChannelType) error
 
 	// BackupState initiates a request to back up a particular revoked
 	// state. If the method returns nil, the backup is guaranteed to be
-	// successful unless the tower is unavailable and client is force quit,
-	// or the justice transaction would create dust outputs when trying to
-	// abide by the negotiated policy. If the channel we're trying to back
-	// up doesn't have a tweak for the remote party's output, then
-	// isTweakless should be true.
-	BackupState(*lnwire.ChannelID, *lnwallet.BreachRetribution,
-		channeldb.ChannelType) error
+	// successful unless the justice transaction would create dust outputs
+	// when trying to abide by the negotiated policy.
+	BackupState(chanID *lnwire.ChannelID, stateNum uint64) error
 }
 
 // InterceptableHtlcForwarder is the interface to set the interceptor
@@ -280,11 +370,11 @@ type InterceptableHtlcForwarder interface {
 type ForwardInterceptor func(InterceptedPacket) error
 
 // InterceptedPacket contains the relevant information for the interceptor about
-// an htlc.
+// an HTLC.
 type InterceptedPacket struct {
 	// IncomingCircuit contains the incoming channel and htlc id of the
 	// packet.
-	IncomingCircuit channeldb.CircuitKey
+	IncomingCircuit models.CircuitKey
 
 	// OutgoingChanID is the destination channel for this packet.
 	OutgoingChanID lnwire.ShortChannelID
@@ -306,12 +396,16 @@ type InterceptedPacket struct {
 	// IncomingAmount is the amount of the accepted htlc.
 	IncomingAmount lnwire.MilliSatoshi
 
-	// CustomRecords are user-defined records in the custom type range that
-	// were included in the payload.
-	CustomRecords record.CustomSet
+	// InOnionCustomRecords are user-defined records in the custom type
+	// range that were included in the payload.
+	InOnionCustomRecords record.CustomSet
 
 	// OnionBlob is the onion packet for the next hop
 	OnionBlob [lnwire.OnionPacketSize]byte
+
+	// InWireCustomRecords are user-defined p2p wire message records that
+	// were defined by the peer that forwarded this HTLC to us.
+	InWireCustomRecords lnwire.CustomRecords
 
 	// AutoFailHeight is the block height at which this intercept will be
 	// failed back automatically.
@@ -331,6 +425,12 @@ type InterceptedForward interface {
 	// basically means the caller wants to resume with the default behavior for
 	// this htlc which usually means forward it.
 	Resume() error
+
+	// ResumeModified notifies the intention to resume an existing hold
+	// forward with modified fields.
+	ResumeModified(inAmountMsat,
+		outAmountMsat fn.Option[lnwire.MilliSatoshi],
+		outWireCustomRecords fn.Option[lnwire.CustomRecords]) error
 
 	// Settle notifies the intention to settle an existing hold
 	// forward with a given preimage.
@@ -355,7 +455,7 @@ type htlcNotifier interface {
 	NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
 		eventType HtlcEventType)
 
-	// NotifyIncomingLinkFailEvent notifies that a htlc has failed on our
+	// NotifyLinkFailEvent notifies that a htlc has failed on our
 	// incoming link. It takes an isReceive bool to differentiate between
 	// our node's receives and forwards.
 	NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
@@ -373,6 +473,44 @@ type htlcNotifier interface {
 
 	// NotifyFinalHtlcEvent notifies the HtlcNotifier that the final outcome
 	// for an htlc has been determined.
-	NotifyFinalHtlcEvent(key channeldb.CircuitKey,
+	NotifyFinalHtlcEvent(key models.CircuitKey,
 		info channeldb.FinalHtlcInfo)
+}
+
+// AuxHtlcModifier is an interface that allows the sender to modify the outgoing
+// HTLC of a payment by changing the amount or the wire message tlv records.
+type AuxHtlcModifier interface {
+	// ProduceHtlcExtraData is a function that, based on the previous extra
+	// data blob of an HTLC, may produce a different blob or modify the
+	// amount of bitcoin this htlc should carry.
+	ProduceHtlcExtraData(totalAmount lnwire.MilliSatoshi,
+		htlcCustomRecords lnwire.CustomRecords) (lnwire.MilliSatoshi,
+		lnwire.CustomRecords, error)
+}
+
+// AuxTrafficShaper is an interface that allows the sender to determine if a
+// payment should be carried by a channel based on the TLV records that may be
+// present in the `update_add_htlc` message or the channel commitment itself.
+type AuxTrafficShaper interface {
+	AuxHtlcModifier
+
+	// ShouldHandleTraffic is called in order to check if the channel
+	// identified by the provided channel ID may have external mechanisms
+	// that would allow it to carry out the payment.
+	ShouldHandleTraffic(cid lnwire.ShortChannelID,
+		fundingBlob fn.Option[tlv.Blob]) (bool, error)
+
+	// PaymentBandwidth returns the available bandwidth for a custom channel
+	// decided by the given channel aux blob and HTLC blob. A return value
+	// of 0 means there is no bandwidth available. To find out if a channel
+	// is a custom channel that should be handled by the traffic shaper, the
+	// ShouldHandleTraffic method should be called first.
+	PaymentBandwidth(htlcBlob, commitmentBlob fn.Option[tlv.Blob],
+		linkBandwidth,
+		htlcAmt lnwire.MilliSatoshi) (lnwire.MilliSatoshi, error)
+
+	// IsCustomHTLC returns true if the HTLC carries the set of relevant
+	// custom records to put it under the purview of the traffic shaper,
+	// meaning that it's from a custom channel.
+	IsCustomHTLC(htlcRecords lnwire.CustomRecords) bool
 }

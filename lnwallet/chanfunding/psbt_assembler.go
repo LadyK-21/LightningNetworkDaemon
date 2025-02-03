@@ -1,17 +1,19 @@
 package chanfunding
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 )
@@ -163,6 +165,13 @@ func (i *PsbtIntent) BindKeys(localKey *keychain.KeyDescriptor,
 	i.State = PsbtOutputKnown
 }
 
+// BindTapscriptRoot takes an optional tapscript root and binds it to the
+// underlying funding intent. This only applies to musig2 channels, and will be
+// used to make the musig2 funding output.
+func (i *PsbtIntent) BindTapscriptRoot(root fn.Option[chainhash.Hash]) {
+	i.tapscriptRoot = root
+}
+
 // FundingParams returns the parameters that are necessary to start funding the
 // channel output this intent was created for. It returns the P2WSH funding
 // address, the exact funding amount and a PSBT packet that contains exactly one
@@ -178,23 +187,26 @@ func (i *PsbtIntent) FundingParams() (btcutil.Address, int64, *psbt.Packet,
 	// The funding output needs to be known already at this point, which
 	// means we need to have the local and remote multisig keys bound
 	// already.
-	witnessScript, out, err := i.FundingOutput()
+	_, out, err := i.FundingOutput()
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("unable to create funding "+
 			"output: %v", err)
 	}
-	witnessScriptHash := sha256.Sum256(witnessScript)
 
-	// Encode the address in the human readable bech32 format.
-	addr, err := btcutil.NewAddressWitnessScriptHash(
-		witnessScriptHash[:], i.netParams,
-	)
+	script, err := txscript.ParsePkScript(out.PkScript)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("unable to encode address: %v",
+		return nil, 0, nil, fmt.Errorf("unable to parse funding "+
+			"output script: %w", err)
+	}
+
+	// Encode the address in the human-readable bech32 format.
+	addr, err := script.Address(i.netParams)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("unable to encode address: %w",
 			err)
 	}
 
-	// We'll also encode the address/amount in a machine readable raw PSBT
+	// We'll also encode the address/amount in a machine-readable raw PSBT
 	// format. If the user supplied a base PSBT, we'll add the output to
 	// that one, otherwise we'll create a new one.
 	packet := i.BasePsbt
@@ -202,11 +214,22 @@ func (i *PsbtIntent) FundingParams() (btcutil.Address, int64, *psbt.Packet,
 		packet, err = psbt.New(nil, nil, 2, 0, nil)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("unable to create "+
-				"PSBT: %v", err)
+				"PSBT: %w", err)
 		}
 	}
 	packet.UnsignedTx.TxOut = append(packet.UnsignedTx.TxOut, out)
-	packet.Outputs = append(packet.Outputs, psbt.POutput{})
+
+	var pOut psbt.POutput
+
+	// If this is a MuSig2 channel, we also need to communicate the internal
+	// key to the caller. Otherwise, they cannot verify the construction of
+	// the P2TR output script.
+	pOut.TaprootInternalKey = fn.MapOptionZ(
+		i.TaprootInternalKey(), schnorr.SerializePubKey,
+	)
+
+	packet.Outputs = append(packet.Outputs, pOut)
+
 	return addr, out.Value, packet, nil
 }
 
@@ -225,7 +248,7 @@ func (i *PsbtIntent) Verify(packet *psbt.Packet, skipFinalize bool) error {
 	// Try to locate the channel funding multisig output.
 	_, expectedOutput, err := i.FundingOutput()
 	if err != nil {
-		return fmt.Errorf("funding output cannot be created: %v", err)
+		return fmt.Errorf("funding output cannot be created: %w", err)
 	}
 	outputFound := false
 	outputSum := int64(0)
@@ -248,7 +271,7 @@ func (i *PsbtIntent) Verify(packet *psbt.Packet, skipFinalize bool) error {
 	}
 	sum, err := psbt.SumUtxoInputValues(packet)
 	if err != nil {
-		return fmt.Errorf("error determining input sum: %v", err)
+		return fmt.Errorf("error determining input sum: %w", err)
 	}
 	if sum <= outputSum {
 		return fmt.Errorf("input amount sum must be larger than " +
@@ -302,11 +325,11 @@ func (i *PsbtIntent) Finalize(packet *psbt.Packet) error {
 	// broadcast.
 	err := psbt.MaybeFinalizeAll(packet)
 	if err != nil {
-		return fmt.Errorf("error finalizing PSBT: %v", err)
+		return fmt.Errorf("error finalizing PSBT: %w", err)
 	}
 	rawTx, err := psbt.Extract(packet)
 	if err != nil {
-		return fmt.Errorf("unable to extract funding TX: %v", err)
+		return fmt.Errorf("unable to extract funding TX: %w", err)
 	}
 
 	return i.FinalizeRawTX(rawTx)
@@ -338,13 +361,13 @@ func (i *PsbtIntent) FinalizeRawTX(rawTx *wire.MsgTx) error {
 		rawTx.TxOut, i.PendingPsbt.UnsignedTx.TxOut,
 	)
 	if err != nil {
-		return fmt.Errorf("outputs differ from verified PSBT: %v", err)
+		return fmt.Errorf("outputs differ from verified PSBT: %w", err)
 	}
 	err = psbt.VerifyInputPrevOutpointsEqual(
 		rawTx.TxIn, i.PendingPsbt.UnsignedTx.TxIn,
 	)
 	if err != nil {
-		return fmt.Errorf("inputs differ from verified PSBT: %v", err)
+		return fmt.Errorf("inputs differ from verified PSBT: %w", err)
 	}
 
 	// We also check that we have a signed TX. This is only necessary if the
@@ -352,7 +375,7 @@ func (i *PsbtIntent) FinalizeRawTX(rawTx *wire.MsgTx) error {
 	// extracting the TX from a PSBT.
 	err = verifyInputsSigned(rawTx.TxIn)
 	if err != nil {
-		return fmt.Errorf("inputs not signed: %v", err)
+		return fmt.Errorf("inputs not signed: %w", err)
 	}
 
 	// As far as we can tell, this TX is ok to be used as a funding
@@ -381,7 +404,7 @@ func (i *PsbtIntent) CompileFundingTx() (*wire.MsgTx, error) {
 	// Identify our funding outpoint now that we know everything's ready.
 	_, txOut, err := i.FundingOutput()
 	if err != nil {
-		return nil, fmt.Errorf("cannot get funding output: %v", err)
+		return nil, fmt.Errorf("cannot get funding output: %w", err)
 	}
 	ok, idx := input.FindScriptOutputIndex(i.FinalTX, txOut.PkScript)
 	if !ok {
@@ -514,15 +537,25 @@ func NewPsbtAssembler(fundingAmt btcutil.Amount, basePsbt *psbt.Packet,
 //
 // NOTE: This method satisfies the chanfunding.Assembler interface.
 func (p *PsbtAssembler) ProvisionChannel(req *Request) (Intent, error) {
-	// We'll exit out if this field is set as the funding transaction will
+	// We'll exit out if SubtractFees is set as the funding transaction will
 	// be assembled externally, so we don't influence coin selection.
 	if req.SubtractFees {
 		return nil, fmt.Errorf("SubtractFees not supported for PSBT")
 	}
 
+	// We'll exit out if FundUpToMaxAmt or MinFundAmt is set as the funding
+	// transaction will be assembled externally, so we don't influence coin
+	// selection.
+	if req.FundUpToMaxAmt != 0 || req.MinFundAmt != 0 {
+		return nil, fmt.Errorf("FundUpToMaxAmt and MinFundAmt not " +
+			"supported for PSBT")
+	}
+
 	intent := &PsbtIntent{
 		ShimIntent: ShimIntent{
 			localFundingAmt: p.fundingAmt,
+			musig2:          req.Musig2,
+			tapscriptRoot:   req.TapscriptRoot,
 		},
 		State:         PsbtShimRegistered,
 		BasePsbt:      p.basePsbt,
@@ -588,8 +621,8 @@ func verifyAllInputsSegWit(txIns []*wire.TxIn, ins []psbt.PInput) error {
 			txIn := txIns[idx]
 			txOut := utxo.TxOut[txIn.PreviousOutPoint.Index]
 
-			if !isSegWitScript(txOut.PkScript) &&
-				!isSegWitScript(in.RedeemScript) {
+			if !txscript.IsWitnessProgram(txOut.PkScript) &&
+				!txscript.IsWitnessProgram(in.RedeemScript) {
 
 				return fmt.Errorf("input %d is non-SegWit "+
 					"spend or missing redeem script", idx)
@@ -604,20 +637,4 @@ func verifyAllInputsSegWit(txIns []*wire.TxIn, ins []psbt.PInput) error {
 	}
 
 	return nil
-}
-
-// isSegWitScript returns true if the given pkScript can be parsed successfully
-// as a SegWit v0 spend.
-func isSegWitScript(pkScript []byte) bool {
-	if len(pkScript) == 0 {
-		return false
-	}
-
-	parsed, err := txscript.ParsePkScript(pkScript)
-	if err != nil {
-		return false
-	}
-
-	return parsed.Class() == txscript.WitnessV0PubKeyHashTy ||
-		parsed.Class() == txscript.WitnessV0ScriptHashTy
 }

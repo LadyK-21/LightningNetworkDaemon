@@ -4,13 +4,14 @@ import (
 	"errors"
 	"time"
 
+	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/lightningnetwork/lnd/channeldb"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/routing/chainview"
 )
@@ -93,7 +94,7 @@ func (n *NoChainBackend) DisconnectedBlocks() <-chan *chainview.FilteredBlock {
 	return make(chan *chainview.FilteredBlock)
 }
 
-func (n *NoChainBackend) UpdateFilter([]channeldb.EdgePoint, uint32) error {
+func (n *NoChainBackend) UpdateFilter([]graphdb.EdgePoint, uint32) error {
 	return nil
 }
 
@@ -211,6 +212,16 @@ func (n *NoChainSource) Notifications() <-chan interface{} {
 
 func (n *NoChainSource) BackEnd() string {
 	return noChainBackendName
+}
+
+func (n *NoChainSource) TestMempoolAccept([]*wire.MsgTx,
+	float64) ([]*btcjson.TestMempoolAcceptResult, error) {
+
+	return nil, nil
+}
+
+func (n *NoChainSource) MapRPCErr(err error) error {
+	return err
 }
 
 var _ chain.Interface = (*NoChainSource)(nil)

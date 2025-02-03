@@ -193,7 +193,7 @@ rescan.
 ### Forced In-Place Rescan
 
 The recovery methods described above assume a clean slate for a node, so
-there's no existing UTXO or key data in the node's database. However, there're
+there's no existing UTXO or key data in the node's database. However, there are
 times when an _existing_ node may want to _manually_ rescan the chain. We have
 a command line flag for that! Just start `lnd` and add the following flag:
 ```shell
@@ -231,7 +231,7 @@ knows if they have the latest state of a channel or not. Instead, we aim to
 provide a simple, safe method to allow users to recover the settled funds in
 their channels in the case of partial or complete data loss. The backups
 themselves are encrypted using a key derived from the user's seed, this way we
-protect privacy of the users channels in the back up state, and ensure that a
+protect privacy of the users channels in the backup state, and ensure that a
 random node can't attempt to import another user's channels.
 
 Given a valid SCB, the user will be able to recover funds that are fully
@@ -249,7 +249,7 @@ There are multiple ways of obtaining SCBs from `lnd`. The most commonly used
 method will likely be via the `channel.backup` file that's stored on-disk
 alongside the rest of the chain data. This is a special file that contains SCB
 entries for _all_ currently open channels. Each time a channel is opened or
-closed, this file is updated on disk in a safe manner (atomic file rename). As
+closed, this file is updated on disk safely (atomic file rename). As
 a result, unlike the `channel.db` file, it's _always_ safe to copy this file
 for backup at ones desired location. The default location on Linux is: 
 `~/.lnd/data/chain/bitcoin/mainnet/channel.backup`
@@ -257,6 +257,22 @@ for backup at ones desired location. The default location on Linux is:
 An example of using file system level notification to [copy the backup to a
 distinct volume/partition/drive can be found
 here](https://gist.github.com/alexbosworth/2c5e185aedbdac45a03655b709e255a3).
+
+##### Last resort manual force close
+
+Reserve this option as a last resort when the peer is offline and all other
+avenues to retrieve funds from the channel have been exhausted. The primary
+motivation for introducing this option is to provide a means of recovery,
+albeit with some risk, rather than losing the funds indefinitely. This is a very
+dangerous option, so it should only be used after consulting with a recovery
+specialist or after opening an issue to make sure!!!
+
+Starting with release 0.19.0 LND includes unsigned force close transaction
+for a channel into channel.backup file and RPCs returning channel backups.
+To generate a force close transaction from the backup file, utilize the
+`chantools scbforceclose` command. However, exercise caution as this action is
+perilous. If the channel has been updated since the backup creation, another
+node or a watchtower may issue a penalty transaction, seizing all funds!
 
 #### Using the `ExportChanBackup` RPC
 
@@ -280,7 +296,7 @@ $  lncli --network=simnet exportchanbackup --all
 $  lncli --network=simnet exportchanbackup --all --output_file=channel.backup
 ```
 
-As shown above, a user can either: specify a specific channel to backup, backup
+As shown above, a user can either: specify a specific channel to back up, backup
 all existing channels, or backup directly to an on-disk file. All backups use
 the same format.
 

@@ -26,6 +26,17 @@ var (
 	// already "in flight" on the network.
 	ErrPaymentInFlight = errors.New("payment is in transition")
 
+	// ErrPaymentExists is returned when we try to initialize an already
+	// existing payment that is not failed.
+	ErrPaymentExists = errors.New("payment already exists")
+
+	// ErrPaymentInternal is returned when performing the payment has a
+	// conflicting state, such as,
+	// - payment has StatusSucceeded but remaining amount is not zero.
+	// - payment has StatusInitiated but remaining amount is zero.
+	// - payment has StatusFailed but remaining amount is zero.
+	ErrPaymentInternal = errors.New("internal error")
+
 	// ErrPaymentNotInitiated is returned if the payment wasn't initiated.
 	ErrPaymentNotInitiated = errors.New("payment isn't initiated")
 
@@ -43,7 +54,8 @@ var (
 
 	// ErrPaymentTerminal is returned if we attempt to alter a payment that
 	// already has reached a terminal condition.
-	ErrPaymentTerminal = errors.New("payment has reached terminal condition")
+	ErrPaymentTerminal = errors.New("payment has reached terminal " +
+		"condition")
 
 	// ErrAttemptAlreadySettled is returned if we try to alter an already
 	// settled HTLC attempt.
@@ -55,12 +67,12 @@ var (
 
 	// ErrValueMismatch is returned if we try to register a non-MPP attempt
 	// with an amount that doesn't match the payment amount.
-	ErrValueMismatch = errors.New("attempted value doesn't match payment" +
+	ErrValueMismatch = errors.New("attempted value doesn't match payment " +
 		"amount")
 
 	// ErrValueExceedsAmt is returned if we try to register an attempt that
 	// would take the total sent amount above the payment amount.
-	ErrValueExceedsAmt = errors.New("attempted value exceeds payment" +
+	ErrValueExceedsAmt = errors.New("attempted value exceeds payment " +
 		"amount")
 
 	// ErrNonMPPayment is returned if we try to register an MPP attempt for
@@ -71,13 +83,37 @@ var (
 	// a payment that already has an MPP attempt registered.
 	ErrMPPayment = errors.New("payment has MPP attempts")
 
+	// ErrMPPRecordInBlindedPayment is returned if we try to register an
+	// attempt with an MPP record for a payment to a blinded path.
+	ErrMPPRecordInBlindedPayment = errors.New("blinded payment cannot " +
+		"contain MPP records")
+
+	// ErrBlindedPaymentTotalAmountMismatch is returned if we try to
+	// register an HTLC shard to a blinded route where the total amount
+	// doesn't match existing shards.
+	ErrBlindedPaymentTotalAmountMismatch = errors.New("blinded path " +
+		"total amount mismatch")
+
 	// ErrMPPPaymentAddrMismatch is returned if we try to register an MPP
 	// shard where the payment address doesn't match existing shards.
 	ErrMPPPaymentAddrMismatch = errors.New("payment address mismatch")
 
 	// ErrMPPTotalAmountMismatch is returned if we try to register an MPP
 	// shard where the total amount doesn't match existing shards.
-	ErrMPPTotalAmountMismatch = errors.New("mp payment total amount mismatch")
+	ErrMPPTotalAmountMismatch = errors.New("mp payment total amount " +
+		"mismatch")
+
+	// ErrPaymentPendingSettled is returned when we try to add a new
+	// attempt to a payment that has at least one of its HTLCs settled.
+	ErrPaymentPendingSettled = errors.New("payment has settled htlcs")
+
+	// ErrPaymentPendingFailed is returned when we try to add a new attempt
+	// to a payment that already has a failure reason.
+	ErrPaymentPendingFailed = errors.New("payment has failure reason")
+
+	// ErrSentExceedsTotal is returned if the payment's current total sent
+	// amount exceed the total amount.
+	ErrSentExceedsTotal = errors.New("total sent exceeds total amount")
 
 	// errNoAttemptInfo is returned when no attempt info is stored yet.
 	errNoAttemptInfo = errors.New("unable to find attempt info for " +
@@ -139,34 +175,21 @@ func (p *PaymentControl) InitPayment(paymentHash lntypes.Hash,
 
 		// Get the existing status of this payment, if any.
 		paymentStatus, err := fetchPaymentStatus(bucket)
-		if err != nil {
+
+		switch {
+		// If no error is returned, it means we already have this
+		// payment. We'll check the status to decide whether we allow
+		// retrying the payment or return a specific error.
+		case err == nil:
+			if err := paymentStatus.initializable(); err != nil {
+				updateErr = err
+				return nil
+			}
+
+		// Otherwise, if the error is not `ErrPaymentNotInitiated`,
+		// we'll return the error.
+		case !errors.Is(err, ErrPaymentNotInitiated):
 			return err
-		}
-
-		switch paymentStatus {
-
-		// We allow retrying failed payments.
-		case StatusFailed:
-
-		// This is a new payment that is being initialized for the
-		// first time.
-		case StatusUnknown:
-
-		// We already have an InFlight payment on the network. We will
-		// disallow any new payments.
-		case StatusInFlight:
-			updateErr = ErrPaymentInFlight
-			return nil
-
-		// We've already succeeded a payment to this payment hash,
-		// forbid the switch from sending another.
-		case StatusSucceeded:
-			updateErr = ErrAlreadyPaid
-			return nil
-
-		default:
-			updateErr = ErrUnknownPaymentStatus
-			return nil
 		}
 
 		// Before we set our new sequence number, we check whether this
@@ -217,7 +240,7 @@ func (p *PaymentControl) InitPayment(paymentHash lntypes.Hash,
 		return bucket.Delete(paymentFailInfoKey)
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to init payment: %w", err)
 	}
 
 	return updateErr
@@ -312,29 +335,57 @@ func (p *PaymentControl) RegisterAttempt(paymentHash lntypes.Hash,
 			return err
 		}
 
-		p, err := fetchPayment(bucket)
+		payment, err = fetchPayment(bucket)
 		if err != nil {
 			return err
 		}
 
-		// We cannot register a new attempt if the payment already has
-		// reached a terminal condition. We check this before
-		// ensureInFlight because it is a more general check.
-		settle, fail := p.TerminalInfo()
-		if settle != nil || fail != nil {
-			return ErrPaymentTerminal
-		}
-
-		// Ensure the payment is in-flight.
-		if err := ensureInFlight(p); err != nil {
+		// Check if registering a new attempt is allowed.
+		if err := payment.Registrable(); err != nil {
 			return err
 		}
+
+		// If the final hop has encrypted data, then we know this is a
+		// blinded payment. In blinded payments, MPP records are not set
+		// for split payments and the recipient is responsible for using
+		// a consistent PathID across the various encrypted data
+		// payloads that we received from them for this payment. All we
+		// need to check is that the total amount field for each HTLC
+		// in the split payment is correct.
+		isBlinded := len(attempt.Route.FinalHop().EncryptedData) != 0
 
 		// Make sure any existing shards match the new one with regards
 		// to MPP options.
 		mpp := attempt.Route.FinalHop().MPP
-		for _, h := range p.InFlightHTLCs() {
+
+		// MPP records should not be set for attempts to blinded paths.
+		if isBlinded && mpp != nil {
+			return ErrMPPRecordInBlindedPayment
+		}
+
+		for _, h := range payment.InFlightHTLCs() {
 			hMpp := h.Route.FinalHop().MPP
+
+			// If this is a blinded payment, then no existing HTLCs
+			// should have MPP records.
+			if isBlinded && hMpp != nil {
+				return ErrMPPRecordInBlindedPayment
+			}
+
+			// If this is a blinded payment, then we just need to
+			// check that the TotalAmtMsat field for this shard
+			// is equal to that of any other shard in the same
+			// payment.
+			if isBlinded {
+				if attempt.Route.FinalHop().TotalAmtMsat !=
+					h.Route.FinalHop().TotalAmtMsat {
+
+					//nolint:ll
+					return ErrBlindedPaymentTotalAmountMismatch
+				}
+
+				continue
+			}
 
 			switch {
 			// We tried to register a non-MPP attempt for a MPP
@@ -363,16 +414,19 @@ func (p *PaymentControl) RegisterAttempt(paymentHash lntypes.Hash,
 		}
 
 		// If this is a non-MPP attempt, it must match the total amount
-		// exactly.
+		// exactly. Note that a blinded payment is considered an MPP
+		// attempt.
 		amt := attempt.Route.ReceiverAmt()
-		if mpp == nil && amt != p.Info.Value {
+		if !isBlinded && mpp == nil && amt != payment.Info.Value {
 			return ErrValueMismatch
 		}
 
 		// Ensure we aren't sending more than the total payment amount.
-		sentAmt, _ := p.SentAmt()
-		if sentAmt+amt > p.Info.Value {
-			return ErrValueExceedsAmt
+		sentAmt, _ := payment.SentAmt()
+		if sentAmt+amt > payment.Info.Value {
+			return fmt.Errorf("%w: attempted=%v, payment amount="+
+				"%v", ErrValueExceedsAmt, sentAmt+amt,
+				payment.Info.Value)
 		}
 
 		htlcsBucket, err := bucket.CreateBucketIfNotExists(
@@ -458,7 +512,7 @@ func (p *PaymentControl) updateHtlcKey(paymentHash lntypes.Hash,
 		// We can only update keys of in-flight payments. We allow
 		// updating keys even if the payment has reached a terminal
 		// condition, since the HTLC outcomes must still be updated.
-		if err := ensureInFlight(p); err != nil {
+		if err := p.Status.updatable(); err != nil {
 			return err
 		}
 
@@ -528,14 +582,12 @@ func (p *PaymentControl) Fail(paymentHash lntypes.Hash,
 		// lets the last attempt to fail with a terminal write its
 		// failure to the PaymentControl without synchronizing with
 		// other attempts.
-		paymentStatus, err := fetchPaymentStatus(bucket)
-		if err != nil {
-			return err
-		}
-
-		if paymentStatus == StatusUnknown {
+		_, err = fetchPaymentStatus(bucket)
+		if errors.Is(err, ErrPaymentNotInitiated) {
 			updateErr = ErrPaymentNotInitiated
 			return nil
+		} else if err != nil {
+			return err
 		}
 
 		// Put the failure reason in the bucket for record keeping.
@@ -700,12 +752,12 @@ func (p *PaymentControl) nextPaymentSequence() ([]byte, error) {
 }
 
 // fetchPaymentStatus fetches the payment status of the payment. If the payment
-// isn't found, it will default to "StatusUnknown".
+// isn't found, it will return error `ErrPaymentNotInitiated`.
 func fetchPaymentStatus(bucket kvdb.RBucket) (PaymentStatus, error) {
 	// Creation info should be set for all payments, regardless of state.
 	// If not, it is unknown.
 	if bucket.Get(paymentCreationInfoKey) == nil {
-		return StatusUnknown, nil
+		return 0, ErrPaymentNotInitiated
 	}
 
 	payment, err := fetchPayment(bucket)
@@ -714,36 +766,6 @@ func fetchPaymentStatus(bucket kvdb.RBucket) (PaymentStatus, error) {
 	}
 
 	return payment.Status, nil
-}
-
-// ensureInFlight checks whether the payment found in the given bucket has
-// status InFlight, and returns an error otherwise. This should be used to
-// ensure we only mark in-flight payments as succeeded or failed.
-func ensureInFlight(payment *MPPayment) error {
-	paymentStatus := payment.Status
-
-	switch {
-
-	// The payment was indeed InFlight.
-	case paymentStatus == StatusInFlight:
-		return nil
-
-	// Our records show the payment as unknown, meaning it never
-	// should have left the switch.
-	case paymentStatus == StatusUnknown:
-		return ErrPaymentNotInitiated
-
-	// The payment succeeded previously.
-	case paymentStatus == StatusSucceeded:
-		return ErrPaymentAlreadySucceeded
-
-	// The payment was already failed.
-	case paymentStatus == StatusFailed:
-		return ErrPaymentAlreadyFailed
-
-	default:
-		return ErrUnknownPaymentStatus
-	}
 }
 
 // FetchInFlightPayments returns all payments with status InFlight.
@@ -761,19 +783,14 @@ func (p *PaymentControl) FetchInFlightPayments() ([]*MPPayment, error) {
 				return fmt.Errorf("non bucket element")
 			}
 
-			// If the status is not InFlight, we can return early.
-			paymentStatus, err := fetchPaymentStatus(bucket)
-			if err != nil {
-				return err
-			}
-
-			if paymentStatus != StatusInFlight {
-				return nil
-			}
-
 			p, err := fetchPayment(bucket)
 			if err != nil {
 				return err
+			}
+
+			// Skip the payment if it's terminated.
+			if p.Terminated() {
+				return nil
 			}
 
 			inFlights = append(inFlights, p)

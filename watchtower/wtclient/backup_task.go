@@ -4,16 +4,13 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/blockchain"
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/txsort"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/watchtower/blob"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
 )
@@ -38,9 +35,9 @@ import (
 //     necessary components are stripped out and encrypted before being sent to
 //     the tower in a StateUpdate.
 type backupTask struct {
-	id         wtdb.BackupID
-	breachInfo *lnwallet.BreachRetribution
-	chanType   channeldb.ChannelType
+	id             wtdb.BackupID
+	breachInfo     *lnwallet.BreachRetribution
+	commitmentType blob.CommitmentType
 
 	// state-dependent variables
 
@@ -55,84 +52,10 @@ type backupTask struct {
 	outputs  []*wire.TxOut
 }
 
-// newBackupTask initializes a new backupTask and populates all state-dependent
-// variables.
-func newBackupTask(chanID *lnwire.ChannelID,
-	breachInfo *lnwallet.BreachRetribution,
-	sweepPkScript []byte, chanType channeldb.ChannelType) *backupTask {
-
-	// Parse the non-dust outputs from the breach transaction,
-	// simultaneously computing the total amount contained in the inputs
-	// present. We can't compute the exact output values at this time
-	// since the task has not been assigned to a session, at which point
-	// parameters such as fee rate, number of outputs, and reward rate will
-	// be finalized.
-	var (
-		totalAmt      int64
-		toLocalInput  input.Input
-		toRemoteInput input.Input
-	)
-
-	// Add the sign descriptors and outputs corresponding to the to-local
-	// and to-remote outputs, respectively, if either input amount is
-	// non-dust. Note that the naming here seems reversed, but both are
-	// correct. For example, the to-remote output on the remote party's
-	// commitment is an output that pays to us. Hence the retribution refers
-	// to that output as local, though relative to their commitment, it is
-	// paying to-the-remote party (which is us).
-	if breachInfo.RemoteOutputSignDesc != nil {
-		toLocalInput = input.NewBaseInput(
-			&breachInfo.RemoteOutpoint,
-			input.CommitmentRevoke,
-			breachInfo.RemoteOutputSignDesc,
-			0,
-		)
-		totalAmt += breachInfo.RemoteOutputSignDesc.Output.Value
-	}
-	if breachInfo.LocalOutputSignDesc != nil {
-		var witnessType input.WitnessType
-		switch {
-		case chanType.HasAnchors():
-			witnessType = input.CommitmentToRemoteConfirmed
-		case chanType.IsTweakless():
-			witnessType = input.CommitSpendNoDelayTweakless
-		default:
-			witnessType = input.CommitmentNoDelay
-		}
-
-		// Anchor channels have a CSV-encumbered to-remote output. We'll
-		// construct a CSV input in that case and assign the proper CSV
-		// delay of 1, otherwise we fallback to the a regular P2WKH
-		// to-remote output for tweaked or tweakless channels.
-		if chanType.HasAnchors() {
-			toRemoteInput = input.NewCsvInput(
-				&breachInfo.LocalOutpoint,
-				witnessType,
-				breachInfo.LocalOutputSignDesc,
-				0, 1,
-			)
-		} else {
-			toRemoteInput = input.NewBaseInput(
-				&breachInfo.LocalOutpoint,
-				witnessType,
-				breachInfo.LocalOutputSignDesc,
-				0,
-			)
-		}
-
-		totalAmt += breachInfo.LocalOutputSignDesc.Output.Value
-	}
-
+// newBackupTask initializes a new backupTask.
+func newBackupTask(id wtdb.BackupID, sweepPkScript []byte) *backupTask {
 	return &backupTask{
-		id: wtdb.BackupID{
-			ChanID:       *chanID,
-			CommitHeight: breachInfo.RevokedStateNum,
-		},
-		breachInfo:    breachInfo,
-		chanType:      chanType,
-		toLocalInput:  toLocalInput,
-		toRemoteInput: toRemoteInput,
-		totalAmt:      btcutil.Amount(totalAmt),
+		id:            id,
 		sweepPkScript: sweepPkScript,
 	}
 }
@@ -140,15 +63,16 @@ func newBackupTask(chanID *lnwire.ChannelID,
 // inputs returns all non-dust inputs that we will attempt to spend from.
 //
 // NOTE: Ordering of the inputs is not critical as we sort the transaction with
-// BIP69.
+// BIP69 in a later stage.
 func (t *backupTask) inputs() map[wire.OutPoint]input.Input {
 	inputs := make(map[wire.OutPoint]input.Input)
 	if t.toLocalInput != nil {
-		inputs[*t.toLocalInput.OutPoint()] = t.toLocalInput
+		inputs[t.toLocalInput.OutPoint()] = t.toLocalInput
 	}
 	if t.toRemoteInput != nil {
-		inputs[*t.toRemoteInput.OutPoint()] = t.toRemoteInput
+		inputs[t.toRemoteInput.OutPoint()] = t.toRemoteInput
 	}
+
 	return inputs
 }
 
@@ -170,8 +94,7 @@ func addrType(pkScript []byte) txscript.ScriptClass {
 func addScriptWeight(weightEstimate *input.TxWeightEstimator,
 	pkScript []byte) error {
 
-	switch addrType(pkScript) { //nolint: whitespace
-
+	switch addrType(pkScript) {
 	case txscript.WitnessV0PubKeyHashTy:
 		weightEstimate.AddP2WKHOutput()
 
@@ -188,11 +111,68 @@ func addScriptWeight(weightEstimate *input.TxWeightEstimator,
 	return nil
 }
 
-// bindSession determines if the backupTask is compatible with the passed
-// SessionInfo's policy. If no error is returned, the task has been bound to the
-// session and can be queued to upload to the tower. Otherwise, the bind failed
-// and should be rescheduled with a different session.
-func (t *backupTask) bindSession(session *wtdb.ClientSessionBody) error {
+// bindSession first populates all state-dependent variables of the task. Then
+// it determines if the backupTask is compatible with the passed SessionInfo's
+// policy. If no error is returned, the task has been bound to the session and
+// can be queued to upload to the tower. Otherwise, the bind failed and should
+// be rescheduled with a different session.
+func (t *backupTask) bindSession(session *wtdb.ClientSessionBody,
+	newBreachRetribution BreachRetributionBuilder) error {
+
+	breachInfo, chanType, err := newBreachRetribution(
+		t.id.ChanID, t.id.CommitHeight,
+	)
+	if err != nil {
+		return err
+	}
+
+	commitType, err := session.Policy.BlobType.CommitmentType(&chanType)
+	if err != nil {
+		return err
+	}
+
+	// Parse the non-dust outputs from the breach transaction,
+	// simultaneously computing the total amount contained in the inputs
+	// present. We can't compute the exact output values at this time
+	// since the task has not been assigned to a session, at which point
+	// parameters such as fee rate, number of outputs, and reward rate will
+	// be finalized.
+	var (
+		totalAmt      int64
+		toLocalInput  input.Input
+		toRemoteInput input.Input
+	)
+
+	// Add the sign descriptors and outputs corresponding to the to-local
+	// and to-remote outputs, respectively, if either input amount is
+	// non-dust. Note that the naming here seems reversed, but both are
+	// correct. For example, the to-remote output on the remote party's
+	// commitment is an output that pays to us. Hence the retribution refers
+	// to that output as local, though relative to their commitment, it is
+	// paying to-the-remote party (which is us).
+	if breachInfo.RemoteOutputSignDesc != nil {
+		toLocalInput, err = commitType.ToLocalInput(breachInfo)
+		if err != nil {
+			return err
+		}
+
+		totalAmt += breachInfo.RemoteOutputSignDesc.Output.Value
+	}
+	if breachInfo.LocalOutputSignDesc != nil {
+		toRemoteInput, err = commitType.ToRemoteInput(breachInfo)
+		if err != nil {
+			return err
+		}
+
+		totalAmt += breachInfo.LocalOutputSignDesc.Output.Value
+	}
+
+	t.commitmentType = commitType
+	t.breachInfo = breachInfo
+	t.toLocalInput = toLocalInput
+	t.toRemoteInput = toRemoteInput
+	t.totalAmt = btcutil.Amount(totalAmt)
+
 	// First we'll begin by deriving a weight estimate for the justice
 	// transaction. The final weight can be different depending on whether
 	// the watchtower is taking a reward.
@@ -201,37 +181,26 @@ func (t *backupTask) bindSession(session *wtdb.ClientSessionBody) error {
 	// Next, add the contribution from the inputs that are present on this
 	// breach transaction.
 	if t.toLocalInput != nil {
-		// An older ToLocalPenaltyWitnessSize constant used to
-		// underestimate the size by one byte. The diferrence in weight
-		// can cause different output values on the sweep transaction,
-		// so we mimic the original bug and create signatures using the
-		// original weight estimate. For anchor channels we'll go ahead
-		// an use the correct penalty witness when signing our justice
-		// transactions.
-		if t.chanType.HasAnchors() {
-			weightEstimate.AddWitnessInput(
-				input.ToLocalPenaltyWitnessSize,
-			)
-		} else {
-			weightEstimate.AddWitnessInput(
-				input.ToLocalPenaltyWitnessSize - 1,
-			)
+		toLocalWitnessSize, err := commitType.ToLocalWitnessSize()
+		if err != nil {
+			return err
 		}
+
+		weightEstimate.AddWitnessInput(toLocalWitnessSize)
 	}
 	if t.toRemoteInput != nil {
-		// Legacy channels (both tweaked and non-tweaked) spend from
-		// P2WKH output. Anchor channels spend a to-remote confirmed
-		// P2WSH  output.
-		if t.chanType.HasAnchors() {
-			weightEstimate.AddWitnessInput(input.ToRemoteConfirmedWitnessSize)
-		} else {
-			weightEstimate.AddWitnessInput(input.P2WKHWitnessSize)
+		toRemoteWitnessSize, err := commitType.ToRemoteWitnessSize()
+		if err != nil {
+			return err
 		}
+
+		weightEstimate.AddWitnessInput(toRemoteWitnessSize)
 	}
 
 	// All justice transactions will either use segwit v0 (p2wkh + p2wsh)
 	// or segwit v1 (p2tr).
-	if err := addScriptWeight(&weightEstimate, t.sweepPkScript); err != nil {
+	err = addScriptWeight(&weightEstimate, t.sweepPkScript)
+	if err != nil {
 		return err
 	}
 
@@ -244,16 +213,10 @@ func (t *backupTask) bindSession(session *wtdb.ClientSessionBody) error {
 		}
 	}
 
-	if t.chanType.HasAnchors() != session.Policy.IsAnchorChannel() {
-		log.Criticalf("Invalid task (has_anchors=%t) for session "+
-			"(has_anchors=%t)", t.chanType.HasAnchors(),
-			session.Policy.IsAnchorChannel())
-	}
-
 	// Now, compute the output values depending on whether FlagReward is set
 	// in the current session's policy.
 	outputs, err := session.Policy.ComputeJusticeTxOuts(
-		t.totalAmt, int64(weightEstimate.Weight()),
+		t.totalAmt, weightEstimate.Weight(),
 		t.sweepPkScript, session.RewardPkScript,
 	)
 	if err != nil {
@@ -277,25 +240,11 @@ func (t *backupTask) craftSessionPayload(
 
 	var hint blob.BreachHint
 
-	// First, copy over the sweep pkscript, the pubkeys used to derive the
-	// to-local script, and the remote CSV delay.
-	keyRing := t.breachInfo.KeyRing
-	justiceKit := &blob.JusticeKit{
-		BlobType:         t.blobType,
-		SweepAddress:     t.sweepPkScript,
-		RevocationPubKey: toBlobPubKey(keyRing.RevocationKey),
-		LocalDelayPubKey: toBlobPubKey(keyRing.ToLocalKey),
-		CSVDelay:         t.breachInfo.RemoteDelay,
-	}
-
-	// If this commitment has an output that pays to us, copy the to-remote
-	// pubkey into the justice kit. This serves as the indicator to the
-	// tower that we expect the breaching transaction to have a non-dust
-	// output to spend from.
-	if t.toRemoteInput != nil {
-		justiceKit.CommitToRemotePubKey = toBlobPubKey(
-			keyRing.ToRemoteKey,
-		)
+	justiceKit, err := t.commitmentType.NewJusticeKit(
+		t.sweepPkScript, t.breachInfo, t.toRemoteInput != nil,
+	)
+	if err != nil {
+		return hint, nil, err
 	}
 
 	// Now, begin construction of the justice transaction. We'll start with
@@ -345,9 +294,10 @@ func (t *backupTask) craftSessionPayload(
 	// Now, iterate through the list of inputs that were initially added to
 	// the transaction and store the computed witness within the justice
 	// kit.
+	commitType := t.commitmentType
 	for _, inp := range inputs {
 		// Lookup the input's new post-sort position.
-		i := inputIndex[*inp.OutPoint()]
+		i := inputIndex[inp.OutPoint()]
 
 		// Construct the full witness required to spend this input.
 		inputScript, err := inp.CraftInputScript(
@@ -357,32 +307,30 @@ func (t *backupTask) craftSessionPayload(
 			return hint, nil, err
 		}
 
-		// Parse the DER-encoded signature from the first position of
-		// the resulting witness. We trim an extra byte to remove the
-		// sighash flag.
-		witness := inputScript.Witness
-		rawSignature := witness[0][:len(witness[0])-1]
+		signature, err := commitType.ParseRawSig(inputScript.Witness)
+		if err != nil {
+			return hint, nil, err
+		}
 
-		// Re-encode the DER signature into a fixed-size 64 byte
-		// signature.
-		signature, err := lnwire.NewSigFromRawSignature(rawSignature)
+		toLocalWitnessType, err := commitType.ToLocalWitnessType()
+		if err != nil {
+			return hint, nil, err
+		}
+
+		toRemoteWitnessType, err := commitType.ToRemoteWitnessType()
 		if err != nil {
 			return hint, nil, err
 		}
 
 		// Finally, copy the serialized signature into the justice kit,
 		// using the input's witness type to select the appropriate
-		// field.
+		// field
 		switch inp.WitnessType() {
-		case input.CommitmentRevoke:
-			copy(justiceKit.CommitToLocalSig[:], signature[:])
+		case toLocalWitnessType:
+			justiceKit.AddToLocalSig(signature)
 
-		case input.CommitSpendNoDelayTweakless:
-			fallthrough
-		case input.CommitmentNoDelay:
-			fallthrough
-		case input.CommitmentToRemoteConfirmed:
-			copy(justiceKit.CommitToRemoteSig[:], signature[:])
+		case toRemoteWitnessType:
+			justiceKit.AddToRemoteSig(signature)
 		default:
 			return hint, nil, fmt.Errorf("invalid witness type: %v",
 				inp.WitnessType())
@@ -391,24 +339,17 @@ func (t *backupTask) craftSessionPayload(
 
 	breachTxID := t.breachInfo.BreachTxHash
 
-	// Compute the breach key as SHA256(txid).
+	// Compute the breach hint as SHA256(txid)[:16] and breach key as
+	// SHA256(txid || txid).
 	hint, key := blob.NewBreachHintAndKeyFromHash(&breachTxID)
 
 	// Then, we'll encrypt the computed justice kit using the full breach
 	// transaction id, which will allow the tower to recover the contents
 	// after the transaction is seen in the chain or mempool.
-	encBlob, err := justiceKit.Encrypt(key)
+	encBlob, err := blob.Encrypt(justiceKit, key)
 	if err != nil {
 		return hint, nil, err
 	}
 
 	return hint, encBlob, nil
-}
-
-// toBlobPubKey serializes the given pubkey into a blob.PubKey that can be set
-// as a field on a blob.JusticeKit.
-func toBlobPubKey(pubKey *btcec.PublicKey) blob.PubKey {
-	var blobPubKey blob.PubKey
-	copy(blobPubKey[:], pubKey.SerializeCompressed())
-	return blobPubKey
 }

@@ -73,8 +73,10 @@ type LightningClient interface {
 	// only the message digest and signature are needed for verification.
 	SignMessage(ctx context.Context, in *SignMessageRequest, opts ...grpc.CallOption) (*SignMessageResponse, error)
 	// lncli: `verifymessage`
-	// VerifyMessage verifies a signature over a msg. The signature must be
-	// zbase32 encoded and signed by an active node in the resident node's
+	// VerifyMessage verifies a signature over a message and recovers the signer's
+	// public key. The signature is only deemed valid if the recovered public key
+	// corresponds to a node key in the public Lightning network. The signature
+	// must be zbase32 encoded and signed by an active node in the resident node's
 	// channel database. In addition to returning the validity of the signature,
 	// VerifyMessage also returns the recovered pubkey from the signature.
 	VerifyMessage(ctx context.Context, in *VerifyMessageRequest, opts ...grpc.CallOption) (*VerifyMessageResponse, error)
@@ -100,6 +102,11 @@ type LightningClient interface {
 	// it's identity pubkey, alias, the chains it is connected to, and information
 	// concerning the number of open+pending channels.
 	GetInfo(ctx context.Context, in *GetInfoRequest, opts ...grpc.CallOption) (*GetInfoResponse, error)
+	// lncli: 'getdebuginfo'
+	// GetDebugInfo returns debug information concerning the state of the daemon
+	// and its subsystems. This includes the full configuration and the latest log
+	// entries from the log file.
+	GetDebugInfo(ctx context.Context, in *GetDebugInfoRequest, opts ...grpc.CallOption) (*GetDebugInfoResponse, error)
 	// * lncli: `getrecoveryinfo`
 	// GetRecoveryInfo returns information concerning the recovery mode including
 	// whether it's in a recovery mode, whether the recovery is finished, and the
@@ -186,10 +193,12 @@ type LightningClient interface {
 	// stream allowing clients to rapidly send payments through the Lightning
 	// Network with a single persistent connection.
 	SendPayment(ctx context.Context, opts ...grpc.CallOption) (Lightning_SendPaymentClient, error)
-	// SendPaymentSync is the synchronous non-streaming version of SendPayment.
-	// This RPC is intended to be consumed by clients of the REST proxy.
-	// Additionally, this RPC expects the destination's public key and the payment
-	// hash (if any) to be encoded as hex strings.
+	// Deprecated: Do not use.
+	//
+	// Deprecated, use routerrpc.SendPaymentV2. SendPaymentSync is the synchronous
+	// non-streaming version of SendPayment. This RPC is intended to be consumed by
+	// clients of the REST proxy. Additionally, this RPC expects the destination's
+	// public key and the payment hash (if any) to be encoded as hex strings.
 	SendPaymentSync(ctx context.Context, in *SendRequest, opts ...grpc.CallOption) (*SendResponse, error)
 	// Deprecated: Do not use.
 	// lncli: `sendtoroute`
@@ -199,8 +208,11 @@ type LightningClient interface {
 	// route manually. This can be used for things like rebalancing, and atomic
 	// swaps.
 	SendToRoute(ctx context.Context, opts ...grpc.CallOption) (Lightning_SendToRouteClient, error)
-	// SendToRouteSync is a synchronous version of SendToRoute. It Will block
-	// until the payment either fails or succeeds.
+	// Deprecated: Do not use.
+	//
+	// Deprecated, use routerrpc.SendToRouteV2. SendToRouteSync is a synchronous
+	// version of SendToRoute. It Will block until the payment either fails or
+	// succeeds.
 	SendToRouteSync(ctx context.Context, in *SendToRouteRequest, opts ...grpc.CallOption) (*SendResponse, error)
 	// lncli: `addinvoice`
 	// AddInvoice attempts to add a new invoice to the invoice database. Any
@@ -226,7 +238,7 @@ type LightningClient interface {
 	// optionally specify the add_index and/or the settle_index. If the add_index
 	// is specified, then we'll first start by sending add invoice events for all
 	// invoices with an add_index greater than the specified value. If the
-	// settle_index is specified, the next, we'll send out all settle events for
+	// settle_index is specified, then next, we'll send out all settle events for
 	// invoices with a settle_index greater than the specified value. One or both
 	// of these fields can be set. If no fields are set, then we'll only send out
 	// the latest add/settle events.
@@ -239,9 +251,11 @@ type LightningClient interface {
 	// lncli: `listpayments`
 	// ListPayments returns a list of all outgoing payments.
 	ListPayments(ctx context.Context, in *ListPaymentsRequest, opts ...grpc.CallOption) (*ListPaymentsResponse, error)
+	// lncli: `deletepayments`
 	// DeletePayment deletes an outgoing payment from DB. Note that it will not
 	// attempt to delete an In-Flight payment, since that would be unsafe.
 	DeletePayment(ctx context.Context, in *DeletePaymentRequest, opts ...grpc.CallOption) (*DeletePaymentResponse, error)
+	// lncli: `deletepayments --all`
 	// DeleteAllPayments deletes all outgoing payments from DB. Note that it will
 	// not attempt to delete In-Flight payments, since that would be unsafe.
 	DeleteAllPayments(ctx context.Context, in *DeleteAllPaymentsRequest, opts ...grpc.CallOption) (*DeleteAllPaymentsResponse, error)
@@ -335,6 +349,7 @@ type LightningClient interface {
 	// as well, which contains a single encrypted blob containing the backups of
 	// each channel.
 	ExportAllChannelBackups(ctx context.Context, in *ChanBackupExportRequest, opts ...grpc.CallOption) (*ChanBackupSnapshot, error)
+	// lncli: `verifychanbackup`
 	// VerifyChanBackup allows a caller to verify the integrity of a channel backup
 	// snapshot. This method will accept either a packed Single or a packed Multi.
 	// Specifying both will result in an error.
@@ -392,13 +407,20 @@ type LightningClient interface {
 	// lncli: `subscribecustom`
 	// SubscribeCustomMessages subscribes to a stream of incoming custom peer
 	// messages.
+	//
+	// To include messages with type outside of the custom range (>= 32768) lnd
+	// needs to be compiled with  the `dev` build tag, and the message type to
+	// override should be specified in lnd's experimental protocol configuration.
 	SubscribeCustomMessages(ctx context.Context, in *SubscribeCustomMessagesRequest, opts ...grpc.CallOption) (Lightning_SubscribeCustomMessagesClient, error)
 	// lncli: `listaliases`
 	// ListAliases returns the set of all aliases that have ever existed with
 	// their confirmed SCID (if it exists) and/or the base SCID (in the case of
 	// zero conf).
 	ListAliases(ctx context.Context, in *ListAliasesRequest, opts ...grpc.CallOption) (*ListAliasesResponse, error)
-	LookupHtlc(ctx context.Context, in *LookupHtlcRequest, opts ...grpc.CallOption) (*LookupHtlcResponse, error)
+	// LookupHtlcResolution retrieves a final htlc resolution from the database.
+	// If the htlc has no final resolution yet, a NotFound grpc status code is
+	// returned.
+	LookupHtlcResolution(ctx context.Context, in *LookupHtlcResolutionRequest, opts ...grpc.CallOption) (*LookupHtlcResolutionResponse, error)
 }
 
 type lightningClient struct {
@@ -593,6 +615,15 @@ func (x *lightningSubscribePeerEventsClient) Recv() (*PeerEvent, error) {
 func (c *lightningClient) GetInfo(ctx context.Context, in *GetInfoRequest, opts ...grpc.CallOption) (*GetInfoResponse, error) {
 	out := new(GetInfoResponse)
 	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/GetInfo", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *lightningClient) GetDebugInfo(ctx context.Context, in *GetDebugInfoRequest, opts ...grpc.CallOption) (*GetDebugInfoResponse, error) {
+	out := new(GetDebugInfoResponse)
+	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/GetDebugInfo", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -830,6 +861,7 @@ func (x *lightningSendPaymentClient) Recv() (*SendResponse, error) {
 	return m, nil
 }
 
+// Deprecated: Do not use.
 func (c *lightningClient) SendPaymentSync(ctx context.Context, in *SendRequest, opts ...grpc.CallOption) (*SendResponse, error) {
 	out := new(SendResponse)
 	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/SendPaymentSync", in, out, opts...)
@@ -871,6 +903,7 @@ func (x *lightningSendToRouteClient) Recv() (*SendResponse, error) {
 	return m, nil
 }
 
+// Deprecated: Do not use.
 func (c *lightningClient) SendToRouteSync(ctx context.Context, in *SendToRouteRequest, opts ...grpc.CallOption) (*SendResponse, error) {
 	out := new(SendResponse)
 	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/SendToRouteSync", in, out, opts...)
@@ -1300,9 +1333,9 @@ func (c *lightningClient) ListAliases(ctx context.Context, in *ListAliasesReques
 	return out, nil
 }
 
-func (c *lightningClient) LookupHtlc(ctx context.Context, in *LookupHtlcRequest, opts ...grpc.CallOption) (*LookupHtlcResponse, error) {
-	out := new(LookupHtlcResponse)
-	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/LookupHtlc", in, out, opts...)
+func (c *lightningClient) LookupHtlcResolution(ctx context.Context, in *LookupHtlcResolutionRequest, opts ...grpc.CallOption) (*LookupHtlcResolutionResponse, error) {
+	out := new(LookupHtlcResolutionResponse)
+	err := c.cc.Invoke(ctx, "/lnrpc.Lightning/LookupHtlcResolution", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1368,8 +1401,10 @@ type LightningServer interface {
 	// only the message digest and signature are needed for verification.
 	SignMessage(context.Context, *SignMessageRequest) (*SignMessageResponse, error)
 	// lncli: `verifymessage`
-	// VerifyMessage verifies a signature over a msg. The signature must be
-	// zbase32 encoded and signed by an active node in the resident node's
+	// VerifyMessage verifies a signature over a message and recovers the signer's
+	// public key. The signature is only deemed valid if the recovered public key
+	// corresponds to a node key in the public Lightning network. The signature
+	// must be zbase32 encoded and signed by an active node in the resident node's
 	// channel database. In addition to returning the validity of the signature,
 	// VerifyMessage also returns the recovered pubkey from the signature.
 	VerifyMessage(context.Context, *VerifyMessageRequest) (*VerifyMessageResponse, error)
@@ -1395,6 +1430,11 @@ type LightningServer interface {
 	// it's identity pubkey, alias, the chains it is connected to, and information
 	// concerning the number of open+pending channels.
 	GetInfo(context.Context, *GetInfoRequest) (*GetInfoResponse, error)
+	// lncli: 'getdebuginfo'
+	// GetDebugInfo returns debug information concerning the state of the daemon
+	// and its subsystems. This includes the full configuration and the latest log
+	// entries from the log file.
+	GetDebugInfo(context.Context, *GetDebugInfoRequest) (*GetDebugInfoResponse, error)
 	// * lncli: `getrecoveryinfo`
 	// GetRecoveryInfo returns information concerning the recovery mode including
 	// whether it's in a recovery mode, whether the recovery is finished, and the
@@ -1481,10 +1521,12 @@ type LightningServer interface {
 	// stream allowing clients to rapidly send payments through the Lightning
 	// Network with a single persistent connection.
 	SendPayment(Lightning_SendPaymentServer) error
-	// SendPaymentSync is the synchronous non-streaming version of SendPayment.
-	// This RPC is intended to be consumed by clients of the REST proxy.
-	// Additionally, this RPC expects the destination's public key and the payment
-	// hash (if any) to be encoded as hex strings.
+	// Deprecated: Do not use.
+	//
+	// Deprecated, use routerrpc.SendPaymentV2. SendPaymentSync is the synchronous
+	// non-streaming version of SendPayment. This RPC is intended to be consumed by
+	// clients of the REST proxy. Additionally, this RPC expects the destination's
+	// public key and the payment hash (if any) to be encoded as hex strings.
 	SendPaymentSync(context.Context, *SendRequest) (*SendResponse, error)
 	// Deprecated: Do not use.
 	// lncli: `sendtoroute`
@@ -1494,8 +1536,11 @@ type LightningServer interface {
 	// route manually. This can be used for things like rebalancing, and atomic
 	// swaps.
 	SendToRoute(Lightning_SendToRouteServer) error
-	// SendToRouteSync is a synchronous version of SendToRoute. It Will block
-	// until the payment either fails or succeeds.
+	// Deprecated: Do not use.
+	//
+	// Deprecated, use routerrpc.SendToRouteV2. SendToRouteSync is a synchronous
+	// version of SendToRoute. It Will block until the payment either fails or
+	// succeeds.
 	SendToRouteSync(context.Context, *SendToRouteRequest) (*SendResponse, error)
 	// lncli: `addinvoice`
 	// AddInvoice attempts to add a new invoice to the invoice database. Any
@@ -1521,7 +1566,7 @@ type LightningServer interface {
 	// optionally specify the add_index and/or the settle_index. If the add_index
 	// is specified, then we'll first start by sending add invoice events for all
 	// invoices with an add_index greater than the specified value. If the
-	// settle_index is specified, the next, we'll send out all settle events for
+	// settle_index is specified, then next, we'll send out all settle events for
 	// invoices with a settle_index greater than the specified value. One or both
 	// of these fields can be set. If no fields are set, then we'll only send out
 	// the latest add/settle events.
@@ -1534,9 +1579,11 @@ type LightningServer interface {
 	// lncli: `listpayments`
 	// ListPayments returns a list of all outgoing payments.
 	ListPayments(context.Context, *ListPaymentsRequest) (*ListPaymentsResponse, error)
+	// lncli: `deletepayments`
 	// DeletePayment deletes an outgoing payment from DB. Note that it will not
 	// attempt to delete an In-Flight payment, since that would be unsafe.
 	DeletePayment(context.Context, *DeletePaymentRequest) (*DeletePaymentResponse, error)
+	// lncli: `deletepayments --all`
 	// DeleteAllPayments deletes all outgoing payments from DB. Note that it will
 	// not attempt to delete In-Flight payments, since that would be unsafe.
 	DeleteAllPayments(context.Context, *DeleteAllPaymentsRequest) (*DeleteAllPaymentsResponse, error)
@@ -1630,6 +1677,7 @@ type LightningServer interface {
 	// as well, which contains a single encrypted blob containing the backups of
 	// each channel.
 	ExportAllChannelBackups(context.Context, *ChanBackupExportRequest) (*ChanBackupSnapshot, error)
+	// lncli: `verifychanbackup`
 	// VerifyChanBackup allows a caller to verify the integrity of a channel backup
 	// snapshot. This method will accept either a packed Single or a packed Multi.
 	// Specifying both will result in an error.
@@ -1687,13 +1735,20 @@ type LightningServer interface {
 	// lncli: `subscribecustom`
 	// SubscribeCustomMessages subscribes to a stream of incoming custom peer
 	// messages.
+	//
+	// To include messages with type outside of the custom range (>= 32768) lnd
+	// needs to be compiled with  the `dev` build tag, and the message type to
+	// override should be specified in lnd's experimental protocol configuration.
 	SubscribeCustomMessages(*SubscribeCustomMessagesRequest, Lightning_SubscribeCustomMessagesServer) error
 	// lncli: `listaliases`
 	// ListAliases returns the set of all aliases that have ever existed with
 	// their confirmed SCID (if it exists) and/or the base SCID (in the case of
 	// zero conf).
 	ListAliases(context.Context, *ListAliasesRequest) (*ListAliasesResponse, error)
-	LookupHtlc(context.Context, *LookupHtlcRequest) (*LookupHtlcResponse, error)
+	// LookupHtlcResolution retrieves a final htlc resolution from the database.
+	// If the htlc has no final resolution yet, a NotFound grpc status code is
+	// returned.
+	LookupHtlcResolution(context.Context, *LookupHtlcResolutionRequest) (*LookupHtlcResolutionResponse, error)
 	mustEmbedUnimplementedLightningServer()
 }
 
@@ -1748,6 +1803,9 @@ func (UnimplementedLightningServer) SubscribePeerEvents(*PeerEventSubscription, 
 }
 func (UnimplementedLightningServer) GetInfo(context.Context, *GetInfoRequest) (*GetInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetInfo not implemented")
+}
+func (UnimplementedLightningServer) GetDebugInfo(context.Context, *GetDebugInfoRequest) (*GetDebugInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetDebugInfo not implemented")
 }
 func (UnimplementedLightningServer) GetRecoveryInfo(context.Context, *GetRecoveryInfoRequest) (*GetRecoveryInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetRecoveryInfo not implemented")
@@ -1899,8 +1957,8 @@ func (UnimplementedLightningServer) SubscribeCustomMessages(*SubscribeCustomMess
 func (UnimplementedLightningServer) ListAliases(context.Context, *ListAliasesRequest) (*ListAliasesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListAliases not implemented")
 }
-func (UnimplementedLightningServer) LookupHtlc(context.Context, *LookupHtlcRequest) (*LookupHtlcResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method LookupHtlc not implemented")
+func (UnimplementedLightningServer) LookupHtlcResolution(context.Context, *LookupHtlcResolutionRequest) (*LookupHtlcResolutionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LookupHtlcResolution not implemented")
 }
 func (UnimplementedLightningServer) mustEmbedUnimplementedLightningServer() {}
 
@@ -2205,6 +2263,24 @@ func _Lightning_GetInfo_Handler(srv interface{}, ctx context.Context, dec func(i
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LightningServer).GetInfo(ctx, req.(*GetInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Lightning_GetDebugInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDebugInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LightningServer).GetDebugInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/lnrpc.Lightning/GetDebugInfo",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LightningServer).GetDebugInfo(ctx, req.(*GetDebugInfoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3162,20 +3238,20 @@ func _Lightning_ListAliases_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Lightning_LookupHtlc_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LookupHtlcRequest)
+func _Lightning_LookupHtlcResolution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LookupHtlcResolutionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(LightningServer).LookupHtlc(ctx, in)
+		return srv.(LightningServer).LookupHtlcResolution(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/lnrpc.Lightning/LookupHtlc",
+		FullMethod: "/lnrpc.Lightning/LookupHtlcResolution",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LightningServer).LookupHtlc(ctx, req.(*LookupHtlcRequest))
+		return srv.(LightningServer).LookupHtlcResolution(ctx, req.(*LookupHtlcResolutionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3242,6 +3318,10 @@ var Lightning_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetInfo",
 			Handler:    _Lightning_GetInfo_Handler,
+		},
+		{
+			MethodName: "GetDebugInfo",
+			Handler:    _Lightning_GetDebugInfo_Handler,
 		},
 		{
 			MethodName: "GetRecoveryInfo",
@@ -3400,8 +3480,8 @@ var Lightning_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Lightning_ListAliases_Handler,
 		},
 		{
-			MethodName: "LookupHtlc",
-			Handler:    _Lightning_LookupHtlc_Handler,
+			MethodName: "LookupHtlcResolution",
+			Handler:    _Lightning_LookupHtlcResolution_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
